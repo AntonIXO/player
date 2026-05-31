@@ -1,0 +1,15 @@
+[package]
+name = "player-gtk"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "player-gtk"
+path = "src/main.rs"
+
+[dependencies]
+player-core = { path = "../player-core" }
+gtk4.workspace = true
+libadwaita.workspace = true
+async-channel.workspace = true

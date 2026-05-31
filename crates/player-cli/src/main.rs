@@ -1,0 +1,332 @@
+//! player-cli — exercises the bit-perfect engine and proves correctness.
+//!
+//!   probe           inspect a file (no device touched)
+//!   play            decode and play to an ALSA hw: device
+//!   dump            write decoded full-scale s32le (compare against ffmpeg)
+//!   loopback-verify play through snd-aloop, capture, byte-compare (transport)
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+use player_core::{
+    append_bytes, capture_raw, run_playback, AlsaSink, Decoder, Flow, Packer, StreamSpec,
+    DEFAULT_PERIOD, DEFAULT_PERIODS,
+};
+
+#[derive(Parser)]
+#[command(name = "player-cli", about = "bit-perfect ALSA player core CLI")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print codec/rate/format info without opening any device.
+    Probe { file: PathBuf },
+
+    /// Decode and play to an ALSA device (default: hw:1,0).
+    Play {
+        file: PathBuf,
+        #[arg(long, default_value = "hw:1,0")]
+        device: String,
+        /// Stop after N seconds (0 = whole file).
+        #[arg(long, default_value_t = 0.0)]
+        seconds: f64,
+    },
+
+    /// Write decoded interleaved full-scale s32le to a file (or stdout).
+    /// Compare with: ffmpeg -i FILE -f s32le -ac 2 -
+    Dump {
+        file: PathBuf,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Play through snd-aloop and capture it back, then byte-compare.
+    LoopbackVerify {
+        file: PathBuf,
+        #[arg(long, default_value = "hw:Loopback,0,0")]
+        out: String,
+        #[arg(long = "in", default_value = "hw:Loopback,1,0")]
+        input: String,
+        /// Limit to N seconds (loopback runs in real time). 0 = whole file.
+        #[arg(long, default_value_t = 10.0)]
+        seconds: f64,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let result = match cli.cmd {
+        Cmd::Probe { file } => probe(&file),
+        Cmd::Play {
+            file,
+            device,
+            seconds,
+        } => play(&file, &device, seconds),
+        Cmd::Dump { file, out } => dump(&file, out.as_deref()),
+        Cmd::LoopbackVerify {
+            file,
+            out,
+            input,
+            seconds,
+        } => return loopback_verify(&file, &out, &input, seconds),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn max_frames(spec_rate: u32, seconds: f64) -> Option<u64> {
+    if seconds > 0.0 {
+        Some((seconds * spec_rate as f64) as u64)
+    } else {
+        None
+    }
+}
+
+fn probe(file: &Path) -> player_core::Result<()> {
+    let dec = Decoder::open(file)?;
+    let s = dec.spec;
+    let dur = s
+        .rate
+        .checked_into_secs(dec.n_frames)
+        .map(|d| format!("{d:.1} s"))
+        .unwrap_or_else(|| "unknown".into());
+    println!("file        : {}", file.display());
+    println!("codec       : {}", dec.codec_name);
+    println!("sample rate : {} Hz", s.rate);
+    println!("channels    : {}", s.channels);
+    println!("source bits : {}", s.source_bits);
+    println!("alsa format : {} ({} bytes/sample)", s.fmt.label(), s.fmt.bytes_per_sample() );
+    println!("frames      : {}", dec.n_frames.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()));
+    println!("duration    : {dur}");
+    Ok(())
+}
+
+fn play(file: &Path, device: &str, seconds: f64) -> player_core::Result<()> {
+    let probe_spec = Decoder::open(file)?.spec;
+    let maxf = max_frames(probe_spec.rate, seconds);
+
+    println!(
+        "playing {} -> {device}  [{} Hz, {} ch, {}]",
+        file.display(),
+        probe_spec.rate,
+        probe_spec.channels,
+        probe_spec.fmt.label()
+    );
+
+    let mut last_sec = u64::MAX;
+    let spec = run_playback(
+        file,
+        device,
+        maxf,
+        DEFAULT_PERIOD,
+        DEFAULT_PERIODS,
+        |frames| {
+            let sec = frames / probe_spec.rate as u64;
+            if sec != last_sec {
+                last_sec = sec;
+                print!("\r  {sec:>4} s ");
+                let _ = io::stdout().flush();
+            }
+            Flow::Continue
+        },
+    )?;
+    println!("\ndone (negotiated {} Hz {}).", spec.rate, spec.fmt.label());
+    Ok(())
+}
+
+fn dump(file: &Path, out: Option<&Path>) -> player_core::Result<()> {
+    let mut dec = Decoder::open(file)?;
+    let mut sink: Box<dyn Write> = match out {
+        Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
+        None => Box::new(io::BufWriter::new(io::stdout().lock())),
+    };
+    let mut block: Vec<i32> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    while dec.next(&mut block)? {
+        buf.clear();
+        for &s in &block {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        sink.write_all(&buf)?;
+    }
+    sink.flush()?;
+    Ok(())
+}
+
+/// Decode (up to `max_frames`) into the exact bytes the sink would write.
+fn decode_to_bytes(
+    file: &Path,
+    maxf: Option<u64>,
+) -> player_core::Result<(Vec<u8>, StreamSpec, usize)> {
+    let mut dec = Decoder::open(file)?;
+    let spec = dec.spec;
+    let channels = spec.channels as usize;
+    let mut packer = Packer::new(spec.fmt);
+    let mut block: Vec<i32> = Vec::new();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut frames: u64 = 0;
+
+    while dec.next(&mut block)? {
+        let mut samples = block.as_slice();
+        if let Some(m) = maxf {
+            if frames >= m {
+                break;
+            }
+            let remaining = (m - frames) as usize * channels;
+            if samples.len() > remaining {
+                samples = &samples[..remaining];
+            }
+        }
+        if samples.is_empty() {
+            continue;
+        }
+        let out = packer.pack(samples);
+        append_bytes(&mut bytes, &out);
+        frames += (samples.len() / channels) as u64;
+    }
+    let n_frames = bytes.len() / spec.bytes_per_frame();
+    Ok((bytes, spec, n_frames))
+}
+
+fn loopback_verify(file: &Path, out_dev: &str, in_dev: &str, seconds: f64) -> ExitCode {
+    let probe_rate = match Decoder::open(file) {
+        Ok(d) => d.spec.rate,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let maxf = max_frames(probe_rate, seconds);
+
+    let (played, spec, n_frames) = match decode_to_bytes(file, maxf) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("decode error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let frame_bytes = spec.bytes_per_frame();
+    println!(
+        "loopback: {} frames, {} Hz, {} ch, {} -> capture {}",
+        n_frames,
+        spec.rate,
+        spec.channels,
+        spec.fmt.label(),
+        in_dev
+    );
+
+    // Start the capture first so it is blocked in readi before playback begins;
+    // snd-aloop then delivers from frame 0 with no head loss.
+    let cap_dev = in_dev.to_string();
+    let cap_handle = thread::spawn(move || {
+        capture_raw(&cap_dev, spec, n_frames, DEFAULT_PERIOD, DEFAULT_PERIODS)
+    });
+    thread::sleep(Duration::from_millis(250));
+
+    // Open playback and stream the pre-decoded bytes. Keep `sink` alive until
+    // capture has drained the loopback (drop would cut off the tail).
+    let sink = match AlsaSink::open(out_dev, spec, DEFAULT_PERIOD, DEFAULT_PERIODS) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("playback open error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = sink.write_all_bytes(&played).and_then(|()| sink.drain()) {
+        eprintln!("playback error: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let captured = match cap_handle.join() {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("capture error: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_) => {
+            eprintln!("capture thread panicked");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(sink);
+
+    compare(&played, &captured, frame_bytes)
+}
+
+/// Align captured to played (snd-aloop should give offset 0) and byte-compare.
+fn compare(played: &[u8], captured: &[u8], frame_bytes: usize) -> ExitCode {
+    let pf = played.len() / frame_bytes;
+    let cf = captured.len() / frame_bytes;
+
+    // Anchor the search on the first non-silent played frame.
+    let anchor = (0..pf)
+        .find(|&f| played[f * frame_bytes..(f + 1) * frame_bytes].iter().any(|&b| b != 0))
+        .unwrap_or(0);
+    let window = (pf - anchor).min(8192);
+    let pat = &played[anchor * frame_bytes..(anchor + window) * frame_bytes];
+
+    let max_d = cf.saturating_sub(anchor + window);
+    let mut delay = None;
+    for d in 0..=max_d {
+        let start = (anchor + d) * frame_bytes;
+        if &captured[start..start + pat.len()] == pat {
+            delay = Some(d);
+            break;
+        }
+    }
+
+    let Some(d) = delay else {
+        eprintln!("FAIL: could not align captured stream to played stream");
+        return ExitCode::FAILURE;
+    };
+
+    let comparable = pf.saturating_sub(d);
+    let mut diff = 0usize;
+    let mut first_diff = None;
+    for f in 0..comparable {
+        let p = &played[f * frame_bytes..(f + 1) * frame_bytes];
+        let c = &captured[(f + d) * frame_bytes..(f + d + 1) * frame_bytes];
+        if p != c {
+            if first_diff.is_none() {
+                first_diff = Some(f);
+            }
+            diff += 1;
+        }
+    }
+
+    if diff == 0 {
+        println!(
+            "MATCH: {comparable} frames identical (alignment offset {d} frames). BIT-PERFECT ✓"
+        );
+        ExitCode::SUCCESS
+    } else {
+        eprintln!(
+            "FAIL: {diff}/{comparable} frames differ (first at frame {:?}, offset {d})",
+            first_diff
+        );
+        ExitCode::FAILURE
+    }
+}
+
+/// Small helper to format duration from frame count.
+trait SecsExt {
+    fn checked_into_secs(self, frames: Option<u64>) -> Option<f64>;
+}
+impl SecsExt for u32 {
+    fn checked_into_secs(self, frames: Option<u64>) -> Option<f64> {
+        frames.map(|n| n as f64 / self as f64)
+    }
+}

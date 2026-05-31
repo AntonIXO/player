@@ -11,7 +11,11 @@ pub mod sink;
 
 pub use convert::{append_bytes, OutFrames, Packer};
 pub use decode::Decoder;
-pub use engine::{run_playback, Cmd, Event, Flow, Player, DEFAULT_PERIOD, DEFAULT_PERIODS};
+pub use engine::{
+    play_queue_blocking, run_playback, Cmd, Event, Flow, Player, Stats, DEFAULT_PERIOD,
+    DEFAULT_PERIODS,
+};
+pub use rt::Sched;
 pub use error::{Error, Result};
-pub use format::{AlsaFmt, StreamSpec};
-pub use sink::{capture::capture_raw, AlsaSink};
+pub use format::{AlsaFmt, DeviceFormats, StreamSpec};
+pub use sink::{capture::capture_raw, probe_formats, AlsaSink};

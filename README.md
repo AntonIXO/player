@@ -20,10 +20,19 @@ Linux desktop app first.
   - `sink/alsa.rs` — blocking `writei` with exact rate/format negotiation. If the
     device won't accept the source rate exactly, it errors (`RateMismatch`)
     instead of letting ALSA silently resample.
-  - `engine.rs` — `run_playback` (the shared decode→convert→write loop) and a
-    threaded `Player` (Cmd in / Event out) for the GUI.
-  - `rt.rs` — `SCHED_FIFO` helper with graceful fallback (RT is not required for
-    bit-perfect; it lowers xrun risk once the audio thread is split out).
+  - `engine/` — two playback paths sharing the decode/pack building blocks:
+    - `run_playback` (`mod.rs`) — the v1 single-thread decode→pack→`writei` loop,
+      kept verbatim for `play`/`dump` and as the bit-perfect oracle.
+    - the **real-time gapless engine** (Phase 2) — a decode thread and a
+      dedicated `SCHED_FIFO` audio thread joined by a wait-free SPSC byte ring
+      (`rtrb`). A *segment* is a maximal run of queued tracks that share one wire
+      format; tracks within a segment stream through one open device
+      (**gapless** — the audio thread never sees the boundary), and a real
+      rate/format change **drains and reopens** the device. Exposed as
+      `play_queue_blocking` and the interactive `Player` (used by the GTK shell).
+  - `rt.rs` — `SCHED_FIFO` helper with graceful fallback, now applied to the
+    audio thread. RT isn't required for bit-perfect, but it keeps output
+    glitch-free under load (verified: 0 xruns with every core saturated).
 - **`crates/player-cli`** — `probe`, `play`, `dump`, `loopback-verify`.
 - **`crates/player-gtk`** — minimal libadwaita shell (Open / Play / Stop, a
   bit-perfect format indicator, and **no volume slider** by design).
@@ -48,6 +57,8 @@ player-cli probe FILE                       # codec / rate / depth / chosen form
 player-cli play  FILE --device hw:1,0       # bit-perfect playback to a card
 player-cli dump  FILE -o out.s32le          # decoded full-scale s32le (for diffing)
 player-cli loopback-verify FILE --seconds 8 # play+capture through snd-aloop, byte-compare
+player-cli play-queue A.flac B.flac         # gapless queue via the real-time engine
+player-cli loopback-verify-queue A.flac B.flac # prove a queue plays gapless + bit-perfect
 ```
 
 ## Verifying bit-perfect output (local, no DAC needed)
@@ -70,9 +81,24 @@ player-cli loopback-verify test.flac --seconds 8
 # -> MATCH: N frames identical ... BIT-PERFECT
 ```
 
-Verified locally across S16_LE / S24_3LE / S32_LE and 44.1 / 48 / 96 kHz: decode
-is byte-identical to ffmpeg, and the captured loopback stream is byte-identical
-to what we wrote.
+**3. Gapless transport** (Phase 2, through the real-time engine):
+
+Split a file into two sample-exact halves, then prove the queue reproduces the
+whole — gaplessness reduces to *"the captured queue equals the original whole,
+byte-for-byte."*
+
+```sh
+ffmpeg -i song.flac -af atrim=end_sample=N   a.flac
+ffmpeg -i song.flac -af atrim=start_sample=N b.flac
+player-cli loopback-verify-queue a.flac b.flac
+# -> MATCH: ... BIT-PERFECT   (zero samples inserted/dropped at the boundary)
+```
+
+Verified locally: decode is byte-identical to ffmpeg, and the captured loopback
+stream is byte-identical to what we wrote — for single tracks and **gapless
+queues**, across S16_LE / S24_3LE / S32_LE and 44.1 / 48 / 96 kHz, including
+with 0 xruns while every CPU core was saturated. A rate/format change between
+queued tracks drains and reopens the device (`play-queue`).
 
 ## GUI
 
@@ -80,12 +106,23 @@ to what we wrote.
 PLAYER_DEVICE=hw:1,0 cargo run -p player-gtk --release
 ```
 
+**Open** replaces the queue and plays now; **Add** enqueues a file (gapless if it
+shares the current wire format). There is still no volume slider by design.
+
 (On this dev box the internal card only does 48k–192k; use `hw:Loopback,0,0` or a
 48k/96k file to hear 44.1k content, or rely on the loopback verifier.)
 
-## Not yet (Phase 2+)
+## Done in Phase 2
 
-Split decode/RT-audio threads + SPSC ring + gapless; ALSA reopen on rate change;
-dynamic device discovery + USB hotplug; lossy codecs + dither; DSD/DoP; aarch64
-cross-compile and on-device testing (WirePlumber `device.reserved` / udev rules,
-MPRIS for the Phosh lockscreen).
+Decode/RT-audio thread split + wait-free SPSC ring (`rtrb`); `SCHED_FIFO` audio
+thread; true **gapless** within a wire format; **drain + reopen** on a
+rate/format change; `play-queue` / `loopback-verify-queue`; a GTK **Add**
+(enqueue) button. Verified bit-perfect (incl. gapless and under full CPU load)
+via snd-aloop across S16_LE @44.1k and S24_3LE @48k.
+
+## Not yet (Phase 3+)
+
+Direct MMAP; dynamic device discovery (`HintIter`) + USB hotplug (`inotify` on
+`/dev/snd`); lossy codecs + dither; DSD/DoP; aarch64 cross-compile and on-device
+testing (WirePlumber `device.reserved` / udev rules, MPRIS for the Phosh
+lockscreen).

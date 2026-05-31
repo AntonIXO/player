@@ -1,17 +1,23 @@
 //! Blocking bit-perfect ALSA `hw:` output. Exact rate/format negotiation; any
 //! attempt by ALSA to resample is turned into a hard `RateMismatch` error.
 
-use alsa::pcm::{Access, HwParams, PCM};
+use std::cell::Cell;
+
+use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 
 use crate::convert::OutFrames;
 use crate::error::{Error, Result};
-use crate::format::StreamSpec;
+use crate::format::{DeviceFormats, StreamSpec};
 
 pub struct AlsaSink {
     pcm: PCM,
     channels: usize,
     spec: StreamSpec,
+    /// Count of recovered underruns (EPIPE) seen while writing — diagnostics for
+    /// the RT path (Phase 2). Not shared across threads; the sink lives on the
+    /// audio thread only.
+    xruns: Cell<u64>,
 }
 
 impl AlsaSink {
@@ -35,11 +41,26 @@ impl AlsaSink {
             pcm,
             channels: spec.channels as usize,
             spec,
+            xruns: Cell::new(0),
         })
     }
 
     pub fn spec(&self) -> StreamSpec {
         self.spec
+    }
+
+    /// Number of recovered underruns since this sink was opened.
+    pub fn xruns(&self) -> u64 {
+        self.xruns.get()
+    }
+
+    /// Recover from a write error, counting underruns (EPIPE) for diagnostics.
+    fn recover(&self, e: alsa::Error) -> Result<()> {
+        if e.errno() == libc::EPIPE {
+            self.xruns.set(self.xruns.get() + 1);
+        }
+        self.pcm.try_recover(e, true)?;
+        Ok(())
     }
 
     /// Write one packed block via the typed interface (the engine hot path).
@@ -67,7 +88,7 @@ impl AlsaSink {
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * self.channels,
-                Err(e) => self.pcm.try_recover(e, true)?,
+                Err(e) => self.recover(e)?,
             }
         }
         Ok(())
@@ -79,7 +100,7 @@ impl AlsaSink {
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * self.channels,
-                Err(e) => self.pcm.try_recover(e, true)?,
+                Err(e) => self.recover(e)?,
             }
         }
         Ok(())
@@ -92,7 +113,7 @@ impl AlsaSink {
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * frame_bytes,
-                Err(e) => self.pcm.try_recover(e, true)?,
+                Err(e) => self.recover(e)?,
             }
         }
         Ok(())
@@ -124,4 +145,18 @@ pub(crate) fn configure_hw(
         });
     }
     Ok(())
+}
+
+/// Probe which sample formats `device` accepts. Opens the device only for HW
+/// param inspection, then closes it (so it must be called while the device is
+/// free — e.g. before playback starts). Used for device-aware, bit-perfect
+/// format selection ([`DeviceFormats::choose`]).
+pub fn probe_formats(device: &str) -> Result<DeviceFormats> {
+    let pcm = PCM::new(device, Direction::Playback, false)?;
+    let hwp = HwParams::any(&pcm)?;
+    Ok(DeviceFormats {
+        s16: hwp.test_format(Format::S16LE).is_ok(),
+        s24_3: hwp.test_format(Format::S243LE).is_ok(),
+        s32: hwp.test_format(Format::S32LE).is_ok(),
+    })
 }

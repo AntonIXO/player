@@ -1,0 +1,26 @@
+# Rust build output
+/target
+
+# Audio test fixtures — large binaries (and often copyrighted music); not source.
+# Generate locally per README, or drop your own files in. Use `git add -f` to
+# force-track a specific fixture if you really want it versioned.
+*.flac
+*.wav
+*.m4a
+*.aac
+*.mp3
+*.dsf
+*.dff
+/testfiles/
+
+# Bit-perfect verification artifacts (decoded PCM dumps)
+*.s32le
+*.raw
+*.pcm
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

@@ -16,6 +16,7 @@ symphonia = { version = "0.5", default-features = false, features = [
     "isomp4",
 ] }
 alsa = "0.9"
+rtrb = "0.3"
 crossbeam-channel = "0.5"
 thiserror = "2"
 libc = "0.2"

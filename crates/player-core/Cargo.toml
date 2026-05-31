@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 symphonia.workspace = true
 alsa.workspace = true
+rtrb.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 libc.workspace = true

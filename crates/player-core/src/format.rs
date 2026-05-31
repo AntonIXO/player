@@ -85,4 +85,56 @@ impl StreamSpec {
     pub fn bytes_per_frame(&self) -> usize {
         self.fmt.bytes_per_sample() * self.channels as usize
     }
+
+    /// True if two specs share the same *wire* parameters (rate, channels, ALSA
+    /// format) and can therefore stream through one open device gaplessly.
+    /// `source_bits` is deliberately ignored: e.g. 20- and 24-bit both emit
+    /// `S24_3LE`, so they are gapless-compatible.
+    pub fn same_wire(&self, other: &StreamSpec) -> bool {
+        self.rate == other.rate && self.channels == other.channels && self.fmt == other.fmt
+    }
+}
+
+/// Which PCM sample formats a device accepts (probed once per device). Used to
+/// pick a bit-perfect output format: the narrowest the device supports that is
+/// no narrower than the source. Widening only zero-pads the low bits (e.g. a
+/// 16-bit sample carried as `S32_LE`), which is lossless — no dither, no
+/// scaling, no resampling. Needed because some DACs (e.g. the Chord Mojo 2) are
+/// `S32_LE`-only and reject the source's native `S16_LE`/`S24_3LE`.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceFormats {
+    pub s16: bool,
+    pub s24_3: bool,
+    pub s32: bool,
+}
+
+impl DeviceFormats {
+    /// Assume everything is supported. Used as a fallback when probing fails so
+    /// behaviour matches the source-native choice and the real error (if any)
+    /// surfaces at device open.
+    pub fn all() -> Self {
+        DeviceFormats {
+            s16: true,
+            s24_3: true,
+            s32: true,
+        }
+    }
+
+    pub fn supports(&self, f: AlsaFmt) -> bool {
+        match f {
+            AlsaFmt::S16 => self.s16,
+            AlsaFmt::S24_3 => self.s24_3,
+            AlsaFmt::S32 => self.s32,
+        }
+    }
+
+    /// The narrowest supported format whose width is `>=` the source's native
+    /// width (so the original samples fit exactly, zero-padded). `None` if the
+    /// device supports nothing wide enough.
+    pub fn choose(&self, source_bits: u32) -> Option<AlsaFmt> {
+        let want = AlsaFmt::from_source_bits(source_bits).output_bits();
+        [AlsaFmt::S16, AlsaFmt::S24_3, AlsaFmt::S32]
+            .into_iter()
+            .find(|f| f.output_bits() >= want && self.supports(*f))
+    }
 }

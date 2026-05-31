@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use player_core::{
-    append_bytes, capture_raw, run_playback, AlsaSink, Decoder, Flow, Packer, StreamSpec,
-    DEFAULT_PERIOD, DEFAULT_PERIODS,
+    append_bytes, capture_raw, play_queue_blocking, run_playback, AlsaSink, Decoder, Event, Flow,
+    Packer, StreamSpec, DEFAULT_PERIOD, DEFAULT_PERIODS,
 };
 
 #[derive(Parser)]
@@ -58,6 +58,30 @@ enum Cmd {
         #[arg(long, default_value_t = 10.0)]
         seconds: f64,
     },
+
+    /// Play a queue through the real-time gapless engine (Phase 2).
+    /// Same-format tracks stream gaplessly; a rate/format change drains+reopens.
+    PlayQueue {
+        /// One or more files, played in order.
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        #[arg(long, default_value = "hw:1,0")]
+        device: String,
+    },
+
+    /// Gapless proof: play a queue through the ring engine into snd-aloop,
+    /// capture it back, and byte-compare against the concatenated decode. A
+    /// MATCH means zero samples were inserted/dropped at track boundaries.
+    /// All files must share the same wire format (the gapless case); use
+    /// `play-queue` to exercise a rate/format change.
+    LoopbackVerifyQueue {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        #[arg(long, default_value = "hw:Loopback,0,0")]
+        out: String,
+        #[arg(long = "in", default_value = "hw:Loopback,1,0")]
+        input: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -76,6 +100,10 @@ fn main() -> ExitCode {
             input,
             seconds,
         } => return loopback_verify(&file, &out, &input, seconds),
+        Cmd::PlayQueue { files, device } => play_queue(&files, &device),
+        Cmd::LoopbackVerifyQueue { files, out, input } => {
+            return loopback_verify_queue(&files, &out, &input)
+        }
     };
 
     match result {
@@ -319,6 +347,117 @@ fn compare(played: &[u8], captured: &[u8], frame_bytes: usize) -> ExitCode {
         );
         ExitCode::FAILURE
     }
+}
+
+/// Play a queue through the real-time gapless engine (Phase 2).
+fn play_queue(files: &[PathBuf], device: &str) -> player_core::Result<()> {
+    println!("queue: {} track(s) -> {device}", files.len());
+    let stats = play_queue_blocking(
+        files,
+        device,
+        DEFAULT_PERIOD,
+        DEFAULT_PERIODS,
+        |ev| match ev {
+            Event::Started { spec, path } => println!(
+                "▶ {}  [{} Hz, {} ch, {}-bit → {}]",
+                path.display(),
+                spec.rate,
+                spec.channels,
+                spec.source_bits,
+                spec.fmt.label()
+            ),
+            Event::Ended => println!("■ queue ended"),
+            Event::Error(e) => eprintln!("⚠ {e}"),
+            Event::Position(_) => {}
+        },
+    )?;
+    println!(
+        "done: {} frames, {} xrun(s), scheduling {:?}",
+        stats.frames, stats.xruns, stats.sched
+    );
+    Ok(())
+}
+
+/// Gapless proof through snd-aloop: play the queue via the ring engine, capture
+/// it back, and byte-compare against the concatenated decode.
+fn loopback_verify_queue(files: &[PathBuf], out_dev: &str, in_dev: &str) -> ExitCode {
+    // Build the reference (decode each track); require a single wire spec so the
+    // capture reads one continuous stream at one rate.
+    let mut reference: Vec<u8> = Vec::new();
+    let mut spec0: Option<StreamSpec> = None;
+    for f in files {
+        let (bytes, spec, _n) = match decode_to_bytes(f, None) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("decode error ({}): {e}", f.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        match spec0 {
+            None => spec0 = Some(spec),
+            Some(s0) if !s0.same_wire(&spec) => {
+                eprintln!(
+                    "FAIL: queue mixes wire formats ({} vs {}); use `play-queue` for a rate/format change.",
+                    s0.fmt.label(),
+                    spec.fmt.label()
+                );
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        reference.extend_from_slice(&bytes);
+    }
+    let spec = spec0.expect("clap guarantees >= 1 file");
+    let frame_bytes = spec.bytes_per_frame();
+    let n_frames = reference.len() / frame_bytes;
+    println!(
+        "loopback-queue: {} track(s), {} frames, {} Hz, {} ch, {} -> capture {}",
+        files.len(),
+        n_frames,
+        spec.rate,
+        spec.channels,
+        spec.fmt.label(),
+        in_dev
+    );
+
+    // Start capture (it blocks in readi), then drive the ring engine.
+    let cap_dev = in_dev.to_string();
+    let cap_handle = thread::spawn(move || {
+        capture_raw(&cap_dev, spec, n_frames, DEFAULT_PERIOD, DEFAULT_PERIODS)
+    });
+    thread::sleep(Duration::from_millis(250));
+
+    let play_res = play_queue_blocking(files, out_dev, DEFAULT_PERIOD, DEFAULT_PERIODS, |ev| {
+        if let Event::Error(e) = ev {
+            eprintln!("engine: {e}");
+        }
+    });
+    let stats = match play_res {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("playback error: {e}");
+            let _ = cap_handle.join();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let captured = match cap_handle.join() {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            eprintln!("capture error: {e}");
+            return ExitCode::FAILURE;
+        }
+        Err(_) => {
+            eprintln!("capture thread panicked");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "engine: {} frames, {} xrun(s), scheduling {:?}",
+        stats.frames, stats.xruns, stats.sched
+    );
+
+    compare(&reference, &captured, frame_bytes)
 }
 
 /// Small helper to format duration from frame count.

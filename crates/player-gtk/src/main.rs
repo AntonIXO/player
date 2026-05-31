@@ -43,6 +43,10 @@ fn build_ui(app: &adw::Application) {
         .build();
     header.pack_start(&open_btn);
 
+    // Enqueue another file — gapless if it shares the current wire format.
+    let add_btn = gtk::Button::with_label("Add");
+    header.pack_start(&add_btn);
+
     let title_label = gtk::Label::builder()
         .label("No file loaded")
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -167,6 +171,22 @@ fn build_ui(app: &adw::Application) {
                     if let Some(path) = file.path() {
                         *last_path.borrow_mut() = Some(path.clone());
                         player.play(path);
+                    }
+                }
+            });
+        });
+    }
+    {
+        let (player, window) = (player.clone(), window.clone());
+        add_btn.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Add a file to the queue")
+                .build();
+            let player = player.clone();
+            dialog.open(Some(&window), gio::Cancellable::NONE, move |res| {
+                if let Ok(file) = res {
+                    if let Some(path) = file.path() {
+                        player.enqueue(path);
                     }
                 }
             });

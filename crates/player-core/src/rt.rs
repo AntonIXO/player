@@ -3,9 +3,10 @@
 //! not depend on RT, only on exact rate/format. RT lowers xrun risk on the
 //! target device once a dedicated audio thread is split out (Phase 2).
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Sched {
     Fifo(i32),
+    #[default]
     Fallback,
 }
 

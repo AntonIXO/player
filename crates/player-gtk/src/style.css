@@ -21,18 +21,30 @@ button.play-hero {
   color: @accent_fg_color;
   border-radius: 9999px;
   box-shadow: 0 1px 2px alpha(black, 0.12), 0 6px 14px alpha(@accent_bg_color, 0.35);
+  transition: filter 120ms ease, box-shadow 120ms ease, transform 80ms ease;
 }
 button.play-hero:hover { filter: brightness(1.07); }
+button.play-hero:active { transform: scale(0.96); }
 
 /* Album-art rounding + neutral placeholder. */
 .art { border-radius: 8px; }
 .art-lg { border-radius: 16px; }
 .art-placeholder { background: alpha(@window_fg_color, 0.10); }
 
+/* Album grid cells: a quiet card that lifts on hover/focus so the 3-up grid
+   reads as tappable targets rather than bare images. */
+.album-cell {
+  padding: 6px;
+  border-radius: 12px;
+  transition: background 120ms ease;
+}
+.album-cell:hover { background: alpha(@window_fg_color, 0.06); }
+
 /* Secondary now-playing toggles (shuffle / repeat) — a subtle raised capsule
    that tints accent when active (see `toggle_accent`). */
 button.pill-toggle {
   background: alpha(@window_fg_color, 0.07);
+  transition: background 120ms ease;
 }
 button.pill-toggle:hover { background: alpha(@window_fg_color, 0.12); }
 
@@ -46,6 +58,7 @@ button.pill-toggle:hover { background: alpha(@window_fg_color, 0.12); }
 
 /* Mini-player progress line. */
 .mini-progress trough, .mini-progress progress { min-height: 3px; }
+.mini-progress progress { background: @accent_bg_color; }
 
 /* A–Z fast-scroll index. */
 .az-index button {
@@ -57,6 +70,7 @@ button.pill-toggle:hover { background: alpha(@window_fg_color, 0.12); }
   background: none;
   box-shadow: none;
   opacity: 0.55;
+  transition: opacity 100ms ease, color 100ms ease;
 }
 .az-index button:hover { opacity: 1; color: @accent_color; }
 

@@ -23,13 +23,12 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use gtk::{gio, glib, ContentFit, Orientation, SelectionMode};
+use gtk::{gio, glib, Orientation, SelectionMode};
 use player_core::{Event, Player, StreamSpec};
 use player_library::{fmt_dur_ms, fmt_khz, Album, Filter, Library, Track};
 
-const ART_ROW: i32 = 46;
-const ART_MINI: i32 = 40;
-const ART_HERO: i32 = 220;
+mod widgets;
+use widgets::*;
 
 /// Mutable app state (single-threaded: GTK main loop).
 struct State {
@@ -118,11 +117,15 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-/// Apply a persisted theme name ("light" / "dark" / anything else = system).
+/// Apply a theme: explicit "light"/"dark" force a scheme, "system" follows the
+/// desktop, and an unset value (`None`, first run) prefers dark — the DAP is a
+/// dark-by-design player, but the user can still override it in Settings.
 fn apply_theme(theme: Option<&str>) {
     let scheme = match theme {
         Some("light") => adw::ColorScheme::ForceLight,
         Some("dark") => adw::ColorScheme::ForceDark,
+        Some("system") => adw::ColorScheme::Default,
+        None => adw::ColorScheme::PreferDark,
         _ => adw::ColorScheme::Default,
     };
     adw::StyleManager::default().set_color_scheme(scheme);
@@ -650,16 +653,6 @@ fn build_library() -> LibUi {
         tracks_box,
         seg,
     }
-}
-
-/// A vertically-stacked, padded container for a browse-tab list.
-fn list_tab_box() -> gtk::Box {
-    let b = gtk::Box::new(Orientation::Vertical, 0);
-    b.set_margin_top(8);
-    b.set_margin_start(16);
-    b.set_margin_end(16);
-    b.set_margin_bottom(20);
-    b
 }
 
 fn build_search() -> (gtk::Widget, gtk::SearchEntry, gtk::Box, Vec<(Filter, gtk::ToggleButton)>) {
@@ -1249,11 +1242,27 @@ fn build_album_detail(
         lb.append(&row);
     }
 
+    // Back affordance: the shared header bar lives outside the NavigationView,
+    // so a pushed detail page would otherwise have no on-screen way back (only
+    // edge-swipe / Escape). An explicit flat back button keeps it usable on the
+    // desktop too.
+    let back = gtk::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_halign(gtk::Align::Start);
+    back.set_tooltip_text(Some("Back to library"));
+    {
+        let ui = ui.clone();
+        back.connect_clicked(move |_| {
+            ui.nav.pop();
+        });
+    }
+
     let content = gtk::Box::new(Orientation::Vertical, 16);
-    content.set_margin_top(16);
+    content.set_margin_top(12);
     content.set_margin_bottom(20);
     content.set_margin_start(16);
     content.set_margin_end(16);
+    content.append(&back);
     content.append(&header);
     content.append(&actions);
     content.append(&lb);
@@ -1374,6 +1383,16 @@ fn on_started(state: &SharedState, ui: &SharedUi, spec: StreamSpec) {
     {
         let mut s = state.borrow_mut();
         s.playing = true;
+        // The engine's StreamSpec is the authoritative wire rate. Backfill the
+        // current track's sample rate from it when the library/tag metadata
+        // didn't carry one, so position (frames → seconds) is always computable.
+        if let Some(i) = s.current {
+            if let Some(t) = s.queue.get_mut(i) {
+                if t.sample_rate.is_none() {
+                    t.sample_rate = Some(spec.rate);
+                }
+            }
+        }
         // Restored session: once the track is open, seek it to the saved
         // position (doing this on Started, not right after play(), so the
         // decoder is actually loaded when the seek lands).
@@ -1699,15 +1718,19 @@ fn run_search(state: &SharedState, ui: &SharedUi) {
         ui.search_results.append(&section_label("Folders"));
         let lb = boxed_list();
         for f in &grouped.folders {
+            let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
             let row = row_widget(
                 &art_dir,
                 None,
                 f.name(),
                 &f.path,
                 Some(&f.meta()),
-                None,
-                || {},
-                || {},
+                Some(("media-playback-start-symbolic", "Play folder")),
+                {
+                    let (state, ui, path) = (state.clone(), ui.clone(), path.clone());
+                    move || play_folder(&state, &ui, &path)
+                },
+                move || play_folder(&state, &ui, &path),
             );
             lb.append(&row);
         }
@@ -2187,238 +2210,12 @@ fn resolve_rel(entry: &str, base: Option<&Path>) -> PathBuf {
 // Small widget builders
 // ---------------------------------------------------------------------------
 
-fn add_page(stack: &adw::ViewStack, child: &impl IsA<gtk::Widget>, name: &str, title: &str, icon: &str) {
-    let page = stack.add_titled(child, Some(name), title);
-    page.set_icon_name(Some(icon));
-}
-
-fn circle(icon: &str, size: i32, tip: &str) -> gtk::Button {
-    let b = gtk::Button::from_icon_name(icon);
-    b.add_css_class("circular");
-    b.add_css_class("flat");
-    b.set_size_request(size, size);
-    b.set_tooltip_text(Some(tip));
-    b
-}
-
-fn flat_menu_item(icon: &str, label: &str) -> gtk::Button {
-    let b = gtk::Button::new();
-    b.add_css_class("flat");
-    let row = gtk::Box::new(Orientation::Horizontal, 10);
-    let i = gtk::Image::from_icon_name(icon);
-    let l = gtk::Label::new(Some(label));
-    l.set_xalign(0.0);
-    l.set_hexpand(true);
-    row.append(&i);
-    row.append(&l);
-    b.set_child(Some(&row));
-    b
-}
-
-fn section_label(text: &str) -> gtk::Label {
-    let l = gtk::Label::new(Some(&text.to_uppercase()));
-    l.add_css_class("section-label");
-    l.set_xalign(0.0);
-    l
-}
-
-fn boxed_list() -> gtk::ListBox {
-    let lb = gtk::ListBox::new();
-    lb.add_css_class("boxed-list");
-    lb.set_selection_mode(SelectionMode::None);
-    lb.set_margin_bottom(16);
-    lb
-}
-
-/// A boxed-list row: art · title/subtitle · mono meta · optional trailing button.
-fn row_widget(
-    art_dir: &Path,
-    art_hash: Option<&str>,
-    title: &str,
-    subtitle: &str,
-    meta: Option<&str>,
-    trailing: Option<(&str, &str)>,
-    on_activate: impl Fn() + 'static,
-    on_trailing: impl Fn() + 'static,
-) -> gtk::ListBoxRow {
-    let row = gtk::Box::new(Orientation::Horizontal, 13);
-    row.set_margin_top(8);
-    row.set_margin_bottom(8);
-    row.set_margin_start(12);
-    row.set_margin_end(8);
-    row.append(&art_widget(art_dir, art_hash, ART_ROW, false));
-
-    let texts = gtk::Box::new(Orientation::Vertical, 1);
-    texts.set_hexpand(true);
-    texts.set_valign(gtk::Align::Center);
-    let t = gtk::Label::new(Some(title));
-    t.add_css_class("heading");
-    t.set_xalign(0.0);
-    t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let s = gtk::Label::new(Some(subtitle));
-    s.add_css_class("dim-label");
-    s.set_xalign(0.0);
-    s.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    texts.append(&t);
-    texts.append(&s);
-    row.append(&texts);
-
-    if let Some(m) = meta {
-        let ml = gtk::Label::new(Some(m));
-        ml.add_css_class("dim-label");
-        ml.add_css_class("mono");
-        ml.add_css_class("caption");
-        row.append(&ml);
-    }
-
-    if let Some((icon, tip)) = trailing {
-        let b = circle(icon, 32, tip);
-        b.connect_clicked(move |_| on_trailing());
-        row.append(&b);
-    }
-
-    let lbr = gtk::ListBoxRow::new();
-    lbr.set_child(Some(&row));
-    lbr.set_activatable(true);
-    // `ListBoxRow::activate` is a *keyboard* action signal — it does NOT fire on a
-    // pointer tap (that was the "touching a track does nothing" bug). Drive taps
-    // with an explicit `GestureClick` and keep `connect_activate` for the Enter
-    // key. The trailing circle button claims its own clicks, so tapping it won't
-    // also fire the row gesture.
-    let on_activate = Rc::new(on_activate);
-    lbr.connect_activate({
-        let on_activate = on_activate.clone();
-        move |_| on_activate()
-    });
-    let tap = gtk::GestureClick::new();
-    tap.connect_released(move |g, _, _, _| {
-        g.set_state(gtk::EventSequenceState::Claimed);
-        on_activate();
-    });
-    lbr.add_controller(tap);
-    lbr
-}
-
-fn album_cell(art_dir: &Path, al: &Album) -> gtk::Box {
-    let cell = gtk::Box::new(Orientation::Vertical, 6);
-    let art = art_widget(art_dir, al.art_hash.as_deref(), 110, false);
-    art.set_size_request(110, 110);
-    cell.append(&art);
-    let t = gtk::Label::new(Some(&al.album));
-    t.add_css_class("heading");
-    t.set_xalign(0.0);
-    t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    t.set_max_width_chars(14);
-    let a = gtk::Label::new(Some(al.album_artist.as_deref().unwrap_or("Unknown Artist")));
-    a.add_css_class("dim-label");
-    a.add_css_class("caption");
-    a.set_xalign(0.0);
-    a.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    a.set_max_width_chars(14);
-    cell.append(&t);
-    cell.append(&a);
-    cell
-}
-
-fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
-    // A fixed square `Box` with `overflow: hidden` + the `.art` radius reliably
-    // clips its child to rounded corners (the standard GTK4 recipe — an
-    // `AspectFrame` does not). The fixed equal size_request plus a Cover-fit
-    // `Picture` makes the art a centred square crop regardless of source shape.
-    let frame = gtk::Box::new(Orientation::Vertical, 0);
-    frame.set_size_request(size, size);
-    frame.set_halign(gtk::Align::Center);
-    frame.set_valign(gtk::Align::Center);
-    frame.set_overflow(gtk::Overflow::Hidden);
-    frame.add_css_class("art");
-    if big {
-        frame.add_css_class("art-lg");
-    }
-    match hash {
-        Some(h) if art_dir.join(h).exists() => {
-            let pic = gtk::Picture::for_filename(art_dir.join(h));
-            pic.set_content_fit(ContentFit::Cover);
-            pic.set_can_shrink(true);
-            pic.set_hexpand(true);
-            pic.set_vexpand(true);
-            frame.append(&pic);
-        }
-        _ => {
-            frame.add_css_class("art-placeholder");
-            let icon = gtk::Image::from_icon_name("folder-music-symbolic");
-            icon.set_pixel_size((size as f32 * 0.42) as i32);
-            icon.add_css_class("dim-label");
-            icon.set_hexpand(true);
-            icon.set_vexpand(true);
-            frame.append(&icon);
-        }
-    }
-    frame.upcast()
-}
-
-fn format_chip(spec: &str) -> gtk::Box {
-    let chip = gtk::Box::new(Orientation::Horizontal, 8);
-    chip.add_css_class("format-chip");
-    chip.set_halign(gtk::Align::Center);
-    let check = gtk::Image::from_icon_name("emblem-ok-symbolic");
-    check.set_pixel_size(15);
-    let label = gtk::Label::new(Some("Bit-perfect"));
-    let specl = gtk::Label::new(Some(spec));
-    specl.add_css_class("spec");
-    chip.append(&check);
-    chip.append(&label);
-    chip.append(&specl);
-    chip
-}
-
-fn wrap_scroller(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
-    let s = gtk::ScrolledWindow::new();
-    s.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    s.set_vexpand(true);
-    s.set_child(Some(child));
-    s
-}
-
-fn fill(container: &gtk::Box, child: &impl IsA<gtk::Widget>) {
-    while let Some(c) = container.first_child() {
-        container.remove(&c);
-    }
-    container.append(child);
-}
-
-fn toggle_accent(b: &gtk::Button, on: bool) {
-    if on {
-        b.add_css_class("accent");
-    } else {
-        b.remove_css_class("accent");
-    }
-}
-
+/// Build a [`Track`] for a file that may not be in the library (Open / playlist
+/// / restored session). Delegates to the library extractor so the now-playing
+/// view has a real title, duration, and sample rate — without which the seek bar
+/// and elapsed clock would never move.
 fn quick_track(path: &Path) -> Track {
-    Track {
-        id: -1,
-        path: path.to_path_buf(),
-        folder: path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-        title: path.file_stem().map(|s| s.to_string_lossy().into_owned()),
-        artist: None,
-        album_artist: None,
-        album: None,
-        composer: None,
-        genre: None,
-        track_no: None,
-        disc_no: None,
-        year: None,
-        duration_ms: None,
-        codec: None,
-        sample_rate: None,
-        bits: None,
-        channels: None,
-        art_hash: None,
-    }
-}
-
-fn mmss(secs: u64) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
+    player_library::track_from_path(path)
 }
 
 fn pseudo_random(len: usize) -> usize {

@@ -1,0 +1,56 @@
+/* Brand extras on top of the libadwaita stylesheet (which already provides the
+   palette/type tokens from the design system's colors_and_type.css). */
+
+/* The bit-perfect format chip — the product's identity. */
+.format-chip {
+  background: alpha(@success_color, 0.16);
+  color: @success_color;
+  border-radius: 9999px;
+  padding: 6px 14px;
+  font-weight: 600;
+}
+.format-chip .spec {
+  font-family: monospace;
+  font-weight: 400;
+}
+
+/* Elevated fully-rounded pill for the primary play action (chat2 brand choice,
+   a deliberate departure from stock flat Adwaita). */
+button.play-hero {
+  background: @accent_bg_color;
+  color: @accent_fg_color;
+  border-radius: 9999px;
+  box-shadow: 0 1px 2px alpha(black, 0.12), 0 6px 14px alpha(@accent_bg_color, 0.35);
+}
+button.play-hero:hover { filter: brightness(1.07); }
+
+/* Album-art rounding + neutral placeholder. */
+.art { border-radius: 8px; }
+.art-lg { border-radius: 16px; }
+.art-placeholder { background: alpha(@window_fg_color, 0.10); }
+
+/* Section headers in the search/queue lists. */
+.section-label {
+  font-weight: 700;
+  font-size: 0.8rem;
+  opacity: 0.55;
+  margin: 4px 4px 6px;
+}
+
+/* Mini-player progress line. */
+.mini-progress trough, .mini-progress progress { min-height: 3px; }
+
+/* A–Z fast-scroll index. */
+.az-index button {
+  font-weight: 700;
+  font-size: 9.5px;
+  min-height: 0;
+  min-width: 14px;
+  padding: 1px 0;
+  background: none;
+  box-shadow: none;
+  opacity: 0.55;
+}
+.az-index button:hover { opacity: 1; color: @accent_color; }
+
+.mono { font-family: monospace; }

@@ -29,6 +29,13 @@ button.play-hero:hover { filter: brightness(1.07); }
 .art-lg { border-radius: 16px; }
 .art-placeholder { background: alpha(@window_fg_color, 0.10); }
 
+/* Secondary now-playing toggles (shuffle / repeat) — a subtle raised capsule
+   that tints accent when active (see `toggle_accent`). */
+button.pill-toggle {
+  background: alpha(@window_fg_color, 0.07);
+}
+button.pill-toggle:hover { background: alpha(@window_fg_color, 0.12); }
+
 /* Section headers in the search/queue lists. */
 .section-label {
   font-weight: 700;

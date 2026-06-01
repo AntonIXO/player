@@ -305,7 +305,7 @@ fn build_ui(app: &adw::Application) {
         queue_box,
     });
 
-    wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next);
+    wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
     wire_segmented(&state, &ui, &lib.seg);
 
     // playlist save / load (Lists page)
@@ -388,6 +388,8 @@ struct Np {
     play: gtk::Button,
     prev: gtk::Button,
     next: gtk::Button,
+    rewind: gtk::Button,
+    fwd: gtk::Button,
     shuffle: gtk::Button,
     repeat: gtk::Button,
     format: gtk::Box,
@@ -426,17 +428,28 @@ fn build_now_playing() -> (gtk::Widget, Np) {
     times.append(&spacer);
     times.append(&total);
 
-    // transport: shuffle · prev · play · next · repeat
+    // secondary toggle row — shuffle / repeat as pills, above the seek bar
+    // (Poweramp-Adwaita design: the transport row is reserved for playback).
     let shuffle = circle("media-playlist-shuffle-symbolic", 40, "Shuffle");
+    shuffle.add_css_class("pill-toggle");
+    let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
+    repeat.add_css_class("pill-toggle");
+    let toggles = gtk::Box::new(Orientation::Horizontal, 9);
+    toggles.set_halign(gtk::Align::Center);
+    toggles.append(&shuffle);
+    toggles.append(&repeat);
+
+    // transport: prev · −10s · play · +10s · next
     let prev = circle("media-skip-backward-symbolic", 48, "Previous");
-    let play = circle("media-playback-start-symbolic", 68, "Play");
+    let rewind = circle("media-seek-backward-symbolic", 48, "Back 10 seconds");
+    let play = circle("media-playback-start-symbolic", 72, "Play");
     play.add_css_class("play-hero");
     play.remove_css_class("flat");
+    let fwd = circle("media-seek-forward-symbolic", 48, "Forward 10 seconds");
     let next = circle("media-skip-forward-symbolic", 48, "Next");
-    let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
-    let transport = gtk::Box::new(Orientation::Horizontal, 10);
+    let transport = gtk::Box::new(Orientation::Horizontal, 8);
     transport.set_halign(gtk::Align::Center);
-    for b in [&shuffle, &prev, &play, &next, &repeat] {
+    for b in [&prev, &rewind, &play, &fwd, &next] {
         transport.append(b);
     }
 
@@ -466,6 +479,7 @@ fn build_now_playing() -> (gtk::Widget, Np) {
     titles.append(&title);
     titles.append(&subtitle);
     content.append(&titles);
+    content.append(&toggles);
     let seekbox = gtk::Box::new(Orientation::Vertical, 4);
     seekbox.append(&seek);
     seekbox.append(&times);
@@ -507,6 +521,8 @@ fn build_now_playing() -> (gtk::Widget, Np) {
             play,
             prev,
             next,
+            rewind,
+            fwd,
             shuffle,
             repeat,
             format,
@@ -540,7 +556,9 @@ fn build_library() -> LibUi {
     // --- Albums grid (with A–Z fast index) ---
     let flow = gtk::FlowBox::new();
     flow.set_selection_mode(SelectionMode::None);
-    flow.set_min_children_per_line(2);
+    // Fixed 3-up grid, matching the design's `repeat(3, …)`. FlowBox squeezes the
+    // homogeneous cells to a third of the width rather than dropping to 2 columns.
+    flow.set_min_children_per_line(3);
     flow.set_max_children_per_line(3);
     flow.set_homogeneous(true);
     flow.set_column_spacing(12);
@@ -755,6 +773,8 @@ fn wire(
     np_repeat: &gtk::Button,
     np_prev: &gtk::Button,
     np_next: &gtk::Button,
+    np_rewind: &gtk::Button,
+    np_fwd: &gtk::Button,
 ) {
     // open file → play immediately
     {
@@ -840,6 +860,14 @@ fn wire(
     {
         let (state, ui) = (state.clone(), ui.clone());
         np_next.connect_clicked(move |_| advance(&state, &ui, true));
+    }
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        np_rewind.connect_clicked(move |_| seek_by(&state, &ui, -10_000));
+    }
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        np_fwd.connect_clicked(move |_| seek_by(&state, &ui, 10_000));
     }
     {
         let state = state.clone();
@@ -1050,6 +1078,31 @@ fn seek_to_fraction(state: &SharedState, ui: &SharedUi, frac: f64) {
         s.paused = false;
     }
     set_play_icon(ui, true);
+}
+
+/// Seek relative to the current position by `delta_ms` (negative = back),
+/// clamped to the track. Used by the −10s / +10s transport buttons.
+fn seek_by(state: &SharedState, ui: &SharedUi, delta_ms: i64) {
+    let total_ms = current_total_ms(state);
+    if total_ms == 0 {
+        return;
+    }
+    let target = (state.borrow().last_pos_ms as i64 + delta_ms).clamp(0, total_ms as i64) as u64;
+    {
+        let mut s = state.borrow_mut();
+        s.player.seek(Duration::from_millis(target));
+        // Seek (re)starts playback in the engine — reflect that in the UI.
+        s.playing = true;
+        s.paused = false;
+        s.last_pos_ms = target;
+    }
+    set_play_icon(ui, true);
+    // Reflect the jump immediately (don't wait for the next Position event).
+    ui.seeking.set(false);
+    ui.np_elapsed.set_label(&mmss(target / 1000));
+    let frac = target as f64 / total_ms as f64;
+    ui.np_seek.set_value(frac);
+    ui.mp_progress.set_fraction(frac);
 }
 
 fn advance(state: &SharedState, ui: &SharedUi, user: bool) {
@@ -2268,35 +2321,11 @@ fn album_cell(art_dir: &Path, al: &Album) -> gtk::Box {
 }
 
 fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
-    let inner: gtk::Widget = match hash {
-        Some(h) if art_dir.join(h).exists() => {
-            let pic = gtk::Picture::for_filename(art_dir.join(h));
-            // Crop-to-fill, and let the paintable shrink below its intrinsic size
-            // so the square frame (below) drives the geometry, not the image.
-            pic.set_content_fit(ContentFit::Cover);
-            pic.set_can_shrink(true);
-            pic.set_halign(gtk::Align::Fill);
-            pic.set_valign(gtk::Align::Fill);
-            pic.upcast()
-        }
-        _ => {
-            let b = gtk::Box::new(Orientation::Vertical, 0);
-            b.set_halign(gtk::Align::Center);
-            b.set_valign(gtk::Align::Center);
-            b.add_css_class("art-placeholder");
-            let icon = gtk::Image::from_icon_name("folder-music-symbolic");
-            icon.set_pixel_size((size as f32 * 0.42) as i32);
-            icon.add_css_class("dim-label");
-            b.append(&icon);
-            b.upcast()
-        }
-    };
-    // A `gtk::Picture` reports the image's natural aspect ratio, so a plain parent
-    // allocates it as a *rectangle*. Wrap it in an AspectFrame locked to 1:1
-    // (`ratio = 1.0`, `obey_child = false`) so cover art is always a centred
-    // square — matching the design — regardless of the source image's shape.
-    let frame = gtk::AspectFrame::new(0.5, 0.5, 1.0, false);
-    frame.set_child(Some(&inner));
+    // A fixed square `Box` with `overflow: hidden` + the `.art` radius reliably
+    // clips its child to rounded corners (the standard GTK4 recipe — an
+    // `AspectFrame` does not). The fixed equal size_request plus a Cover-fit
+    // `Picture` makes the art a centred square crop regardless of source shape.
+    let frame = gtk::Box::new(Orientation::Vertical, 0);
     frame.set_size_request(size, size);
     frame.set_halign(gtk::Align::Center);
     frame.set_valign(gtk::Align::Center);
@@ -2304,6 +2333,25 @@ fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::
     frame.add_css_class("art");
     if big {
         frame.add_css_class("art-lg");
+    }
+    match hash {
+        Some(h) if art_dir.join(h).exists() => {
+            let pic = gtk::Picture::for_filename(art_dir.join(h));
+            pic.set_content_fit(ContentFit::Cover);
+            pic.set_can_shrink(true);
+            pic.set_hexpand(true);
+            pic.set_vexpand(true);
+            frame.append(&pic);
+        }
+        _ => {
+            frame.add_css_class("art-placeholder");
+            let icon = gtk::Image::from_icon_name("folder-music-symbolic");
+            icon.set_pixel_size((size as f32 * 0.42) as i32);
+            icon.add_css_class("dim-label");
+            icon.set_hexpand(true);
+            icon.set_vexpand(true);
+            frame.append(&icon);
+        }
     }
     frame.upcast()
 }

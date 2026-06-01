@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crossbeam_channel::{bounded, unbounded, Sender};
 use rtrb::Consumer;
@@ -116,10 +117,13 @@ where
 /// Internal control messages from the decode thread to the audio thread.
 pub(crate) enum Ctl {
     /// Start a segment for `spec` (after the current one drains, if any),
-    /// reading bytes from `consumer`.
+    /// reading bytes from `consumer`. `pos_base` is the per-track frame the
+    /// segment starts at (0 for a fresh track, the landed frame after a seek),
+    /// used to rebase [`Event::Position`].
     Open {
         spec: StreamSpec,
         consumer: Consumer<u8>,
+        pos_base: u64,
     },
     /// The queue is finished: drain and report `Ended`. If `quit`, the audio
     /// thread then terminates (the blocking player wants it to end); otherwise
@@ -127,6 +131,10 @@ pub(crate) enum Ctl {
     Finish { quit: bool },
     /// Immediate stop: discard buffered audio.
     Flush,
+    /// Hold output at the device (hardware pause) until `Resume`/`Flush`/`Quit`.
+    Pause,
+    /// Resume output after a `Pause`.
+    Resume,
     /// Shut the audio thread down.
     Quit,
 }
@@ -233,6 +241,12 @@ pub enum Cmd {
     Play(PathBuf),
     /// Append to the queue (gapless if it shares the current wire spec).
     Enqueue(PathBuf),
+    /// Hold output (hardware pause) without dropping the current track.
+    Pause,
+    /// Resume after a pause.
+    Resume,
+    /// Seek the current track to this position; output jumps to the new frame.
+    Seek(Duration),
     /// Stop immediately and clear the queue.
     Stop,
     /// Shut the engine down (sent on drop).
@@ -304,6 +318,24 @@ impl Player {
 
     pub fn enqueue(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::Enqueue(path));
+    }
+
+    /// Hold output at the device without dropping the current track. Does not set
+    /// `interrupt` (that would abort the in-flight decode and lose the track); the
+    /// decode thread picks the command up at its next loop top.
+    pub fn pause(&self) {
+        let _ = self.cmd_tx.send(Cmd::Pause);
+    }
+
+    /// Resume after [`Player::pause`].
+    pub fn resume(&self) {
+        let _ = self.cmd_tx.send(Cmd::Resume);
+    }
+
+    /// Seek the current track to `pos`. Output jumps to the new frame and
+    /// (re)starts playing from there. No-op if nothing is loaded.
+    pub fn seek(&self, pos: Duration) {
+        let _ = self.cmd_tx.send(Cmd::Seek(pos));
     }
 
     pub fn stop(&self) {

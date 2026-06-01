@@ -2,14 +2,16 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::time::Duration;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder as SymDecoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymError;
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 
 use crate::error::{Error, Result};
 use crate::format::StreamSpec;
@@ -76,6 +78,25 @@ impl Decoder {
             codec_name,
             n_frames,
         })
+    }
+
+    /// Seek to `pos` (sample-accurate). Returns the actual landed frame in this
+    /// track's timebase (which the engine uses to rebase the per-track position).
+    /// Resets decoder state and the sample buffer so the next [`Decoder::next`]
+    /// yields fresh audio at the seek point.
+    pub fn seek(&mut self, pos: Duration) -> Result<u64> {
+        let time = Time::new(pos.as_secs(), f64::from(pos.subsec_nanos()) / 1_000_000_000.0);
+        let seeked = self.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            },
+        )?;
+        // Decoders may carry inter-frame state (e.g. residuals); reset after a seek.
+        self.decoder.reset();
+        self.sbuf = None;
+        Ok(seeked.actual_ts)
     }
 
     /// Decode the next block into `out` as interleaved full-scale `i32`.

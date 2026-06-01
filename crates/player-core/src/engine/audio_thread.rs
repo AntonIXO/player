@@ -24,7 +24,7 @@ const AUDIO_RT_PRIO: i32 = 80;
 /// A segment-lifecycle directive, buffered locally in queue order. (`Ctl::Flush`
 /// / `Ctl::Quit` are interrupts and never buffered.)
 enum Next {
-    Open(StreamSpec, Consumer<u8>),
+    Open(StreamSpec, Consumer<u8>, u64),
     Finish { quit: bool },
     Quit,
 }
@@ -46,6 +46,11 @@ pub(crate) fn run(
     emit: Arc<dyn Fn(Event) + Send + Sync>,
 ) -> Stats {
     let sched = rt::try_set_realtime_fifo(AUDIO_RT_PRIO);
+    // Optional big-core pin (device-specific): `PLAYER_AUDIO_CPU=<n>` pins the
+    // audio thread to CPU n to cut scheduling jitter on big.LITTLE (Poco F1).
+    if let Some(cpu) = std::env::var("PLAYER_AUDIO_CPU").ok().and_then(|s| s.parse().ok()) {
+        rt::pin_to_cpu(cpu);
+    }
     let mut stats = Stats {
         frames: 0,
         xruns: 0,
@@ -59,18 +64,23 @@ pub(crate) fn run(
 
     'outer: loop {
         // Acquire the next segment to play (from buffered directives, else block).
-        let (spec, mut consumer) = loop {
+        let (spec, mut consumer, pos_base) = loop {
             let dir = match pending.pop_front() {
                 Some(d) => d,
                 None => match ctl_rx.recv() {
-                    Ok(Ctl::Open { spec, consumer }) => Next::Open(spec, consumer),
+                    Ok(Ctl::Open {
+                        spec,
+                        consumer,
+                        pos_base,
+                    }) => Next::Open(spec, consumer, pos_base),
                     Ok(Ctl::Finish { quit }) => Next::Finish { quit },
-                    Ok(Ctl::Flush) => continue, // idle flush: nothing to stop
+                    // Idle flush / pause / resume: no active segment to act on.
+                    Ok(Ctl::Flush) | Ok(Ctl::Pause) | Ok(Ctl::Resume) => continue,
                     Ok(Ctl::Quit) | Err(_) => Next::Quit,
                 },
             };
             match dir {
-                Next::Open(s, c) => break (s, c),
+                Next::Open(s, c, b) => break (s, c, b),
                 Next::Finish { quit } => {
                     emit(Event::Ended);
                     if quit {
@@ -93,6 +103,7 @@ pub(crate) fn run(
             &mut sink,
             &mut consumer,
             spec,
+            pos_base,
             period,
             &ctl_rx,
             &emit,
@@ -126,6 +137,7 @@ fn play_segment(
     sink: &mut AlsaSink,
     consumer: &mut Consumer<u8>,
     spec: StreamSpec,
+    pos_base: u64,
     period: i64,
     ctl_rx: &Receiver<Ctl>,
     emit: &Arc<dyn Fn(Event) + Send + Sync>,
@@ -135,6 +147,9 @@ fn play_segment(
     let fb = spec.bytes_per_frame();
     let cap = period as usize * fb; // at most one period between control checks
     let pos_step = (spec.rate as u64 / 10).max(1); // ~100 ms position cadence
+    // Position is reported *per track*: frames written within this segment, on
+    // top of `pos_base` (0 for a fresh track, the landed frame after a seek).
+    let seg_start = stats.frames;
     let mut last_pos = stats.frames;
 
     loop {
@@ -142,7 +157,16 @@ fn play_segment(
         match ctl_rx.try_recv() {
             Ok(Ctl::Flush) => return Outcome::Flushed,
             Ok(Ctl::Quit) => return Outcome::Quit,
-            Ok(Ctl::Open { spec, consumer }) => pending.push_back(Next::Open(spec, consumer)),
+            Ok(Ctl::Pause) => match pause_until_resumed(sink, ctl_rx, emit, pending) {
+                Outcome::Drained => {} // resumed: fall through and keep playing
+                other => return other,
+            },
+            Ok(Ctl::Resume) => {} // not paused; ignore
+            Ok(Ctl::Open {
+                spec,
+                consumer,
+                pos_base,
+            }) => pending.push_back(Next::Open(spec, consumer, pos_base)),
             Ok(Ctl::Finish { quit }) => pending.push_back(Next::Finish { quit }),
             Err(_) => {}
         }
@@ -167,7 +191,7 @@ fn play_segment(
                 stats.frames += (n / fb) as u64;
                 if stats.frames - last_pos >= pos_step {
                     last_pos = stats.frames;
-                    emit(Event::Position(stats.frames));
+                    emit(Event::Position(pos_base + (stats.frames - seg_start)));
                 }
             }
         } else if consumer.is_abandoned() {
@@ -178,6 +202,41 @@ fn play_segment(
             // Ring momentarily empty but more is coming. Steady state never lands
             // here (the decoder stays ahead); brief wait avoids a busy spin.
             std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+}
+
+/// Hold the device paused (samples preserved on a hardware-pause-capable card;
+/// the drop+prepare fallback discards only ALSA's buffered audio). Blocks on the
+/// control channel until resumed, buffering any segment directives that arrive
+/// so the queue is not disturbed. Returns [`Outcome::Drained`] to mean *resumed,
+/// keep playing*; `Flushed`/`Quit` propagate.
+fn pause_until_resumed(
+    sink: &AlsaSink,
+    ctl_rx: &Receiver<Ctl>,
+    emit: &Arc<dyn Fn(Event) + Send + Sync>,
+    pending: &mut VecDeque<Next>,
+) -> Outcome {
+    if let Err(e) = sink.pause(true) {
+        emit(Event::Error(e.to_string()));
+    }
+    loop {
+        match ctl_rx.recv() {
+            Ok(Ctl::Resume) => {
+                if let Err(e) = sink.pause(false) {
+                    emit(Event::Error(e.to_string()));
+                }
+                return Outcome::Drained;
+            }
+            Ok(Ctl::Flush) => return Outcome::Flushed,
+            Ok(Ctl::Quit) | Err(_) => return Outcome::Quit,
+            Ok(Ctl::Open {
+                spec,
+                consumer,
+                pos_base,
+            }) => pending.push_back(Next::Open(spec, consumer, pos_base)),
+            Ok(Ctl::Finish { quit }) => pending.push_back(Next::Finish { quit }),
+            Ok(Ctl::Pause) => {} // already paused
         }
     }
 }

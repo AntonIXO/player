@@ -3,6 +3,7 @@
 
 pub mod convert;
 pub mod decode;
+pub mod devices;
 pub mod engine;
 pub mod error;
 pub mod format;
@@ -11,6 +12,7 @@ pub mod sink;
 
 pub use convert::{append_bytes, OutFrames, Packer};
 pub use decode::Decoder;
+pub use devices::{auto_pick, list_devices, DeviceInfo, DeviceKind};
 pub use engine::{
     play_queue_blocking, run_playback, Cmd, Event, Flow, Player, Stats, DEFAULT_PERIOD,
     DEFAULT_PERIODS,

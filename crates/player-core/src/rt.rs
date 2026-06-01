@@ -25,6 +25,19 @@ pub fn try_set_realtime_fifo(priority: i32) -> Sched {
     }
 }
 
+/// Best-effort pin of the current thread to a single CPU (`cpu`). On the Poco
+/// F1's big.LITTLE SoC, pinning the audio thread to a big core reduces wake-up
+/// jitter (and DVFS migration) under `SCHED_FIFO`. Never panics; returns whether
+/// the affinity was applied. No-op-safe on any core count.
+pub fn pin_to_cpu(cpu: usize) -> bool {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
 /// Best-effort RT priority ceiling from `RLIMIT_RTPRIO` (for diagnostics).
 pub fn rtprio_limit() -> Option<u64> {
     let mut lim = libc::rlimit {

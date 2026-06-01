@@ -27,6 +27,9 @@ pub(crate) struct SegmentWriter {
     ctl_tx: Sender<Ctl>,
     prod: Option<Producer<u8>>,
     cur: Option<StreamSpec>,
+    /// Per-track frame the *next* opened segment starts at (0 normally, the
+    /// landed frame after a seek). Consumed (reset to 0) on the next `Open`.
+    next_pos_base: u64,
 }
 
 impl SegmentWriter {
@@ -35,6 +38,7 @@ impl SegmentWriter {
             ctl_tx,
             prod: None,
             cur: None,
+            next_pos_base: 0,
         }
     }
 
@@ -46,15 +50,41 @@ impl SegmentWriter {
         let continues = self.prod.is_some() && self.cur.is_some_and(|c| c.same_wire(&spec));
         if !continues {
             let (prod, consumer) = ring_for_spec(spec);
+            let pos_base = self.next_pos_base;
             // Send Open *before* dropping the old producer: by the time the audio
             // thread observes the old consumer abandoned, the directive is queued.
-            if self.ctl_tx.send(Ctl::Open { spec, consumer }).is_err() {
+            if self
+                .ctl_tx
+                .send(Ctl::Open {
+                    spec,
+                    consumer,
+                    pos_base,
+                })
+                .is_err()
+            {
                 return None;
             }
+            self.next_pos_base = 0;
             self.prod = Some(prod); // dropping the old producer abandons its consumer
             self.cur = Some(spec);
         }
         self.prod.as_mut()
+    }
+
+    /// Set the per-track base frame for the next segment (after a seek). Force a
+    /// fresh segment first via [`SegmentWriter::flush`] so it actually takes.
+    pub(crate) fn set_next_pos_base(&mut self, base: u64) {
+        self.next_pos_base = base;
+    }
+
+    /// Forward a hardware pause to the audio thread (segment state untouched).
+    pub(crate) fn pause(&mut self) {
+        let _ = self.ctl_tx.send(Ctl::Pause);
+    }
+
+    /// Forward a resume to the audio thread.
+    pub(crate) fn resume(&mut self) {
+        let _ = self.ctl_tx.send(Ctl::Resume);
     }
 
     /// Queue finished: drain and report `Ended`. `quit` asks the audio thread to
@@ -88,6 +118,72 @@ struct Track {
     spec: StreamSpec,
 }
 
+/// Whether the decode loop should keep running or shut down after a command.
+enum CmdOutcome {
+    Continue,
+    Quit,
+}
+
+/// Apply one [`Cmd`] to the interactive decode state. Shared by the three places
+/// commands are read (the try_recv drain, the paused block, and the idle block)
+/// so their semantics never drift.
+fn apply_cmd(
+    cmd: Cmd,
+    queue: &mut VecDeque<PathBuf>,
+    cur: &mut Option<Track>,
+    writer: &mut SegmentWriter,
+    interrupt: &Arc<AtomicBool>,
+    paused: &mut bool,
+    emit: &Arc<dyn Fn(Event) + Send + Sync>,
+) -> CmdOutcome {
+    match cmd {
+        Cmd::Play(p) => {
+            queue.clear();
+            queue.push_back(p);
+            *cur = None;
+            writer.flush();
+            *paused = false;
+            interrupt.store(false, Ordering::SeqCst);
+        }
+        Cmd::Enqueue(p) => queue.push_back(p),
+        Cmd::Pause => {
+            writer.pause();
+            *paused = true;
+        }
+        Cmd::Resume => {
+            writer.resume();
+            *paused = false;
+        }
+        Cmd::Seek(d) => {
+            // Seek the current track in place: discard buffered audio, reposition
+            // the decoder, and rebase the next segment to the landed frame. Seek
+            // (re)starts playback at the new position.
+            if let Some(track) = cur.as_mut() {
+                writer.flush();
+                match track.dec.seek(d) {
+                    Ok(landed) => writer.set_next_pos_base(landed),
+                    Err(e) => emit(Event::Error(e.to_string())),
+                }
+                *paused = false;
+                interrupt.store(false, Ordering::SeqCst);
+            }
+        }
+        Cmd::Stop => {
+            queue.clear();
+            *cur = None;
+            writer.flush();
+            *paused = false;
+            interrupt.store(false, Ordering::SeqCst);
+        }
+        Cmd::Quit => {
+            writer.flush();
+            writer.quit();
+            return CmdOutcome::Quit;
+        }
+    }
+    CmdOutcome::Continue
+}
+
 /// Interactive driver behind [`super::Player`]: maintains a mutable queue and
 /// reacts to commands. `interrupt` is set by Play/Stop/Quit so an in-flight
 /// block push aborts promptly (Enqueue never interrupts — it just appends, which
@@ -104,6 +200,7 @@ pub(crate) fn run_interactive(
     let mut writer = SegmentWriter::new(ctl_tx);
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     let mut cur: Option<Track> = None;
+    let mut paused = false;
     let mut block: Vec<i32> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
 
@@ -111,24 +208,12 @@ pub(crate) fn run_interactive(
         // 1) Apply all pending commands.
         loop {
             match cmd_rx.try_recv() {
-                Ok(Cmd::Play(p)) => {
-                    queue.clear();
-                    queue.push_back(p);
-                    cur = None;
-                    writer.flush();
-                    interrupt.store(false, Ordering::SeqCst);
-                }
-                Ok(Cmd::Enqueue(p)) => queue.push_back(p),
-                Ok(Cmd::Stop) => {
-                    queue.clear();
-                    cur = None;
-                    writer.flush();
-                    interrupt.store(false, Ordering::SeqCst);
-                }
-                Ok(Cmd::Quit) => {
-                    writer.flush();
-                    writer.quit();
-                    return;
+                Ok(cmd) => {
+                    if let CmdOutcome::Quit =
+                        apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit)
+                    {
+                        return;
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -137,6 +222,25 @@ pub(crate) fn run_interactive(
                     return;
                 }
             }
+        }
+
+        // 1b) While paused, output is held at the device; don't decode (which
+        // would only spin filling the ring). Block for the next command instead.
+        if paused {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    if let CmdOutcome::Quit =
+                        apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit)
+                    {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    writer.quit();
+                    return;
+                }
+            }
+            continue;
         }
 
         // 2) Ensure a current track, or idle until commanded.
@@ -164,13 +268,14 @@ pub(crate) fn run_interactive(
                         writer.finish(false);
                     }
                     match cmd_rx.recv() {
-                        Ok(Cmd::Play(p)) => {
-                            queue.push_back(p);
-                            interrupt.store(false, Ordering::SeqCst);
+                        Ok(cmd) => {
+                            if let CmdOutcome::Quit = apply_cmd(
+                                cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit,
+                            ) {
+                                return;
+                            }
                         }
-                        Ok(Cmd::Enqueue(p)) => queue.push_back(p),
-                        Ok(Cmd::Stop) => interrupt.store(false, Ordering::SeqCst),
-                        Ok(Cmd::Quit) | Err(_) => {
+                        Err(_) => {
                             writer.quit();
                             return;
                         }

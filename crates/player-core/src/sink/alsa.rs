@@ -14,6 +14,9 @@ pub struct AlsaSink {
     pcm: PCM,
     channels: usize,
     spec: StreamSpec,
+    /// Whether the device reports hardware pause support (`snd_pcm_hw_params_can_pause`).
+    /// When false, [`AlsaSink::pause`] falls back to drop+prepare.
+    can_pause: bool,
     /// Count of recovered underruns (EPIPE) seen while writing — diagnostics for
     /// the RT path (Phase 2). Not shared across threads; the sink lives on the
     /// audio thread only.
@@ -29,18 +32,22 @@ impl AlsaSink {
 
         // Software params: start once a period is buffered; wake every period.
         // Scoped so the borrowing HwParams/SwParams drop before `pcm` is moved.
-        {
-            let actual_period = pcm.hw_params_current()?.get_period_size()?;
+        let can_pause = {
+            let hwc = pcm.hw_params_current()?;
+            let actual_period = hwc.get_period_size()?;
+            let can_pause = hwc.can_pause();
             let swp = pcm.sw_params_current()?;
             swp.set_start_threshold(actual_period)?;
             swp.set_avail_min(actual_period)?;
             pcm.sw_params(&swp)?;
-        }
+            can_pause
+        };
 
         Ok(AlsaSink {
             pcm,
             channels: spec.channels as usize,
             spec,
+            can_pause,
             xruns: Cell::new(0),
         })
     }
@@ -79,6 +86,37 @@ impl AlsaSink {
 
     pub fn drain(&self) -> Result<()> {
         self.pcm.drain()?;
+        Ok(())
+    }
+
+    /// Pause or resume output. Bit-perfect: samples are never touched. When the
+    /// device supports hardware pause the DAC clock simply halts (ALSA's buffer
+    /// is preserved, so resume continues seamlessly); otherwise we fall back to
+    /// drop+prepare, which discards only ALSA's already-buffered audio (a brief
+    /// gap on resume) and never alters samples.
+    pub fn pause(&self, enable: bool) -> Result<()> {
+        if self.can_pause {
+            self.pcm.pause(enable)?;
+        } else if enable {
+            self.pcm.drop()?;
+        } else {
+            self.pcm.prepare()?;
+        }
+        Ok(())
+    }
+
+    /// Whether this device supports true hardware pause (vs. the drop+prepare
+    /// fallback). The audio thread uses this to decide if it must re-prime the
+    /// ALSA buffer on resume.
+    pub fn can_pause(&self) -> bool {
+        self.can_pause
+    }
+
+    /// Stop the stream and discard ALSA's buffered audio, then re-prepare so the
+    /// next `write` restarts playback from a clean state. Used for seek/flush.
+    pub fn reset(&self) -> Result<()> {
+        self.pcm.drop()?;
+        self.pcm.prepare()?;
         Ok(())
     }
 

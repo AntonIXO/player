@@ -16,6 +16,7 @@ use player_core::{
     append_bytes, capture_raw, play_queue_blocking, run_playback, AlsaSink, Decoder, Event, Flow,
     Packer, StreamSpec, DEFAULT_PERIOD, DEFAULT_PERIODS,
 };
+use player_library::{Filter, Library};
 
 #[derive(Parser)]
 #[command(name = "player-cli", about = "bit-perfect ALSA player core CLI")]
@@ -82,6 +83,39 @@ enum Cmd {
         #[arg(long = "in", default_value = "hw:Loopback,1,0")]
         input: String,
     },
+
+    /// Scan a music folder into the library index (incremental).
+    Scan {
+        /// Folder to scan recursively.
+        root: PathBuf,
+        /// Database path (default: $XDG_DATA_HOME/player/library.db).
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+
+    /// Search the library index.
+    Search {
+        /// Query terms.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// all | albums | artists | album-artists | composers | genres.
+        #[arg(long, default_value = "all")]
+        filter: String,
+        /// Grouped Albums/Folders/Tracks (FTS5) instead of fuzzy typeahead (nucleo).
+        #[arg(long)]
+        group: bool,
+    },
+
+    /// Print library counts (tracks / albums / artists / folders).
+    LibraryStats {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+
+    /// List bit-perfect ALSA output devices (USB DACs first).
+    Devices,
 }
 
 fn main() -> ExitCode {
@@ -104,6 +138,15 @@ fn main() -> ExitCode {
         Cmd::LoopbackVerifyQueue { files, out, input } => {
             return loopback_verify_queue(&files, &out, &input)
         }
+        Cmd::Scan { root, db } => lib_scan(&root, db).map_err(to_core_err),
+        Cmd::Search {
+            query,
+            db,
+            filter,
+            group,
+        } => lib_search(query, db, &filter, group).map_err(to_core_err),
+        Cmd::LibraryStats { db } => lib_stats(db).map_err(to_core_err),
+        Cmd::Devices => devices(),
     };
 
     match result {
@@ -121,6 +164,35 @@ fn max_frames(spec_rate: u32, seconds: f64) -> Option<u64> {
     } else {
         None
     }
+}
+
+fn devices() -> player_core::Result<()> {
+    let devices = player_core::list_devices();
+    if devices.is_empty() {
+        println!("(no bit-perfect hw: output devices found)");
+        return Ok(());
+    }
+    let pick = player_core::auto_pick().map(|d| d.id);
+    for d in &devices {
+        let kind = match d.kind {
+            player_core::DeviceKind::Usb => "USB DAC",
+            player_core::DeviceKind::Internal => "internal",
+            player_core::DeviceKind::Other => "other",
+        };
+        let marker = if pick.as_deref() == Some(d.id.as_str()) {
+            " *"
+        } else {
+            "  "
+        };
+        println!("{marker} {:<28} [{kind}]  {}", d.id, d.name);
+        if !d.description.is_empty() && d.description != d.id {
+            for line in d.description.lines() {
+                println!("       {line}");
+            }
+        }
+    }
+    println!("\n  * = auto-pick default");
+    Ok(())
 }
 
 fn probe(file: &Path) -> player_core::Result<()> {
@@ -468,4 +540,108 @@ impl SecsExt for u32 {
     fn checked_into_secs(self, frames: Option<u64>) -> Option<f64> {
         frames.map(|n| n as f64 / self as f64)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Library index (player-library).
+// ---------------------------------------------------------------------------
+
+fn to_core_err(e: player_library::Error) -> player_core::Error {
+    player_core::Error::Unsupported(e.to_string())
+}
+
+/// Open the library at an explicit `--db` (art cached beside it) or the XDG default.
+fn open_library(db: Option<PathBuf>) -> player_library::Result<Library> {
+    match db {
+        Some(p) => {
+            let art = p
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("art");
+            Library::open(&p, &art)
+        }
+        None => Library::open_default(),
+    }
+}
+
+fn parse_filter(s: &str) -> Filter {
+    match s.to_ascii_lowercase().as_str() {
+        "albums" => Filter::Albums,
+        "artists" => Filter::Artists,
+        "album-artists" | "albumartists" => Filter::AlbumArtists,
+        "composers" => Filter::Composers,
+        "genres" => Filter::Genres,
+        _ => Filter::All,
+    }
+}
+
+fn lib_scan(root: &Path, db: Option<PathBuf>) -> player_library::Result<()> {
+    let mut lib = open_library(db)?;
+    println!("scanning {} …", root.display());
+    let stats = lib.scan_with_progress(root, |p| {
+        if p.seen % 500 == 0 || p.seen == p.total {
+            print!("\r  {} / {} files", p.seen, p.total);
+            let _ = io::stdout().flush();
+        }
+    })?;
+    println!(
+        "\nadded {} · updated {} · moved {} · removed {} · unchanged {} · errors {}  ({} ms)",
+        stats.added,
+        stats.updated,
+        stats.moved,
+        stats.removed,
+        stats.unchanged,
+        stats.errors,
+        stats.elapsed_ms
+    );
+    Ok(())
+}
+
+fn lib_search(
+    query: Vec<String>,
+    db: Option<PathBuf>,
+    filter: &str,
+    group: bool,
+) -> player_library::Result<()> {
+    let lib = open_library(db)?;
+    let q = query.join(" ");
+
+    if group {
+        let r = lib.search_grouped(&q, parse_filter(filter))?;
+        if !r.albums.is_empty() {
+            println!("Albums");
+            for a in &r.albums {
+                println!(
+                    "  {} — {}  [{}]",
+                    a.album,
+                    a.album_artist.as_deref().unwrap_or("Unknown Artist"),
+                    a.meta()
+                );
+            }
+        }
+        if !r.folders.is_empty() {
+            println!("Folders");
+            for f in &r.folders {
+                println!("  {}  [{}]", f.name(), f.meta());
+            }
+        }
+        println!("Tracks");
+        for t in &r.tracks {
+            println!("  {} — {}  [{}]", t.display_title(), t.subtitle(), t.format_spec());
+        }
+    } else {
+        for t in lib.search_typeahead(&q, 30) {
+            println!("  {} — {}  [{}]", t.display_title(), t.subtitle(), t.format_spec());
+        }
+    }
+    Ok(())
+}
+
+fn lib_stats(db: Option<PathBuf>) -> player_library::Result<()> {
+    let s = open_library(db)?.stats()?;
+    println!("tracks  : {}", s.tracks);
+    println!("albums  : {}", s.albums);
+    println!("artists : {}", s.artists);
+    println!("folders : {}", s.folders);
+    Ok(())
 }

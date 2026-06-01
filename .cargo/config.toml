@@ -1,0 +1,28 @@
+# Cross-compilation for the Poco F1 (aarch64 / postmarketOS).
+#
+# Two paths are supported:
+#
+# 1. Turnkey (recommended): `cross` + Docker, no host toolchain needed.
+#        cargo install cross
+#        cross build --release --target aarch64-unknown-linux-gnu -p player-cli
+#        cross build --release --target aarch64-unknown-linux-gnu -p player-library
+#    The aarch64 `libasound` + cross GCC live in the container (see Cross.toml).
+#    Only the headless crates are cross-built; player-gtk is built on-device.
+#
+# 2. Host-side (bare metal): needs an aarch64 cross toolchain + an aarch64
+#    libasound. Install `aarch64-linux-gnu-gcc` and an arm64 `libasound2-dev`
+#    sysroot, then point pkg-config at it for *this target only*, e.g.:
+#        env \
+#          PKG_CONFIG_ALLOW_CROSS=1 \
+#          PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu \
+#          PKG_CONFIG_LIBDIR=/usr/aarch64-linux-gnu/lib/pkgconfig \
+#          cargo build --release --target aarch64-unknown-linux-gnu \
+#            -p player-cli -p player-library
+#    (PKG_CONFIG_* are intentionally NOT set globally here — that would break
+#    the native x86_64 build. Set them per-invocation as above.)
+#
+# rusqlite's bundled SQLite C compiles with the cross GCC; alsa-sys needs the
+# aarch64 ALSA dev headers found via pkg-config.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

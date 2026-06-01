@@ -59,6 +59,11 @@ player-cli dump  FILE -o out.s32le          # decoded full-scale s32le (for diff
 player-cli loopback-verify FILE --seconds 8 # play+capture through snd-aloop, byte-compare
 player-cli play-queue A.flac B.flac         # gapless queue via the real-time engine
 player-cli loopback-verify-queue A.flac B.flac # prove a queue plays gapless + bit-perfect
+player-cli devices                          # list bit-perfect hw: outputs (USB DACs first, * = auto-pick)
+player-cli scan ~/Music                     # index a folder (incremental; tags + art via lofty)
+player-cli search "miles kind of blue"      # fuzzy typeahead search of the index
+player-cli search davis --filter artists --group   # grouped FTS search, narrowed by column
+player-cli library-stats                    # tracks / albums / artists / folders counts
 ```
 
 ## Verifying bit-perfect output (local, no DAC needed)
@@ -100,14 +105,56 @@ queues**, across S16_LE / S24_3LE / S32_LE and 44.1 / 48 / 96 kHz, including
 with 0 xruns while every CPU core was saturated. A rate/format change between
 queued tracks drains and reopens the device (`play-queue`).
 
+## Library & search (`crates/player-library`)
+
+A headless index: scans a folder tree, extracts tags + embedded art (lofty) and
+header wire-facts, caches them in SQLite/FTS5, refreshes **incrementally**
+(mtime+size change detection; `mv` is recognised as a move, not re-imported), and
+answers two kinds of search — grouped FTS5 (Albums/Folders/Tracks, accent-folded)
+and forgiving nucleo fuzzy typeahead. No audio/GTK deps, so it stays testable
+without hardware. Default locations: `~/.local/share/player/library.db`, art under
+`~/.cache/player/art`. Settings + the last session live in its `meta` table.
+
 ## GUI
 
 ```sh
-PLAYER_DEVICE=hw:1,0 cargo run -p player-gtk --release
+cargo run -p player-gtk --release        # device: persisted choice → $PLAYER_DEVICE → auto-picked USB DAC
 ```
 
-**Open** replaces the queue and plays now; **Add** enqueues a file (gapless if it
-shares the current wire format). There is still no volume slider by design.
+A libadwaita DAP: **Library** (Albums / Artists / Folders / Tracks with album
+drill-down), **Playing** (hero art, the bit-perfect format chip, real
+**pause/resume**, a **draggable seek** bar, per-track position), **Search** (FTS +
+fuzzy), and **Lists** (the queue + `.m3u` save/load). **Settings** (menu) picks the
+output device (bit-perfect `hw:` only; switching re-spawns the engine), the music
+folder + live-watch, and the theme — all persisted, along with the last
+queue/track/position, and restored on launch. Still **no volume slider** by design
+(volume is the DAC's hardware knob).
+
+## Cross-compiling for the Poco F1 (aarch64)
+
+The headless crates cross-compile; **player-gtk is built on-device** (postmarketOS
+ships gtk4 + libadwaita). The pure-Rust code is portable — only the bundled C
+(SQLite via rusqlite, ALSA via alsa-sys) needs an aarch64 toolchain + `libasound`.
+
+**Turnkey (recommended)** — `cross` + Docker, nothing on the host but Docker:
+
+```sh
+cargo install cross
+# start Docker first if needed:  sudo systemctl start docker
+cross build --release --target aarch64-unknown-linux-gnu -p player-cli
+cross build --release --target aarch64-unknown-linux-gnu -p player-library
+file target/aarch64-unknown-linux-gnu/release/player-cli   # ELF 64-bit ARM aarch64
+```
+
+`Cross.toml` adds `libasound2-dev:arm64` inside the build image; `.cargo/config.toml`
+documents the bare-host alternative (an `aarch64-linux-gnu-gcc` + arm64 `libasound`
+sysroot with per-invocation `PKG_CONFIG_*`).
+
+**On the device** (postmarketOS): `cargo build --release -p player-gtk` natively, and
+for the engine give the audio group `SCHED_FIFO` headroom (`/etc/security/limits.d`:
+`@audio - rtprio 95`). Optionally pin the audio thread to a big core with
+`PLAYER_AUDIO_CPU=<n>` (e.g. a Kryo gold core on the SD845). Point the engine at the
+Mojo 2 — `player-cli devices` shows it as the USB auto-pick (`hw:CARD=Mojo2,DEV=0`).
 
 (On this dev box the internal card only does 48k–192k; use `hw:Loopback,0,0` or a
 48k/96k file to hear 44.1k content, or rely on the loopback verifier.)
@@ -120,9 +167,18 @@ rate/format change; `play-queue` / `loopback-verify-queue`; a GTK **Add**
 (enqueue) button. Verified bit-perfect (incl. gapless and under full CPU load)
 via snd-aloop across S16_LE @44.1k and S24_3LE @48k.
 
-## Not yet (Phase 3+)
+## Done in Phase 3
 
-Direct MMAP; dynamic device discovery (`HintIter`) + USB hotplug (`inotify` on
-`/dev/snd`); lossy codecs + dither; DSD/DoP; aarch64 cross-compile and on-device
-testing (WirePlumber `device.reserved` / udev rules, MPRIS for the Phosh
-lockscreen).
+Music **library** (scan/index/incremental-refresh, FTS5 + nucleo search) + CLI
+`scan`/`search`/`library-stats`; the full **GTK DAP** (browse + album detail,
+search, queue, `.m3u` playlists, Settings, session persistence); engine **transport**
+— real `pause`/`resume`, sample-accurate `seek`, and **per-track** position; dynamic
+**device discovery** (`devices`, USB-DAC auto-pick); aarch64 cross-build config
+(`cross` + `Cross.toml`) with on-device GTK.
+
+## Not yet (Phase 4+)
+
+Gapless album playback **through the UI** + an engine-owned queue (`Next`/`Prev` +
+`TrackChanged`); direct MMAP; USB hotplug (`inotify` on `/dev/snd`); lossy codecs +
+dither; DSD/DoP; WirePlumber `device.reserved` / udev rules. **MPRIS** is
+deliberately skipped (the player phone's lockscreen is disabled).

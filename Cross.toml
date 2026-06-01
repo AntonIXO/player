@@ -1,0 +1,17 @@
+# Turnkey aarch64 cross-build via `cross` (Docker/Podman). The default cross
+# image is Ubuntu-based and ships the aarch64 GCC; we add the aarch64 ALSA dev
+# package so `alsa-sys` links. rusqlite builds its bundled SQLite with the
+# in-image cross GCC.
+#
+#   cargo install cross
+#   cross build --release --target aarch64-unknown-linux-gnu -p player-cli
+#   cross build --release --target aarch64-unknown-linux-gnu -p player-library
+#
+# player-gtk is intentionally excluded — build it on the device (postmarketOS
+# ships gtk4 + libadwaita) or in an aarch64 GTK container.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install --assume-yes libasound2-dev:arm64",
+]

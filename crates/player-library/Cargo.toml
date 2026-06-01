@@ -1,0 +1,17 @@
+[package]
+name = "player-library"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+lofty = "0.24.0"
+nucleo = "0.5.0"
+ignore = "0.4.25"
+rayon = "1.12.0"
+blake3 = "1.8.5"
+notify = "8.2.0"
+directories = "6.0.0"
+rusqlite = { version = "0.40.0", features = ["bundled"] }

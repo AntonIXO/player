@@ -25,6 +25,61 @@ pub use model::{
     Sort, Track,
 };
 
+/// Build a standalone [`Track`] from an audio file by extracting its tags and
+/// header facts (no DB row, no saved cover art). Used for ad-hoc "Open file"
+/// playback so the now-playing view shows a real title, duration, and sample
+/// rate even for files outside the indexed library — the seek bar and elapsed
+/// clock both depend on a known sample rate / duration, so a metadata-less stub
+/// would freeze them. Falls back to a path-only [`Track`] if extraction fails.
+pub fn track_from_path(path: &Path) -> Track {
+    let folder = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match extract::extract(path) {
+        Ok(e) => Track {
+            id: -1,
+            path: path.to_path_buf(),
+            folder,
+            title: e.title,
+            artist: e.artist,
+            album_artist: e.album_artist,
+            album: e.album,
+            composer: e.composer,
+            genre: e.genre,
+            track_no: e.track_no,
+            disc_no: e.disc_no,
+            year: e.year,
+            duration_ms: e.duration_ms,
+            codec: e.codec,
+            sample_rate: e.sample_rate,
+            bits: e.bits,
+            channels: e.channels,
+            art_hash: None,
+        },
+        Err(_) => Track {
+            id: -1,
+            path: path.to_path_buf(),
+            folder,
+            title: None,
+            artist: None,
+            album_artist: None,
+            album: None,
+            composer: None,
+            genre: None,
+            track_no: None,
+            disc_no: None,
+            year: None,
+            duration_ms: None,
+            codec: None,
+            sample_rate: None,
+            bits: None,
+            channels: None,
+            art_hash: None,
+        },
+    }
+}
+
 use search::Hay;
 
 /// Aggregate counts for the whole library.
@@ -334,8 +389,7 @@ impl Library {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = std::iter::repeat("?")
-            .take(ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(

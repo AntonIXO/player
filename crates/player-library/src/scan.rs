@@ -52,10 +52,15 @@ enum Msg {
 }
 
 /// Scan `root` into the database at `db_path`, caching art under `art_dir`.
+///
+/// `force` re-extracts every file even when `(mtime, size)` is unchanged — use it
+/// to backfill data added by a newer extractor (e.g. folder-sidecar covers) into
+/// an already-indexed library; the normal path skips unchanged files for speed.
 pub fn scan(
     db_path: &Path,
     art_dir: &Path,
     root: &Path,
+    force: bool,
     progress: impl Fn(ScanProgress) + Send + Sync,
 ) -> Result<ScanStats> {
     let start = Instant::now();
@@ -95,7 +100,7 @@ pub fn scan(
             total,
             path: path.clone(),
         });
-        let msg = build_row(path, art_dir, &existing).unwrap_or(Msg::Failed);
+        let msg = build_row(path, art_dir, &existing, force).unwrap_or(Msg::Failed);
         let _ = tx.send(msg);
     });
     // all senders dropped here → writer's recv loop ends.
@@ -132,6 +137,7 @@ fn build_row(
     path: &Path,
     art_dir: &Path,
     existing: &HashMap<String, FileState>,
+    force: bool,
 ) -> Result<Msg> {
     let meta = std::fs::metadata(path)?;
     let mtime_ns = mtime_ns(&meta);
@@ -139,7 +145,7 @@ fn build_row(
     let key = path.to_string_lossy().into_owned();
 
     let existing_id = match existing.get(&key) {
-        Some(fs) if fs.mtime_ns == mtime_ns && fs.size == size => {
+        Some(fs) if !force && fs.mtime_ns == mtime_ns && fs.size == size => {
             return Ok(Msg::Unchanged(fs.id));
         }
         Some(fs) => Some(fs.id),

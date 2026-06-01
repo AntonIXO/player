@@ -91,6 +91,10 @@ enum Cmd {
         /// Database path (default: $XDG_DATA_HOME/player/library.db).
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Re-extract every file even if unchanged (backfills new data such as
+        /// folder-sidecar covers into an already-indexed library).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Search the library index.
@@ -138,7 +142,7 @@ fn main() -> ExitCode {
         Cmd::LoopbackVerifyQueue { files, out, input } => {
             return loopback_verify_queue(&files, &out, &input)
         }
-        Cmd::Scan { root, db } => lib_scan(&root, db).map_err(to_core_err),
+        Cmd::Scan { root, db, force } => lib_scan(&root, db, force).map_err(to_core_err),
         Cmd::Search {
             query,
             db,
@@ -575,10 +579,10 @@ fn parse_filter(s: &str) -> Filter {
     }
 }
 
-fn lib_scan(root: &Path, db: Option<PathBuf>) -> player_library::Result<()> {
+fn lib_scan(root: &Path, db: Option<PathBuf>, force: bool) -> player_library::Result<()> {
     let mut lib = open_library(db)?;
-    println!("scanning {} …", root.display());
-    let stats = lib.scan_with_progress(root, |p| {
+    println!("scanning {} {}…", root.display(), if force { "(force) " } else { "" });
+    let stats = lib.scan_with_progress(root, force, |p| {
         if p.seen % 500 == 0 || p.seen == p.total {
             print!("\r  {} / {} files", p.seen, p.total);
             let _ = io::stdout().flush();

@@ -88,16 +88,18 @@ impl Library {
 
     /// Incrementally scan `root` and rebuild the typeahead index.
     pub fn scan(&mut self, root: &Path) -> Result<ScanStats> {
-        self.scan_with_progress(root, |_| {})
+        self.scan_with_progress(root, false, |_| {})
     }
 
-    /// Scan with a progress callback (called from worker threads).
+    /// Scan with a progress callback (called from worker threads). `force`
+    /// re-extracts unchanged files too (see [`scan::scan`]).
     pub fn scan_with_progress(
         &mut self,
         root: &Path,
+        force: bool,
         progress: impl Fn(ScanProgress) + Send + Sync,
     ) -> Result<ScanStats> {
-        let stats = scan::scan(&self.db_path, &self.art_dir, root, progress)?;
+        let stats = scan::scan(&self.db_path, &self.art_dir, root, force, progress)?;
         self.reload_index()?;
         Ok(stats)
     }

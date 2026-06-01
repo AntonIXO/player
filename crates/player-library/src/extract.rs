@@ -84,7 +84,63 @@ pub fn extract(path: &Path) -> crate::Result<Extracted> {
         }
     }
 
+    // Fallback: many libraries keep the cover as a folder sidecar (cover.jpg,
+    // folder.jpg, …) rather than embedding it — common for M4A/ALAC rips.
+    if e.art.is_none() {
+        e.art = folder_cover(path);
+    }
+
     Ok(e)
+}
+
+/// Sidecar cover-image base names (without extension), case-insensitive.
+const COVER_NAMES: &[&str] = &["cover", "folder", "front", "albumart", "album", "thumb"];
+/// Image extensions we accept for a folder cover.
+const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
+
+/// Look for a cover image alongside `path` (the track's folder). Returns the
+/// same `(blake3 hex, mime, bytes)` shape as embedded art so it caches/dedupes
+/// identically.
+fn folder_cover(path: &Path) -> Option<(String, String, Vec<u8>)> {
+    let dir = path.parent()?;
+    let mut chosen: Option<std::path::PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let stem = stem.to_ascii_lowercase();
+        let ext = ext.to_ascii_lowercase();
+        if !COVER_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        if COVER_NAMES.iter().any(|n| stem == *n) {
+            // Prefer the canonical "cover"/"folder"; take it immediately.
+            if stem == "cover" || stem == "folder" {
+                chosen = Some(p);
+                break;
+            }
+            chosen.get_or_insert(p);
+        }
+    }
+    let p = chosen?;
+    let bytes = std::fs::read(&p).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mime = match p.extension().and_then(|s| s.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("png") => "image/png",
+        Some(e) if e.eq_ignore_ascii_case("webp") => "image/webp",
+        Some(e) if e.eq_ignore_ascii_case("gif") => "image/gif",
+        Some(e) if e.eq_ignore_ascii_case("bmp") => "image/bmp",
+        _ => "image/jpeg",
+    }
+    .to_string();
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Some((hash, mime, bytes))
 }
 
 fn norm<S: AsRef<str>>(v: Option<S>) -> Option<String> {

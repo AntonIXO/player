@@ -85,6 +85,9 @@ struct Ui {
     /// True while the user is dragging the seek slider — suppresses programmatic
     /// position updates so the handle does not fight the drag.
     seeking: Cell<bool>,
+    /// Monotonic seek-debounce generation: each slider move bumps it and arms a
+    /// timeout; only the latest generation actually commits the engine seek.
+    seek_gen: Cell<u64>,
     // library
     nav: adw::NavigationView,
     albums_flow: gtk::FlowBox,
@@ -286,6 +289,7 @@ fn build_ui(app: &adw::Application) {
         np_format: np.format,
         np_stack: np.stack.clone(),
         seeking: Cell::new(false),
+        seek_gen: Cell::new(0),
         nav: lib.nav.clone(),
         albums_flow: lib.albums_flow.clone(),
         az_box: lib.az_box.clone(),
@@ -803,7 +807,7 @@ fn wire(
                     if let Ok(folder) = res {
                         if let Some(path) = folder.path() {
                             state.borrow_mut().music_dir = Some(path.clone());
-                            start_scan(&state, &ui, path);
+                            start_scan(&state, &ui, path, false);
                         }
                     }
                 });
@@ -815,7 +819,9 @@ fn wire(
                 popover.popdown();
                 let dir = state.borrow().music_dir.clone();
                 match dir {
-                    Some(d) => start_scan(&state, &ui, d),
+                    // Force re-extraction so covers/tags refresh even when files
+                    // are byte-unchanged on disk.
+                    Some(d) => start_scan(&state, &ui, d, true),
                     None => ui.toast("Pick a music folder first (Scan Music Folder…)"),
                 }
             });
@@ -852,38 +858,34 @@ fn wire(
         });
     }
 
-    // interactive seek: drag the slider → engine seek. A press marks `seeking`
-    // so `on_position` stops driving the handle; release commits the seek.
+    // interactive seek. `change-value` fires only on *user* input (drag, click,
+    // arrow/scroll) — never on our programmatic `set_value` in `on_position`,
+    // which would otherwise feed back as a seek. A `GestureClick` on a `Scale` is
+    // unreliable (the Scale claims the drag sequence, so `released` is cancelled
+    // and the seek never commits — the bug we're fixing). Each move marks
+    // `seeking` (freezing `on_position`), updates the elapsed readout live, and
+    // arms a debounce: only the latest generation commits the engine seek, so a
+    // continuous drag results in one seek when the handle settles.
     {
-        let scale = ui.np_seek.clone();
-        let press = gtk::GestureClick::new();
-        {
-            let ui = ui.clone();
-            press.connect_pressed(move |_, _, _, _| ui.seeking.set(true));
-        }
-        {
+        let (state, ui) = (state.clone(), ui.clone());
+        ui.np_seek.clone().connect_change_value(move |_, _, value| {
+            let frac = value.clamp(0.0, 1.0);
+            ui.seeking.set(true);
+            let total_ms = current_total_ms(&state);
+            if total_ms > 0 {
+                ui.np_elapsed.set_label(&mmss((frac * total_ms as f64 / 1000.0) as u64));
+            }
+            let gen = ui.seek_gen.get().wrapping_add(1);
+            ui.seek_gen.set(gen);
             let (state, ui) = (state.clone(), ui.clone());
-            let scale2 = scale.clone();
-            press.connect_released(move |_, _, _, _| {
-                let frac = scale2.value().clamp(0.0, 1.0);
+            glib::timeout_add_local_once(Duration::from_millis(180), move || {
+                if ui.seek_gen.get() != gen {
+                    return; // a newer move superseded this one
+                }
                 ui.seeking.set(false);
                 seek_to_fraction(&state, &ui, frac);
             });
-        }
-        scale.add_controller(press);
-    }
-    // live elapsed readout while dragging (the handle has already moved).
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        let scale = ui.np_seek.clone();
-        scale.connect_value_changed(move |s| {
-            if ui.seeking.get() {
-                let total_ms = current_total_ms(&state);
-                if total_ms > 0 {
-                    let secs = (s.value() * total_ms as f64 / 1000.0) as u64;
-                    ui.np_elapsed.set_label(&mmss(secs));
-                }
-            }
+            glib::Propagation::Proceed
         });
     }
 
@@ -1731,7 +1733,10 @@ enum ScanMsg {
     Done(Result<player_library::ScanStats, String>),
 }
 
-fn start_scan(state: &SharedState, ui: &SharedUi, root: PathBuf) {
+/// Scan `root` into the library on a worker thread. `force` re-extracts every
+/// file even when unchanged — used by "Rescan Library" so newly-supported data
+/// (e.g. folder-sidecar covers) is backfilled into an already-indexed library.
+fn start_scan(state: &SharedState, ui: &SharedUi, root: PathBuf, force: bool) {
     ui.toast(&format!("Scanning {}…", root.display()));
     let (db, art) = {
         let s = state.borrow();
@@ -1742,7 +1747,7 @@ fn start_scan(state: &SharedState, ui: &SharedUi, root: PathBuf) {
     std::thread::spawn(move || match Library::open(&db, &art) {
         Ok(mut lib) => {
             let tx2 = tx.clone();
-            let res = lib.scan_with_progress(&root, move |p| {
+            let res = lib.scan_with_progress(&root, force, move |p| {
                 let _ = tx2.send_blocking(ScanMsg::Progress(p.seen, p.total));
             });
             let _ = tx.send_blocking(ScanMsg::Done(res.map_err(|e| e.to_string())));
@@ -1878,7 +1883,7 @@ fn open_settings(state: &SharedState, ui: &SharedUi) {
                             let _ = s.library.set_meta("music_dir", &path.to_string_lossy());
                             s.music_dir = Some(path.clone());
                         }
-                        start_scan(&state, &ui, path);
+                        start_scan(&state, &ui, path, false);
                     }
                 }
             });
@@ -1963,7 +1968,7 @@ fn set_watch(state: &SharedState, ui: &SharedUi, on: bool) {
                         while arx.try_recv().is_ok() {}
                         let dir = state.borrow().music_dir.clone();
                         if let Some(d) = dir {
-                            start_scan(&state, &ui, d);
+                            start_scan(&state, &ui, d, false);
                         }
                     }
                 });
@@ -2222,7 +2227,22 @@ fn row_widget(
     let lbr = gtk::ListBoxRow::new();
     lbr.set_child(Some(&row));
     lbr.set_activatable(true);
-    lbr.connect_activate(move |_| on_activate());
+    // `ListBoxRow::activate` is a *keyboard* action signal — it does NOT fire on a
+    // pointer tap (that was the "touching a track does nothing" bug). Drive taps
+    // with an explicit `GestureClick` and keep `connect_activate` for the Enter
+    // key. The trailing circle button claims its own clicks, so tapping it won't
+    // also fire the row gesture.
+    let on_activate = Rc::new(on_activate);
+    lbr.connect_activate({
+        let on_activate = on_activate.clone();
+        move |_| on_activate()
+    });
+    let tap = gtk::GestureClick::new();
+    tap.connect_released(move |g, _, _, _| {
+        g.set_state(gtk::EventSequenceState::Claimed);
+        on_activate();
+    });
+    lbr.add_controller(tap);
     lbr
 }
 
@@ -2248,10 +2268,15 @@ fn album_cell(art_dir: &Path, al: &Album) -> gtk::Box {
 }
 
 fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
-    let w: gtk::Widget = match hash {
+    let inner: gtk::Widget = match hash {
         Some(h) if art_dir.join(h).exists() => {
             let pic = gtk::Picture::for_filename(art_dir.join(h));
+            // Crop-to-fill, and let the paintable shrink below its intrinsic size
+            // so the square frame (below) drives the geometry, not the image.
             pic.set_content_fit(ContentFit::Cover);
+            pic.set_can_shrink(true);
+            pic.set_halign(gtk::Align::Fill);
+            pic.set_valign(gtk::Align::Fill);
             pic.upcast()
         }
         _ => {
@@ -2266,13 +2291,21 @@ fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::
             b.upcast()
         }
     };
-    w.set_size_request(size, size);
-    w.set_overflow(gtk::Overflow::Hidden);
-    w.add_css_class("art");
+    // A `gtk::Picture` reports the image's natural aspect ratio, so a plain parent
+    // allocates it as a *rectangle*. Wrap it in an AspectFrame locked to 1:1
+    // (`ratio = 1.0`, `obey_child = false`) so cover art is always a centred
+    // square — matching the design — regardless of the source image's shape.
+    let frame = gtk::AspectFrame::new(0.5, 0.5, 1.0, false);
+    frame.set_child(Some(&inner));
+    frame.set_size_request(size, size);
+    frame.set_halign(gtk::Align::Center);
+    frame.set_valign(gtk::Align::Center);
+    frame.set_overflow(gtk::Overflow::Hidden);
+    frame.add_css_class("art");
     if big {
-        w.add_css_class("art-lg");
+        frame.add_css_class("art-lg");
     }
-    w
+    frame.upcast()
 }
 
 fn format_chip(spec: &str) -> gtk::Box {

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Apply the shipped preset so the audio-setup service is enabled. On image builds
+# postmarketOS runs `systemctl preset-all`; this covers live installs too. Guarded
+# so it never fails the transaction when systemd isn't running (e.g. in the chroot).
+systemctl preset hifi-player-audio-setup.service >/dev/null 2>&1 || true
+
+cat >&2 <<'EOF'
+
+hifi-player installed. Three manual follow-ups (one-time):
+
+  1. Add your login user to the 'audio' group (RT scheduling + DAC access):
+         sudo adduser <user> audio          # then log out and back in
+     (PAM applies /etc/security/limits.d/99-audio.conf to the graphical session.)
+
+  2. Apply the kernel cmdline audio tuning in /etc/kernel-cmdline.d/90-audio.conf:
+         sudo apk fix linux-postmarketos-qcom-sdm845   # rebuilds the boot image
+     then reflash the kernel / reboot.
+
+  3. If a sound server still grabs the DAC, set its vendor:product in
+     /etc/udev/rules.d/99-mojo2-nopulse.rules from:  lsusb | grep -i chord
+
+EOF
+exit 0

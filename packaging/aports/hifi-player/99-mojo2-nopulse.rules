@@ -1,0 +1,10 @@
+# Keep PipeWire / WirePlumber / PulseAudio off the USB DAC so the bit-perfect
+# player can open it exclusively (hw:). Belt-and-suspenders: the player grabs the
+# device exclusively anyway and WirePlumber releases idle devices, but this makes
+# the grab deterministic.
+#
+# Match by product name (works without knowing the numeric IDs):
+ATTRS{product}=="*Mojo*", ENV{PULSE_IGNORE}="1", ENV{ACP_IGNORE_DEV}="1", ENV{SOUND_CLASS}="none"
+#
+# Or match by vendor:product — fill XXXX / YYYY from `lsusb | grep -i chord`:
+#SUBSYSTEM=="usb", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", ENV{PULSE_IGNORE}="1", ENV{ACP_IGNORE_DEV}="1", ENV{SOUND_CLASS}="none"

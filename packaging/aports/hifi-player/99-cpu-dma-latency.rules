@@ -1,0 +1,4 @@
+# Let the 'audio' group hold /dev/cpu_dma_latency open so the player's
+# CpuLatencyGuard can bound CPU wake-up latency during playback. (It lives in the
+# 'misc' subsystem, not 'virtual'.)
+SUBSYSTEM=="misc", KERNEL=="cpu_dma_latency", GROUP="audio", MODE="0660"

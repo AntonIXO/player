@@ -1,0 +1,44 @@
+# Audiophile kernel-config deltas for linux-postmarketos-qcom-sdm845 (beryllium).
+#
+# REFERENCE / DOCUMENTATION ONLY. The pmaports kernel package builds from the
+# fully-resolved `config-postmarketos-qcom-sdm845.aarch64`, not from fragments,
+# so these symbols must be applied into that file — either with
+#   pmbootstrap kconfig edit linux-postmarketos-qcom-sdm845
+# or by editing the symbols directly and re-running `pmbootstrap kconfig check`.
+#
+# Everything the two guides ask for that ISN'T listed here is already enabled in
+# the shipped config: CONFIG_HZ_1000, CONFIG_PREEMPT (full), HIGH_RES_TIMERS,
+# IRQ_FORCED_THREADING, CPU_FREQ_GOV_PERFORMANCE. Only the deltas below remain.
+
+# --- Full-tickless isolated audio core ---------------------------------------
+# Was NO_HZ_IDLE. NO_HZ_FULL lets a core run tickless when a single RT task owns
+# it; it auto-selects RCU_NOCB_CPU. Pairs with the cmdline isolation in the
+# hifi-player package (nohz_full=7 rcu_nocbs=7 isolcpus=7 irqaffinity=0-6).
+CONFIG_NO_HZ_FULL=y
+# CONFIG_NO_HZ_IDLE is unset by the above (mutually exclusive); kept implicit.
+CONFIG_RCU_NOCB_CPU=y
+
+# --- USB audio driver built-in (was =m) --------------------------------------
+# Built-in removes module-load latency and makes the kernel-cmdline module
+# params authoritative. NOTE: once built-in, /etc/modprobe.d/audio.conf no
+# longer applies — params move to the cmdline as snd_usb_audio.<param>
+# (underscores), handled in the hifi-player 90-audio-cmdline.conf.
+CONFIG_SND_USB_AUDIO=y
+
+# --- Transparent hugepages -----------------------------------------------------
+# NOT changed here: toggling CONFIG_TRANSPARENT_HUGEPAGE needs CONFIG_EXPERT,
+# which pmOS keeps off. Relax at runtime via the cmdline `transparent_hugepage=madvise`
+# (in the hifi-player 90-audio-cmdline.conf) instead of a config change.
+
+# --- Build-gate fix (not audio-related) ---------------------------------------
+# Pulling pmaports to the 7.1_rc1 HEAD brought a stricter hardening kconfigcheck
+# (category:hardening, all versions/arches) than the shipped config satisfied:
+# it now requires SECURITY_YAMA=y. Without this, `pmbootstrap build` aborts on the
+# community gate before compiling. YAMA (ptrace_scope LSM) is a benign security
+# setting with zero audio impact; enabling it makes the community check green.
+CONFIG_SECURITY_YAMA=y
+
+# --- DELIBERATELY NOT TOUCHED (would fail pmb:kconfigcheck-community / break systemd):
+#   CONFIG_BPF_SYSCALL, CONFIG_IPV6, CONFIG_NETFILTER  (required by the userspace)
+#   CONFIG_COMPACTION, CONFIG_MIGRATION                (selected by THP/hotplug; risky)
+#   CONFIG_FTRACE and other DEBUG_* strips             (need EXPERT; marginal benefit)

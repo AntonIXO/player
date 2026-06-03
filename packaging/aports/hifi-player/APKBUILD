@@ -1,0 +1,112 @@
+# Maintainer: Anton <fourth@devpins.org>
+pkgname=hifi-player
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
+url="https://github.com/AntonIXO/player"
+# beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
+arch="aarch64"
+license="MIT"
+# alsa-lib and the GTK4/libadwaita runtime libraries are added automatically by
+# abuild's shared-library tracing, so they are not listed here. alsa-utils is for
+# on-device verification (aplay / speaker-test). The RT / governor / IRQ tuning is
+# self-contained in the systemd service, so there is no rtirq/cpupower dependency.
+depends="alsa-utils"
+makedepends="
+	cargo
+	rust
+	gtk4.0-dev
+	libadwaita-dev
+	alsa-lib-dev
+"
+install="$pkgname.post-install"
+# net:    cargo fetches crate sources in prepare() (build() then runs offline).
+# !check: the test suite needs an ALSA loopback device, unavailable in the chroot.
+options="net !check"
+# Local-source build: run
+#   pmbootstrap build --src=/home/antonix/player hifi-player
+# which rsyncs the working tree into $builddir. (A tagged release would instead add
+# a "$pkgname-$pkgver.tar.gz::<github-archive-url>" entry to source= and drop --src.)
+source="
+	hifi-player-audio-setup
+	hifi-player-audio-setup.service
+	hifi-player.preset
+	hifi-player.desktop
+	hifi-player.svg
+	99-mojo2-nopulse.rules
+	99-cpu-dma-latency.rules
+	99-audio.conf
+	audio.conf
+	99-audio-sysctl.conf
+	90-audio-cmdline.conf
+"
+builddir="$srcdir/$pkgname-$pkgver"
+
+prepare() {
+	default_prepare
+	cd "$builddir"
+	# Pre-fetch every crate dependency now; build() is offline (--frozen).
+	cargo fetch --locked
+}
+
+build() {
+	cd "$builddir"
+	# Native musl/aarch64 build inside the chroot: no --target, no linker flags.
+	cargo build --release --frozen -p player-gtk -p player-cli
+}
+
+package() {
+	cd "$builddir"
+	install -Dm755 target/release/player-gtk "$pkgdir"/usr/bin/player-gtk
+	install -Dm755 target/release/player-cli "$pkgdir"/usr/bin/player-cli
+
+	# Phosh app-grid launcher + icon.
+	install -Dm644 "$srcdir"/hifi-player.desktop \
+		"$pkgdir"/usr/share/applications/hifi-player.desktop
+	install -Dm644 "$srcdir"/hifi-player.svg \
+		"$pkgdir"/usr/share/icons/hicolor/scalable/apps/hifi-player.svg
+
+	# systemd service: USB host mode (OTG workaround) + governors + IRQ RT.
+	# Shared imperative setup script (also runnable by hand), unit, and the
+	# preset that enables it at image build (`systemctl preset-all`).
+	install -Dm755 "$srcdir"/hifi-player-audio-setup \
+		"$pkgdir"/usr/bin/hifi-player-audio-setup
+	install -Dm644 "$srcdir"/hifi-player-audio-setup.service \
+		"$pkgdir"/usr/lib/systemd/system/hifi-player-audio-setup.service
+	install -Dm644 "$srcdir"/hifi-player.preset \
+		"$pkgdir"/usr/lib/systemd/system-preset/80-hifi-player.preset
+
+	# udev: keep the sound server off the DAC; let the audio group hold cpu_dma_latency.
+	install -Dm644 "$srcdir"/99-mojo2-nopulse.rules \
+		"$pkgdir"/etc/udev/rules.d/99-mojo2-nopulse.rules
+	install -Dm644 "$srcdir"/99-cpu-dma-latency.rules \
+		"$pkgdir"/etc/udev/rules.d/99-cpu-dma-latency.rules
+
+	# RT limits, snd-usb-audio module options, swap/dirty tuning.
+	install -Dm644 "$srcdir"/99-audio.conf \
+		"$pkgdir"/etc/security/limits.d/99-audio.conf
+	install -Dm644 "$srcdir"/audio.conf \
+		"$pkgdir"/etc/modprobe.d/audio.conf
+	install -Dm644 "$srcdir"/99-audio-sysctl.conf \
+		"$pkgdir"/etc/sysctl.d/99-audio-sysctl.conf
+
+	# Kernel cmdline additions (applied on the next boot-image rebuild).
+	install -Dm644 "$srcdir"/90-audio-cmdline.conf \
+		"$pkgdir"/etc/kernel-cmdline.d/90-audio.conf
+}
+
+# Generated with `sha512sum` over the source= files (regenerate after any edit
+# with `pmbootstrap checksum hifi-player` or `abuild checksum`).
+sha512sums="
+9943581150f1a9bd618387b94e6dc6baa78df5035d97e306b9cf72a5c9d3c559e0c8d4b3661338c83f90c25db113d752de72a4bf571c5259bcc36debd31a8b7f  hifi-player-audio-setup
+faff1c8006f71863df0f2efc0ad2a7392e4bf045f531a9a17cdfcb8f1997f23f460b6f62d24fc7e0efa6a621a7e2e9031924549448550d0eb41ac6cf71504f03  hifi-player-audio-setup.service
+640b1c10c767e9972250338743eeb49164edcdde0b11d19fc299d39daa262df4de5922d7e31a20b2c25e4d62a45973d07a49e4e95990b0cca9887da5600a4d91  hifi-player.preset
+021da27d848da5d7405ed03d0ba711448ff04f6b4c2847ca8e7bd819b2195bd0372bc946e1dd98a43f3bbfc4d279783fb60033d239a92288d6311b4ec769bfff  hifi-player.desktop
+07e2281d300d92ef337eca966b7c20f55174c21f100f877c1b74ac9fe2ac9f0f0f2be51c2694716c4258311b0a8e742751b12f21bae802b309ec0073f605560a  hifi-player.svg
+4818d2539c8af4246e4672d2ab93fa13a8bc9548870fa06bcc30a38ded52232c36aff08ba01a55bf21692137f730a230f673d8579533e5cc02548cf3955d3cc3  99-mojo2-nopulse.rules
+3928ceae0a348105d6595d624284f6e3e4acff589a49c65cfb2fe33cba00253d39805b84192bb40def6d6219abe114514eece9c228d5dd0efcfc50aeea1669b4  99-cpu-dma-latency.rules
+8f0eeeae79ed4d6ed8e5b7c203802fa53b56e3668ffb0795762fd6540ae4c9bc9d0d15b16690e6b8b10465bcfeb865b8aa1ed5932e38db5786fd2ff075cfa47d  99-audio.conf
+b77a030b39c49eab93eaa3b0aa0360bd68b6d618fb43abd6c7048b851180cc25fbb52ff307a3ac8d7e3d17458fa8b9fb1336ed6931ef88640fdcc2c3e0c028c0  audio.conf
+94b0fc0c1b395d0d00e6c9c98d7fa5bf6dced987f3cbd35a24543b73d0e1aea400ca849a3f4bd68b8ad235b580fd9ab71cbe8ca2311a91b87c38c401c935d3d4  99-audio-sysctl.conf
+83e2fca19ca29e3e8a848cafab1b865df63391fd421af074a1ce7a62d93a88b733f763461c154a1bd878bb2492e6199a165e1657ee7bb541318f231b86ed0e3b  90-audio-cmdline.conf
+"

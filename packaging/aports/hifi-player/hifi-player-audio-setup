@@ -1,0 +1,63 @@
+#!/bin/sh
+# Imperative audio-environment setup for the bit-perfect player on the Poco F1
+# (beryllium / SDM845). Driven by hifi-player-audio-setup.service (start|stop),
+# and safe to re-run by hand (`sudo hifi-player-audio-setup`). Every step degrades
+# quietly when a sysfs node is absent, so it is safe across kernel revisions.
+#
+# Note: /etc/sysctl.d, /etc/modprobe.d, /etc/udev/rules.d and /etc/security/limits.d
+# are applied by systemd-sysctl, the module loader, udev and PAM respectively — this
+# script only handles the imperative bits that have no declarative equivalent.
+set -u
+
+start() {
+	# 1. Force DWC3 into USB host mode. USB OTG is officially "Broken" on
+	#    beryllium; this is the community workaround that lets the Mojo 2
+	#    enumerate. Try debugfs first, then the sysfs role interfaces.
+	for f in /sys/kernel/debug/usb/*/mode; do
+		[ -e "$f" ] && echo host > "$f" 2>/dev/null
+	done
+	for r in /sys/bus/platform/devices/a600000.dwc3/usb_role \
+	         /sys/class/usb_role/*/role; do
+		[ -e "$r" ] && echo host > "$r" 2>/dev/null
+	done
+
+	# 2. Performance governor on the Kryo 385 Gold cores (CPUs 4-7) so DVFS
+	#    ramp-up never starves the SCHED_FIFO audio thread; little cores stay
+	#    on schedutil.
+	for c in 4 5 6 7; do
+		g="/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor"
+		[ -w "$g" ] && echo performance > "$g" 2>/dev/null
+	done
+
+	# 3. Pin + RT-boost the threaded DWC3 / xHCI USB IRQs onto the isolated audio
+	#    core (CPU 7; see isolcpus=7 / nohz_full=7 in 90-audio.conf) so USB packet
+	#    completion runs RT right next to the SCHED_FIFO player thread with no
+	#    cross-core hop. The cmdline "irqaffinity=0-6" keeps every *other* IRQ off
+	#    CPU 7. Requires "threadirqs"; degrades to a no-op otherwise.
+	for pid in $(pgrep 'irq/[0-9]+-(dwc3|xhci|usb)' 2>/dev/null); do
+		chrt -f -p 90 "$pid" 2>/dev/null
+	done
+	for irq in $(awk -F: '/dwc3|xhci/ { gsub(/ /, "", $1); print $1 }' \
+	             /proc/interrupts 2>/dev/null); do
+		a="/proc/irq/$irq/smp_affinity_list"
+		[ -w "$a" ] && echo 7 > "$a" 2>/dev/null
+	done
+
+	# 4. Backstop the swap/dirty sysctls (systemd-sysctl already applies the file).
+	sysctl -qw vm.swappiness=10 vm.dirty_ratio=5 vm.dirty_background_ratio=2 \
+		>/dev/null 2>&1
+}
+
+stop() {
+	for c in 4 5 6 7; do
+		g="/sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor"
+		[ -w "$g" ] && echo schedutil > "$g" 2>/dev/null
+	done
+}
+
+case "${1:-start}" in
+	start) start ;;
+	stop)  stop ;;
+	*)     echo "usage: $0 {start|stop}" >&2; exit 2 ;;
+esac
+exit 0

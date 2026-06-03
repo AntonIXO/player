@@ -30,11 +30,11 @@ whole GTK4 workspace links against Alpine's musl libraries.
 # 0. (once) select the device profile for image builds
 pmbootstrap init            # xiaomi / beryllium / panel tianma|ebbg / phosh / edge / f2fs
 
-# 1. stage the package into the pmaports checkout and build it
-cp -r packaging/aports/hifi-player \
-      ~/.local/var/pmbootstrap/cache_git/pmaports/temp/
-pmbootstrap checksum hifi-player
-pmbootstrap build --arch aarch64 --src="$PWD" hifi-player   # first build is slow (qemu)
+# 1. link the package into pmaports once — builds straight from this repo and
+#    survives `pmbootstrap pull` (drops a symlink into pmaports' git-ignored
+#    custom-player/ dir; no copying, correct channel). Re-run after `pmbootstrap init`.
+sh packaging/aports/link-into-pmaports.sh
+pmbootstrap build --arch aarch64 --src="$PWD" hifi-player
 
 # 2a. bake into the image …
 pmbootstrap install --add hifi-player --filesystem f2fs     # +--fde for encryption
@@ -54,3 +54,30 @@ cmdline. See `aports/hifi-player/hifi-player.post-install` for the full checklis
 > **USB OTG is officially "Broken" on beryllium.** The whole Mojo-2-over-USB path
 > depends on the host-mode workaround in the init script succeeding — verify
 > `lsusb | grep -i chord` enumerates the DAC before anything else.
+
+## Source of truth & `pmbootstrap pull`
+
+This repo is canonical; pmbootstrap's `~/.local/var/pmbootstrap/cache_git/pmaports` is just
+a build checkout of upstream that `pmbootstrap pull` fast-forwards — **only when its git tree
+is clean.**
+
+- **hifi-player** — handled by `aports/link-into-pmaports.sh`: it symlinks the package into
+  pmaports' git-ignored `custom-player/` directory (pmaports' `.gitignore` whitelists
+  `custom-*/` for exactly this). So it builds from this repo, keeps the right channel
+  (e.g. `systemd-edge`, since it lives *inside* pmaports — unlike a `config aports` overlay,
+  which would become pkgrepo[0] and flip channel detection), and is invisible to git →
+  **never blocks or gets overwritten by a pull.** Re-run the script after a fresh `pmbootstrap init`.
+
+- **kernel** — `linux-postmarketos-qcom-sdm845` is an *upstream* package we override, so it
+  can't use `custom-*`. Its canonical artifacts live in `../kernel/` (the `0002`/`0003`
+  patches + `audiophile.kconfig`); the working edits sit directly in the pmaports kernel dir
+  and **do** dirty the tree. To update pmaports:
+
+  ```sh
+  cd ~/.local/var/pmbootstrap/cache_git/pmaports
+  git checkout -- device/community/linux-postmarketos-qcom-sdm845/        # drop our edits
+  rm -f device/community/linux-postmarketos-qcom-sdm845/000[23]-*.patch   # drop staged patches
+  pmbootstrap pull                                                        # clean now → updates
+  ```
+  then re-apply from `../kernel/` per its README (copy the patches, add them to `source=`,
+  bump `pkgrel`, re-apply the `audiophile.kconfig` deltas, `pmbootstrap checksum`).

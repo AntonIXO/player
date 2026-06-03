@@ -17,7 +17,7 @@ pub use engine::{
     play_queue_blocking, run_playback, Cmd, Event, Flow, Player, Stats, DEFAULT_PERIOD,
     DEFAULT_PERIODS,
 };
-pub use rt::Sched;
+pub use rt::{CpuLatencyGuard, Sched};
 pub use error::{Error, Result};
 pub use format::{AlsaFmt, DeviceFormats, StreamSpec};
 pub use sink::{capture::capture_raw, probe_formats, AlsaSink};

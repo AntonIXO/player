@@ -12,7 +12,7 @@ use crossbeam_channel::Receiver;
 use rtrb::Consumer;
 
 use crate::format::StreamSpec;
-use crate::rt;
+use crate::rt::{self, CpuLatencyGuard};
 use crate::sink::AlsaSink;
 
 use super::{Ctl, Event, Stats};
@@ -57,6 +57,13 @@ pub(crate) fn run(
         sched,
     };
 
+    // PM-QoS guard: held only while a segment is actively playing so deep CPU
+    // C-states (whose exit latency is a common source of USB-audio xruns) can't
+    // engage mid-stream; released when the thread goes idle so the CPU can sleep
+    // between sessions. No-op on a dev box where `/dev/cpu_dma_latency` isn't
+    // writable — bit-perfect output is unaffected either way.
+    let mut latency_guard: Option<CpuLatencyGuard> = None;
+
     // Segment directives that arrived while an earlier segment was still
     // playing, kept in order so a decode thread racing ahead across several
     // rate changes never loses or reorders a segment.
@@ -67,17 +74,22 @@ pub(crate) fn run(
         let (spec, mut consumer, pos_base) = loop {
             let dir = match pending.pop_front() {
                 Some(d) => d,
-                None => match ctl_rx.recv() {
-                    Ok(Ctl::Open {
-                        spec,
-                        consumer,
-                        pos_base,
-                    }) => Next::Open(spec, consumer, pos_base),
-                    Ok(Ctl::Finish { quit }) => Next::Finish { quit },
-                    // Idle flush / pause / resume: no active segment to act on.
-                    Ok(Ctl::Flush) | Ok(Ctl::Pause) | Ok(Ctl::Resume) => continue,
-                    Ok(Ctl::Quit) | Err(_) => Next::Quit,
-                },
+                None => {
+                    // Nothing queued: going idle. Release the latency guard so
+                    // the CPU may sleep until the next segment arrives.
+                    latency_guard = None;
+                    match ctl_rx.recv() {
+                        Ok(Ctl::Open {
+                            spec,
+                            consumer,
+                            pos_base,
+                        }) => Next::Open(spec, consumer, pos_base),
+                        Ok(Ctl::Finish { quit }) => Next::Finish { quit },
+                        // Idle flush / pause / resume: no active segment to act on.
+                        Ok(Ctl::Flush) | Ok(Ctl::Pause) | Ok(Ctl::Resume) => continue,
+                        Ok(Ctl::Quit) | Err(_) => Next::Quit,
+                    }
+                }
             };
             match dir {
                 Next::Open(s, c, b) => break (s, c, b),
@@ -90,6 +102,13 @@ pub(crate) fn run(
                 Next::Quit => break 'outer,
             }
         };
+
+        // Playback is about to start: bound CPU wake-up latency (100 µs) for the
+        // life of this and any gapless follow-on segment. Held across pauses;
+        // released only when the thread returns to the idle wait above.
+        if latency_guard.is_none() {
+            latency_guard = CpuLatencyGuard::new(100);
+        }
 
         let mut sink = match AlsaSink::open(&device, spec, period, periods) {
             Ok(s) => s,

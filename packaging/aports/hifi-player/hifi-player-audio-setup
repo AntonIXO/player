@@ -43,6 +43,13 @@ start() {
 		[ -w "$a" ] && echo 7 > "$a" 2>/dev/null
 	done
 
+	# 3b. RT-boost ksoftirqd on the audio core (low RT prio, below the IRQ thread's
+	#     90) so deferred USB-completion softirqs are serviced promptly on core 7
+	#     instead of waiting behind SCHED_OTHER work. ArchQ pattern.
+	for pid in $(pgrep -x 'ksoftirqd/7' 2>/dev/null); do
+		chrt -f -p 50 "$pid" 2>/dev/null
+	done
+
 	# 4. Backstop the swap/dirty sysctls (systemd-sysctl already applies the file).
 	sysctl -qw vm.swappiness=10 vm.dirty_ratio=5 vm.dirty_background_ratio=2 \
 		>/dev/null 2>&1

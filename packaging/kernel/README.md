@@ -8,8 +8,9 @@ because the in-tree pmaports copy gets wiped by `pmbootstrap pull`.
 
 | File | Role |
 |---|---|
-| `0002-…-force-usb-host-mode.patch` | DTS patch: `&usb_1_dwc3` `dr_mode = "peripheral"` → `"host"` in the shared `sdm845-xiaomi-beryllium-common.dtsi` (covers both EBBG + Tianma panels). |
-| `audiophile.kconfig` | Reference list of the kernel-config deltas to apply (`NO_HZ_FULL`, `SND_USB_AUDIO=y`). Most audiophile options ship enabled already. |
+| `0002-…-force-usb-host-mode.patch` | DTS: `&usb_1_dwc3` `dr_mode = "peripheral"` → `"host"` in the shared `sdm845-xiaomi-beryllium-common.dtsi` (covers both EBBG + Tianma panels). |
+| `0003-…-disable-internal-audio.patch` | DTS: `status="disabled"` on `&sound`/`&wcd9340`/`&slim`/`&slimbam` — frees SLIMbus + the internal codec (audio is USB-only). Reversible. |
+| `audiophile.kconfig` | Kernel-config deltas: `NO_HZ_FULL`+`RCU_NOCB`, `LTO_CLANG_THIN`, `SECURITY_YAMA` (build-gate fix), and the ALSA core + `SND_USB_AUDIO` built-in `=y` (needs `SOUND`/`SND`/`SND_PCM`/… `=y`). Most audiophile options ship enabled already. |
 
 > **Permanent host-only USB.** After this, the USB-C port is host-only every boot: no
 > charging, no adb/usb-networking while booted. `fastboot` from the bootloader still

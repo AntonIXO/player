@@ -18,12 +18,30 @@ CONFIG_NO_HZ_FULL=y
 # CONFIG_NO_HZ_IDLE is unset by the above (mutually exclusive); kept implicit.
 CONFIG_RCU_NOCB_CPU=y
 
-# --- USB audio driver built-in (was =m) --------------------------------------
-# Built-in removes module-load latency and makes the kernel-cmdline module
-# params authoritative. NOTE: once built-in, /etc/modprobe.d/audio.conf no
-# longer applies — params move to the cmdline as snd_usb_audio.<param>
-# (underscores), handled in the hifi-player 90-audio-cmdline.conf.
+# --- USB audio driver BUILT-IN (=y) via a built-in ALSA core -----------------
+# The 7.x pmOS config ships the ALSA core modular (CONFIG_SND=m), and a built-in
+# driver can't depend on a modular core, so SND_USB_AUDIO=y alone silently
+# downgrades to =m. To truly force it in, build the core in too (this is exactly
+# what the older 6.16.7 pmOS config did, so it's known-good):
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_TIMER=y
+CONFIG_SND_PCM=y
+CONFIG_SND_HWDEP=y
+CONFIG_SND_RAWMIDI=y
+CONFIG_SND_UMP=y
 CONFIG_SND_USB_AUDIO=y
+# Built into vmlinuz now, so params come from the kernel cmdline
+# (snd_usb_audio.nrpacks=1 / .low_latency=1 in 90-audio-cmdline.conf), NOT
+# modprobe.d — modprobe.d/audio.conf is inert while built-in (kept, harmless).
+# kconfigcheck only *prefers* SND_USB_AUDIO=m (non-gating INFO); =y still passes.
+
+# --- ThinLTO -----------------------------------------------------------------
+# Cross-module inlining + better codegen; the kernel already builds with LLVM=1
+# (ARCH_SUPPORTS_LTO_CLANG_THIN=y) and keeps CONFIG_CFI=y (kCFI) alongside.
+# Marginal for audio (hot path is DMA/IRQ-bound) and a much heavier/slower link,
+# enabled per request. Selecting THIN unsets CONFIG_LTO_NONE.
+CONFIG_LTO_CLANG_THIN=y
 
 # --- Transparent hugepages -----------------------------------------------------
 # NOT changed here: toggling CONFIG_TRANSPARENT_HUGEPAGE needs CONFIG_EXPERT,

@@ -244,6 +244,27 @@ pub(crate) fn wrap_scroller(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindo
     s
 }
 
+/// Centre `child` with a sane maximum width on wide windows (the libadwaita
+/// recipe). No visible effect at phone width — it only kicks in once the window
+/// is wider than the clamp, keeping the DAP readable on a desktop/landscape.
+pub(crate) fn clamp(child: &impl IsA<gtk::Widget>) -> adw::Clamp {
+    let c = adw::Clamp::new();
+    c.set_maximum_size(620);
+    c.set_tightening_threshold(480);
+    c.set_child(Some(child));
+    c
+}
+
+/// A full-page empty/placeholder state (icon · title · description), used in
+/// place of hand-built `Box`es so empty views match the rest of Adwaita.
+pub(crate) fn status_page(icon: &str, title: &str, description: &str) -> adw::StatusPage {
+    let sp = adw::StatusPage::new();
+    sp.set_icon_name(Some(icon));
+    sp.set_title(title);
+    sp.set_description(Some(description));
+    sp
+}
+
 pub(crate) fn fill(container: &gtk::Box, child: &impl IsA<gtk::Widget>) {
     while let Some(c) = container.first_child() {
         container.remove(&c);

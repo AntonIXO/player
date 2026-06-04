@@ -4,13 +4,13 @@ use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{Decoder as SymDecoder, DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymError;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use crate::error::{Error, Result};
@@ -18,9 +18,8 @@ use crate::format::StreamSpec;
 
 pub struct Decoder {
     format: Box<dyn FormatReader>,
-    decoder: Box<dyn SymDecoder>,
+    decoder: Box<dyn AudioDecoder>,
     track_id: u32,
-    sbuf: Option<SampleBuffer<i32>>,
     pub spec: StreamSpec,
     pub codec_name: &'static str,
     /// Total frames if known (from the container).
@@ -42,43 +41,40 @@ impl Decoder {
             hint.with_extension(ext);
         }
 
-        let fmt_opts = FormatOptions {
-            enable_gapless: true,
-            ..Default::default()
-        };
-        let meta_opts = MetadataOptions::default();
+        // 0.6: probe() returns the FormatReader directly. Gapless is now a decoder
+        // concern (AudioDecoderOptions::gapless, default true) — FormatOptions no
+        // longer carries an enable_gapless flag.
+        let format = symphonia::default::get_probe().probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )?;
 
-        let probed =
-            symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
-        let format = probed.format;
-
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .ok_or(Error::NoTrack)?;
+        let track = format.default_track(TrackType::Audio).ok_or(Error::NoTrack)?;
         let track_id = track.id;
-        let cp = &track.codec_params;
+        let Some(CodecParameters::Audio(cp)) = &track.codec_params else {
+            return Err(Error::NoTrack);
+        };
 
         let rate = cp.sample_rate.ok_or(Error::NoTrack)?;
-        let channels = cp.channels.map(|c| c.count() as u32).ok_or(Error::NoTrack)?;
+        let channels = cp
+            .channels
+            .as_ref()
+            .map(|c| c.count() as u32)
+            .ok_or(Error::NoTrack)?;
         // FLAC always reports bits_per_sample; default to 32 (-> S32_LE) if absent.
         let source_bits = cp.bits_per_sample.unwrap_or(32);
-        let n_frames = cp.n_frames;
+        let n_frames = track.num_frames;
 
-        let codec_name = symphonia::default::get_codecs()
-            .get_codec(cp.codec)
-            .map(|d| d.short_name)
-            .unwrap_or("unknown");
-
-        let decoder =
-            symphonia::default::get_codecs().make(cp, &DecoderOptions::default())?;
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(cp, &AudioDecoderOptions::default())?;
+        let codec_name = decoder.codec_info().short_name;
 
         Ok(Decoder {
             format,
             decoder,
             track_id,
-            sbuf: None,
             spec: StreamSpec::new(rate, channels, source_bits),
             codec_name,
             n_frames,
@@ -100,7 +96,7 @@ impl Decoder {
     /// Resets decoder state and the sample buffer so the next [`Decoder::next`]
     /// yields fresh audio at the seek point.
     pub fn seek(&mut self, pos: Duration) -> Result<u64> {
-        let time = Time::new(pos.as_secs(), f64::from(pos.subsec_nanos()) / 1_000_000_000.0);
+        let time = Time::try_new(pos.as_secs() as i64, pos.subsec_nanos()).unwrap_or(Time::ZERO);
         let seeked = self.format.seek(
             SeekMode::Accurate,
             SeekTo::Time {
@@ -110,8 +106,8 @@ impl Decoder {
         )?;
         // Decoders may carry inter-frame state (e.g. residuals); reset after a seek.
         self.decoder.reset();
-        self.sbuf = None;
-        Ok(seeked.actual_ts)
+        // 0.6: actual_ts is a Timestamp(i64); clamp to the track's frame index.
+        Ok(seeked.actual_ts.get().max(0) as u64)
     }
 
     /// Decode the next block into `out` as interleaved full-scale `i32`.
@@ -122,18 +118,15 @@ impl Decoder {
             return Ok(false);
         }
         loop {
+            // 0.6: next_packet() yields Ok(None) at end of stream.
             let packet = match self.format.next_packet() {
-                Ok(p) => p,
-                Err(SymError::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    return Ok(false)
-                }
+                Ok(Some(p)) => p,
+                Ok(None) => return Ok(false),
                 Err(SymError::ResetRequired) => return Ok(false),
                 Err(e) => return Err(e.into()),
             };
 
-            if packet.track_id() != self.track_id {
+            if packet.track_id != self.track_id {
                 continue;
             }
 
@@ -144,16 +137,9 @@ impl Decoder {
                 Err(e) => return Err(e.into()),
             };
 
-            if self.sbuf.is_none() {
-                let spec = *decoded.spec();
-                let cap = decoded.capacity() as u64;
-                self.sbuf = Some(SampleBuffer::new(cap, spec));
-            }
-            let sbuf = self.sbuf.as_mut().unwrap();
-            sbuf.copy_interleaved_ref(decoded);
-
-            out.clear();
-            out.extend_from_slice(sbuf.samples());
+            // Convert the decoded buffer (any native format) to interleaved
+            // full-scale i32; copy_to_vec_interleaved resizes `out` to fit.
+            decoded.copy_to_vec_interleaved(out);
 
             // Enforce the cue-track frame limit, trimming the final block exactly.
             if let Some(limit) = self.limit_frames {

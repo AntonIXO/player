@@ -8,19 +8,25 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-symphonia = { version = "0.5", default-features = false, features = [
+symphonia = { version = "0.6", default-features = false, features = [
     "flac",
     "wav",
     "pcm",
     "alac",
     "isomp4",
     # Lossy: mp3/aac register their own readers; vorbis needs the ogg demuxer.
-    # AAC-in-.m4a is already covered by isomp4 above. (symphonia 0.5 has no Opus
-    # decoder, so .opus files index but won't play — out of scope.)
+    # AAC-in-.m4a is already covered by isomp4 above. (symphonia still ships no
+    # Opus decoder as of 0.6, so .opus files index but won't play — out of scope.)
     "mp3",
     "aac",
     "vorbis",
     "ogg",
+    # SIMD decode paths (new in 0.6; arch-gated). Speeds up decode on both the
+    # x86 dev box and the ARM/Poco F1 target — they're no-ops off their arch.
+    "opt-simd",
+    "opt-simd-sse",
+    "opt-simd-avx",
+    "opt-simd-neon",
 ] }
 alsa = "0.11"
 rtrb = "0.3.4"

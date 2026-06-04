@@ -24,3 +24,10 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code local config (skills, plans, memory) — not project source.
+.claude/
+
+# Scratch screenshots (not source).
+queue.png
+search.png

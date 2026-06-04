@@ -4,6 +4,7 @@
 //! fuzzy searches. Kept headless (no GTK / no audio) so it is testable without
 //! hardware and `player-core` stays bit-perfect-pure.
 
+mod cue;
 mod db;
 mod error;
 mod extract;
@@ -55,6 +56,8 @@ pub fn track_from_path(path: &Path) -> Track {
             bits: e.bits,
             channels: e.channels,
             art_hash: None,
+            source_path: path.to_path_buf(),
+            start_ms: None,
         },
         Err(_) => Track {
             id: -1,
@@ -75,6 +78,8 @@ pub fn track_from_path(path: &Path) -> Track {
             bits: None,
             channels: None,
             art_hash: None,
+            source_path: path.to_path_buf(),
+            start_ms: None,
         },
     }
 }
@@ -220,6 +225,21 @@ impl Library {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// All albums credited to `artist` (album-artist preferred, matching
+    /// [`Library::artists`]), newest year first — for the artist detail page.
+    pub fn artist_albums(&self, artist: &str) -> Result<Vec<Album>> {
+        let sql = "SELECT track.album, track.album_artist, MAX(track.year), COUNT(*), \
+                 COALESCE(SUM(track.duration_ms),0), MAX(track.art_hash) \
+             FROM track \
+             WHERE COALESCE(NULLIF(track.album_artist,''), track.artist) = ?1 \
+                 AND track.album IS NOT NULL AND track.album <> '' \
+             GROUP BY track.album_artist, track.album \
+             ORDER BY MAX(track.year) DESC, track.album COLLATE NOCASE";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![artist], row_to_album)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// All tracks directly inside `folder`, ordered disc/track/title.
     pub fn folder_tracks(&self, folder: &str) -> Result<Vec<Track>> {
         let sql = format!(
@@ -242,6 +262,36 @@ impl Library {
             .query_row(params![p.as_ref()], db::row_to_track)
             .optional()?;
         Ok(t)
+    }
+
+    // --- recently played ---------------------------------------------------
+
+    /// Record that `track_id` was just played (upsert; newest play wins).
+    pub fn record_play(&self, track_id: i64) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO play_history(track_id, played_at) VALUES(?1, ?2) \
+             ON CONFLICT(track_id) DO UPDATE SET played_at = excluded.played_at",
+            params![track_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The most recently played tracks, newest first (joined back to `track`, so
+    /// history rows for since-removed files are skipped).
+    pub fn recent_plays(&self, limit: usize) -> Result<Vec<Track>> {
+        let sql = format!(
+            "SELECT {} FROM track \
+             JOIN play_history ON play_history.track_id = track.id \
+             ORDER BY play_history.played_at DESC LIMIT ?1",
+            db::TRACK_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![limit as i64], db::row_to_track)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // --- persisted key/value (settings + last session) ---------------------
@@ -447,6 +497,7 @@ fn row_to_folder(r: &rusqlite::Row) -> rusqlite::Result<Folder> {
 fn album_order(sort: Sort) -> &'static str {
     match sort {
         Sort::Artist => "track.album_artist COLLATE NOCASE, track.album COLLATE NOCASE",
+        Sort::Year => "MAX(track.year) DESC, track.album COLLATE NOCASE",
         _ => "track.album COLLATE NOCASE",
     }
 }
@@ -458,6 +509,7 @@ fn track_order(sort: Sort) -> &'static str {
             "track.artist COLLATE NOCASE, track.album COLLATE NOCASE, track.disc_no, track.track_no"
         }
         Sort::Album => "track.album COLLATE NOCASE, track.disc_no, track.track_no",
+        Sort::Year => "track.year DESC, track.album COLLATE NOCASE, track.disc_no, track.track_no",
     }
 }
 

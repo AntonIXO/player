@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::Result;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Open (creating if needed) a connection with the library pragmas applied and
 /// the schema migrated to the current version.
@@ -46,8 +46,33 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v == 1 {
         conn.execute_batch(DROP_FTS_V1)?;
     }
+    // v3 adds the recently-played history table (additive — no track rebuild).
+    if v < 3 {
+        conn.execute_batch(SCHEMA_PLAY_HISTORY)?;
+    }
+    // v4 adds the .cue columns (additive). `add_column_if_missing` makes this a
+    // no-op on a fresh database, whose `SCHEMA_BASE` already declares them.
+    if v < 4 {
+        add_column_if_missing(conn, "track", "source_path", "TEXT")?;
+        add_column_if_missing(conn, "track", "start_ms", "INTEGER")?;
+    }
     if v < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD COLUMN` only if the column isn't already present (SQLite
+/// has no `IF NOT EXISTS` for columns), so it is safe on both fresh and upgraded
+/// databases.
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == col);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"), [])?;
     }
     Ok(())
 }
@@ -72,6 +97,8 @@ CREATE TABLE track (
   bits          INTEGER,
   channels      INTEGER,
   art_hash      TEXT,
+  source_path   TEXT,
+  start_ms      INTEGER,
   mtime_ns      INTEGER NOT NULL,
   size          INTEGER NOT NULL
 );
@@ -79,6 +106,21 @@ CREATE INDEX track_folder_idx ON track(folder);
 CREATE INDEX track_album_idx  ON track(album, album_artist);
 
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+
+CREATE TABLE play_history (
+  track_id  INTEGER PRIMARY KEY,
+  played_at INTEGER NOT NULL
+);
+"#;
+
+/// Recently-played history (one row per track, newest play wins). Added in v3;
+/// `IF NOT EXISTS` so a fresh database (which already created it via
+/// `SCHEMA_BASE`) is unaffected.
+const SCHEMA_PLAY_HISTORY: &str = r#"
+CREATE TABLE IF NOT EXISTS play_history (
+  track_id  INTEGER PRIMARY KEY,
+  played_at INTEGER NOT NULL
+);
 "#;
 
 /// Drop the legacy FTS5 mirror + triggers when upgrading a v1 database.
@@ -95,11 +137,17 @@ DROP TABLE IF EXISTS track_fts;
 pub const TRACK_COLS: &str = "track.id, track.path, track.folder, track.title, track.artist, \
      track.album_artist, track.album, track.composer, track.genre, track.track_no, track.disc_no, \
      track.year, track.duration_ms, track.codec, track.sample_rate, track.bits, track.channels, \
-     track.art_hash";
+     track.art_hash, track.source_path, track.start_ms";
 
 /// Build a `Track` from a row selected with [`TRACK_COLS`] (in order).
 pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> {
     let path: String = r.get(1)?;
+    // Whole-file tracks store NULL source_path; fall back to `path` so the engine
+    // always has a real file to decode.
+    let source_path = r
+        .get::<_, Option<String>>(18)?
+        .map(Into::into)
+        .unwrap_or_else(|| path.clone().into());
     Ok(crate::model::Track {
         id: r.get(0)?,
         path: path.into(),
@@ -119,5 +167,7 @@ pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> 
         bits: r.get::<_, Option<i64>>(15)?.map(|v| v as u32),
         channels: r.get::<_, Option<i64>>(16)?.map(|v| v as u32),
         art_hash: r.get(17)?,
+        source_path,
+        start_ms: r.get::<_, Option<i64>>(19)?.map(|v| v as u64),
     })
 }

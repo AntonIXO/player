@@ -29,6 +29,13 @@ pub struct Track {
     /// blake3 hex of the embedded cover, if any; the file lives at
     /// `Library::art_path(hash)`.
     pub art_hash: Option<String>,
+    /// The audio file the engine should decode. Equals `path` for a whole-file
+    /// track; for a `.cue` track it is the referenced audio file (while `path`
+    /// is a synthetic per-track id like `album.cue#02`).
+    pub source_path: PathBuf,
+    /// Start offset into `source_path` for a `.cue` track; `None` (whole file)
+    /// otherwise. With `duration_ms` this gives the track's decode range.
+    pub start_ms: Option<u64>,
 }
 
 impl Track {
@@ -54,6 +61,15 @@ impl Track {
 
     pub fn duration(&self) -> Option<Duration> {
         self.duration_ms.map(Duration::from_millis)
+    }
+
+    /// The `(start, end)` decode range for a `.cue` track, or `None` for a
+    /// whole-file track (decode from the beginning to EOF).
+    pub fn cue_range(&self) -> Option<(Duration, Duration)> {
+        self.start_ms.map(|s| {
+            let start = Duration::from_millis(s);
+            (start, start + Duration::from_millis(self.duration_ms.unwrap_or(0)))
+        })
     }
 
     /// The signal-path string for the bit-perfect chip, without duration:
@@ -179,6 +195,8 @@ pub enum Sort {
     Title,
     Artist,
     Album,
+    /// Newest first (tracks/albums with no year sort last).
+    Year,
 }
 
 /// Counters returned by a scan.

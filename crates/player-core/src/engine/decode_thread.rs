@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rtrb::Producer;
@@ -118,6 +119,19 @@ struct Track {
     spec: StreamSpec,
 }
 
+/// A queued item: a file plus an optional decode range (`Some` for a `.cue`
+/// track — seek to `start`, stop at `end`).
+struct Source {
+    path: PathBuf,
+    range: Option<(Duration, Duration)>,
+}
+
+impl Source {
+    fn whole(path: PathBuf) -> Self {
+        Self { path, range: None }
+    }
+}
+
 /// Whether the decode loop should keep running or shut down after a command.
 enum CmdOutcome {
     Continue,
@@ -129,7 +143,7 @@ enum CmdOutcome {
 /// so their semantics never drift.
 fn apply_cmd(
     cmd: Cmd,
-    queue: &mut VecDeque<PathBuf>,
+    queue: &mut VecDeque<Source>,
     cur: &mut Option<Track>,
     writer: &mut SegmentWriter,
     interrupt: &Arc<AtomicBool>,
@@ -139,13 +153,24 @@ fn apply_cmd(
     match cmd {
         Cmd::Play(p) => {
             queue.clear();
-            queue.push_back(p);
+            queue.push_back(Source::whole(p));
             *cur = None;
             writer.flush();
             *paused = false;
             interrupt.store(false, Ordering::SeqCst);
         }
-        Cmd::Enqueue(p) => queue.push_back(p),
+        Cmd::PlayRange { path, start, end } => {
+            queue.clear();
+            queue.push_back(Source {
+                path,
+                range: Some((start, end)),
+            });
+            *cur = None;
+            writer.flush();
+            *paused = false;
+            interrupt.store(false, Ordering::SeqCst);
+        }
+        Cmd::Enqueue(p) => queue.push_back(Source::whole(p)),
         Cmd::Pause => {
             writer.pause();
             *paused = true;
@@ -198,7 +223,7 @@ pub(crate) fn run_interactive(
     // Probe the output device once (it is free until the audio thread opens it).
     let formats = probe_formats(&device).unwrap_or_else(|_| DeviceFormats::all());
     let mut writer = SegmentWriter::new(ctl_tx);
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    let mut queue: VecDeque<Source> = VecDeque::new();
     let mut cur: Option<Track> = None;
     let mut paused = false;
     let mut block: Vec<i32> = Vec::new();
@@ -246,13 +271,31 @@ pub(crate) fn run_interactive(
         // 2) Ensure a current track, or idle until commanded.
         if cur.is_none() {
             match queue.pop_front() {
-                Some(p) => match Decoder::open(&p) {
-                    Ok(dec) => {
+                Some(src) => match Decoder::open(&src.path) {
+                    Ok(mut dec) => {
+                        // A .cue track decodes a sub-range: seek to its start and
+                        // cap the decode at its length. Per-track position rebases
+                        // to 0 because the GTK shell issues a fresh Play(Range) per
+                        // track (flush → new segment, pos_base 0).
+                        if let Some((start, end)) = src.range {
+                            if let Err(e) = dec.seek(start) {
+                                emit(Event::Error(e.to_string()));
+                            }
+                            if end > start {
+                                let frames = (end - start).as_millis() as u64
+                                    * dec.spec.rate as u64
+                                    / 1000;
+                                dec.set_limit(frames);
+                            }
+                        }
                         let mut spec = dec.spec;
                         if let Some(fmt) = formats.choose(spec.source_bits) {
                             spec.fmt = fmt;
                         }
-                        emit(Event::Started { spec, path: p });
+                        emit(Event::Started {
+                            spec,
+                            path: src.path,
+                        });
                         cur = Some(Track {
                             dec,
                             packer: Packer::new(spec.fmt),

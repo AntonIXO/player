@@ -69,8 +69,9 @@ pub fn scan(
     let existing = Arc::new(load_existing(db_path)?);
 
     // Cheap directory walk to collect candidate files; the heavy per-file work
-    // is parallelized below.
+    // is parallelized below. `.cue` sheets are collected separately.
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut cue_paths: Vec<PathBuf> = Vec::new();
     for dent in WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(false)
@@ -79,10 +80,26 @@ pub fn scan(
         .build()
     {
         let Ok(d) = dent else { continue };
-        if d.file_type().map(|t| t.is_file()).unwrap_or(false) && is_audio(d.path()) {
+        if !d.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if is_audio(d.path()) {
             paths.push(d.path().to_path_buf());
+        } else if has_ext(d.path(), "cue") {
+            cue_paths.push(d.path().to_path_buf());
         }
     }
+
+    // Parse the cue sheets up front so we can (a) skip the audio files they own
+    // from standalone indexing — avoiding a duplicate whole-file track — and
+    // (b) emit their per-track rows after the normal diff.
+    let cues: Vec<(PathBuf, crate::cue::CueSheet)> = cue_paths
+        .into_iter()
+        .filter_map(|p| crate::cue::parse_file(&p).map(|s| (p, s)))
+        .collect();
+    let referenced = cue_referenced_files(&cues);
+    paths.retain(|p| !referenced.contains(p));
+
     let total = paths.len() as u64;
 
     let (tx, rx) = bounded::<Msg>(2048);
@@ -108,13 +125,42 @@ pub fn scan(
     let mut stats = writer
         .join()
         .map_err(|_| Error::Other("scan writer thread panicked".into()))??;
+
+    // Per-track rows for `.cue` sheets (incremental: a sheet whose file mtime+size
+    // is unchanged is skipped; removed sheets have their rows deleted).
+    scan_cues(db_path, art_dir, &cues, &mut stats)?;
+
     stats.elapsed_ms = start.elapsed().as_millis();
     Ok(stats)
 }
 
+fn has_ext(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(ext))
+        .unwrap_or(false)
+}
+
+/// The set of audio files referenced by any cue sheet (resolved against each
+/// sheet's directory), so they aren't also indexed as standalone tracks.
+fn cue_referenced_files(cues: &[(PathBuf, crate::cue::CueSheet)]) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    for (cue_path, sheet) in cues {
+        let Some(dir) = cue_path.parent() else { continue };
+        for f in &sheet.files {
+            set.insert(dir.join(&f.name));
+        }
+    }
+    set
+}
+
 fn load_existing(db_path: &Path) -> Result<HashMap<String, FileState>> {
     let conn = db::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT id, path, mtime_ns, size FROM track")?;
+    // Whole-file tracks only — `.cue` rows (start_ms NOT NULL) are diffed
+    // separately in `scan_cues`, so the normal delete reconciliation must not
+    // see them.
+    let mut stmt =
+        conn.prepare("SELECT id, path, mtime_ns, size FROM track WHERE start_ms IS NULL")?;
     let mut map = HashMap::new();
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -299,6 +345,185 @@ fn write_art(art_dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &dst)?;
     Ok(())
+}
+
+// --- .cue sheets ----------------------------------------------------------
+
+/// Diff the parsed cue sheets against existing cue rows and (re)insert their
+/// per-track rows. A sheet's rows carry the *cue file's* mtime+size, so an
+/// unchanged sheet is skipped, a changed one is rebuilt, and a vanished one's
+/// rows are deleted.
+fn scan_cues(
+    db_path: &Path,
+    art_dir: &Path,
+    cues: &[(PathBuf, crate::cue::CueSheet)],
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let mut conn = db::open(db_path)?;
+    let existing = load_existing_cues(&conn)?;
+    let mut current: HashSet<String> = HashSet::new();
+
+    let txn = conn.transaction()?;
+    for (cue_path, sheet) in cues {
+        let key = cue_path.to_string_lossy().into_owned();
+        current.insert(key.clone());
+        let Ok(meta) = std::fs::metadata(cue_path) else {
+            continue;
+        };
+        let sig = (mtime_ns(&meta), meta.len() as i64);
+        if existing.get(&key) == Some(&sig) {
+            stats.unchanged += sheet.files.iter().map(|f| f.tracks.len() as u64).sum::<u64>();
+            continue;
+        }
+        delete_cue_rows(&txn, &key)?;
+        stats.added += insert_cue_tracks(&txn, art_dir, cue_path, sheet, sig)?;
+    }
+    // Sheets that no longer exist on disk: drop their rows.
+    for old in existing.keys() {
+        if !current.contains(old) {
+            stats.removed += delete_cue_rows(&txn, old)?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Map each existing cue's path to its (mtime, size) signature, recovered from
+/// the synthetic `<cue>#<seq>` track paths.
+fn load_existing_cues(conn: &rusqlite::Connection) -> Result<HashMap<String, (i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, mtime_ns, size FROM track WHERE start_ms IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (path, mtime, size) = row?;
+        if let Some(key) = strip_cue_suffix(&path) {
+            map.entry(key).or_insert((mtime, size));
+        }
+    }
+    Ok(map)
+}
+
+/// Recover the owning cue path from a synthetic `<cue>#<seq>` track path.
+fn strip_cue_suffix(path: &str) -> Option<String> {
+    let hash = path.rfind('#')?;
+    let suffix = &path[hash + 1..];
+    (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| path[..hash].to_string())
+}
+
+/// Escape SQLite `LIKE` metacharacters (used with `ESCAPE '\'`).
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn delete_cue_rows(txn: &Transaction, cue_key: &str) -> Result<u64> {
+    let pattern = format!("{}#%", escape_like(cue_key));
+    let n = txn.execute(
+        "DELETE FROM track WHERE path LIKE ?1 ESCAPE '\\'",
+        params![pattern],
+    )?;
+    Ok(n as u64)
+}
+
+/// Insert one synthetic row per cue track. Each file is opened once for its wire
+/// facts + cover; a track's duration is the gap to the next track's start (the
+/// last in a file runs to the file's end).
+fn insert_cue_tracks(
+    txn: &Transaction,
+    art_dir: &Path,
+    cue_path: &Path,
+    sheet: &crate::cue::CueSheet,
+    sig: (i64, i64),
+) -> Result<u64> {
+    let key = cue_path.to_string_lossy().into_owned();
+    let dir = cue_path.parent().unwrap_or_else(|| Path::new(""));
+    let folder = dir.to_string_lossy().into_owned();
+    let (mtime_ns, size) = sig;
+    let mut seq: u32 = 0;
+    let mut added = 0u64;
+
+    for file in &sheet.files {
+        let audio = dir.join(&file.name);
+        if !audio.exists() {
+            continue;
+        }
+        let Ok(mut e) = extract::extract(&audio) else {
+            continue;
+        };
+        let mut art_hash = None;
+        if let Some((hash, _mime, bytes)) = e.art.take() {
+            let _ = write_art(art_dir, &hash, &bytes);
+            art_hash = Some(hash);
+        }
+        let file_total = e.duration_ms.unwrap_or(0);
+        let source = audio.to_string_lossy().into_owned();
+        let n = file.tracks.len();
+        for (i, tr) in file.tracks.iter().enumerate() {
+            seq += 1;
+            let start = tr.start_ms;
+            let end = if i + 1 < n {
+                file.tracks[i + 1].start_ms
+            } else {
+                file_total
+            };
+            let dur = end.saturating_sub(start) as i64;
+            let path = format!("{key}#{seq:03}");
+            let title = tr
+                .title
+                .clone()
+                .unwrap_or_else(|| format!("Track {:02}", tr.number));
+            let artist = tr.performer.clone().or_else(|| sheet.performer.clone());
+            txn.execute(
+                "INSERT INTO track(path,folder,title,artist,album_artist,album,composer,genre,\
+                    track_no,disc_no,year,duration_ms,codec,sample_rate,bits,channels,art_hash,\
+                    source_path,start_ms,mtime_ns,size)\
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)\
+                 ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,title=excluded.title,\
+                    artist=excluded.artist,album_artist=excluded.album_artist,album=excluded.album,\
+                    composer=excluded.composer,genre=excluded.genre,track_no=excluded.track_no,\
+                    disc_no=excluded.disc_no,year=excluded.year,duration_ms=excluded.duration_ms,\
+                    codec=excluded.codec,sample_rate=excluded.sample_rate,bits=excluded.bits,\
+                    channels=excluded.channels,art_hash=excluded.art_hash,\
+                    source_path=excluded.source_path,start_ms=excluded.start_ms,\
+                    mtime_ns=excluded.mtime_ns,size=excluded.size",
+                params![
+                    path,
+                    folder,
+                    title,
+                    artist,
+                    sheet.performer,
+                    sheet.title,
+                    None::<String>,   // composer
+                    sheet.genre,
+                    tr.number,
+                    None::<i64>,      // disc_no
+                    sheet.date,
+                    dur,
+                    e.codec,
+                    e.sample_rate,
+                    e.bits,
+                    e.channels,
+                    art_hash,
+                    source,
+                    start as i64,
+                    mtime_ns,
+                    size,
+                ],
+            )?;
+            added += 1;
+        }
+    }
+    Ok(added)
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {

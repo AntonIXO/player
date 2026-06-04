@@ -26,7 +26,8 @@ use adw::prelude::*;
 use gtk::{gio, glib, Orientation};
 use player_core::{Event, Player, StreamSpec};
 use player_library::{
-    fmt_dur_ms, fmt_khz, Album, Artist, Filter, Folder, Library, SearchIndex, SearchResults, Track,
+    fmt_dur_ms, fmt_khz, Album, Artist, Filter, Folder, Library, SearchIndex, SearchResults, Sort,
+    Track,
 };
 
 mod art;
@@ -85,6 +86,8 @@ struct Ui {
     np_total: gtk::Label,
     np_seek: gtk::Scale,
     np_play: gtk::Button,
+    np_goto_artist: gtk::Button,
+    np_goto_album: gtk::Button,
     np_format: gtk::Box,
     np_stack: gtk::Stack,
     /// True while the user is dragging the seek slider — suppresses programmatic
@@ -103,6 +106,9 @@ struct Ui {
     artists_scroller: gtk::ScrolledWindow,
     folders_scroller: gtk::ScrolledWindow,
     tracks_scroller: gtk::ScrolledWindow,
+    /// Current browse sort (Albums/Tracks tabs); the menu button's label mirrors it.
+    sort: Cell<Sort>,
+    sort_label: gtk::Label,
     // search
     search_entry: gtk::SearchEntry,
     search_results: gtk::Box,
@@ -115,6 +121,7 @@ struct Ui {
     search_seq: Cell<u64>,
     // queue
     queue_box: gtk::Box,
+    queue_title: gtk::Label,
     /// Async, cached cover-art textures (decoded off the main thread).
     art: ArtCache,
 }
@@ -237,6 +244,11 @@ fn build_ui(app: &adw::Application) {
     let menu_btn = gtk::MenuButton::new();
     menu_btn.set_icon_name("open-menu-symbolic");
     header.pack_end(&menu_btn);
+    // Search toggle: jumps to the Search page and focuses the entry (sits just
+    // left of the menu button, per the figma).
+    let search_btn = gtk::Button::from_icon_name("system-search-symbolic");
+    search_btn.set_tooltip_text(Some("Search"));
+    header.pack_end(&search_btn);
 
     // --- the four pages ---
     let (np_page, np) = build_now_playing();
@@ -249,6 +261,11 @@ fn build_ui(app: &adw::Application) {
     let pl_save = gtk::Button::from_icon_name("document-save-symbolic");
     pl_save.add_css_class("flat");
     pl_save.set_tooltip_text(Some("Save queue as playlist (.m3u)"));
+    let pl_clear = gtk::Button::from_icon_name("edit-clear-all-symbolic");
+    pl_clear.add_css_class("flat");
+    pl_clear.set_tooltip_text(Some("Clear the queue"));
+    let queue_title = section_label("Up Next");
+    queue_title.set_hexpand(true);
     let queue_page = wrap_scroller(&{
         let b = gtk::Box::new(Orientation::Vertical, 0);
         b.set_margin_top(14);
@@ -256,11 +273,10 @@ fn build_ui(app: &adw::Application) {
         b.set_margin_start(14);
         b.set_margin_end(14);
         let head = gtk::Box::new(Orientation::Horizontal, 6);
-        let lbl = section_label("Up Next");
-        lbl.set_hexpand(true);
-        head.append(&lbl);
+        head.append(&queue_title);
         head.append(&pl_load);
         head.append(&pl_save);
+        head.append(&pl_clear);
         b.append(&head);
         b.append(&queue_box);
         b
@@ -270,7 +286,7 @@ fn build_ui(app: &adw::Application) {
     add_page(&stack, &lib.nav, "library", "Library", "view-grid-symbolic");
     add_page(&stack, &np_page, "playing", "Playing", "media-playback-start-symbolic");
     add_page(&stack, &search_page, "search", "Search", "system-search-symbolic");
-    add_page(&stack, &queue_page, "lists", "Lists", "view-list-symbolic");
+    add_page(&stack, &queue_page, "lists", "Queue", "view-list-symbolic");
     stack.set_visible_child_name("library");
 
     // --- mini player ---
@@ -308,6 +324,8 @@ fn build_ui(app: &adw::Application) {
         np_total: np.total,
         np_seek: np.seek,
         np_play: np.play.clone(),
+        np_goto_artist: np.goto_artist.clone(),
+        np_goto_album: np.goto_album.clone(),
         np_format: np.format,
         np_stack: np.stack.clone(),
         seeking: Cell::new(false),
@@ -320,6 +338,8 @@ fn build_ui(app: &adw::Application) {
         artists_scroller: lib.artists_scroller.clone(),
         folders_scroller: lib.folders_scroller.clone(),
         tracks_scroller: lib.tracks_scroller.clone(),
+        sort: Cell::new(Sort::Title),
+        sort_label: lib.sort_label.clone(),
         search_entry: search_entry.clone(),
         search_results,
         filter: RefCell::new(Filter::All),
@@ -327,11 +347,52 @@ fn build_ui(app: &adw::Application) {
         search_tx: search_tx.clone(),
         search_seq: Cell::new(0),
         queue_box,
+        queue_title,
         art: ArtCache::new(state.borrow().art_dir.clone()),
     });
 
     wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
     wire_segmented(&state, &ui, &lib.seg);
+    wire_sort(&state, &ui, &lib.sort_btn, &lib.sort_opts);
+
+    // header search toggle → Search page + focus the entry
+    {
+        let ui = ui.clone();
+        search_btn.connect_clicked(move |_| {
+            ui.stack.set_visible_child_name("search");
+            ui.search_entry.grab_focus();
+        });
+    }
+
+    // now-playing → current track's artist / album detail page
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        np.goto_artist.connect_clicked(move |_| {
+            let Some(t) = current_track(&state) else { return };
+            match t.album_artist.clone().or_else(|| t.artist.clone()) {
+                Some(a) if !a.is_empty() => open_artist_detail(&state, &ui, &a),
+                _ => ui.toast("No artist for this track"),
+            }
+        });
+    }
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        np.goto_album.connect_clicked(move |_| {
+            let Some(t) = current_track(&state) else { return };
+            match t.album.clone() {
+                Some(al) if !al.is_empty() => {
+                    open_album_for(&state, &ui, &al, t.album_artist.as_deref())
+                }
+                _ => ui.toast("No album for this track"),
+            }
+        });
+    }
+
+    // clear the queue
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        pl_clear.connect_clicked(move |_| clear_queue(&state, &ui));
+    }
 
     // playlist save / load (Lists page)
     {
@@ -429,6 +490,8 @@ struct Np {
     fwd: gtk::Button,
     shuffle: gtk::Button,
     repeat: gtk::Button,
+    goto_artist: gtk::Button,
+    goto_album: gtk::Button,
     format: gtk::Box,
     stack: gtk::Stack,
 }
@@ -471,10 +534,19 @@ fn build_now_playing() -> (gtk::Widget, Np) {
     shuffle.add_css_class("pill-toggle");
     let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
     repeat.add_css_class("pill-toggle");
+    // Jump to the current track's artist / album detail page.
+    let goto_artist = circle("avatar-default-symbolic", 40, "Go to artist");
+    goto_artist.add_css_class("pill-toggle");
+    goto_artist.set_sensitive(false);
+    let goto_album = circle("media-optical-symbolic", 40, "Go to album");
+    goto_album.add_css_class("pill-toggle");
+    goto_album.set_sensitive(false);
     let toggles = gtk::Box::new(Orientation::Horizontal, 9);
     toggles.set_halign(gtk::Align::Center);
     toggles.append(&shuffle);
     toggles.append(&repeat);
+    toggles.append(&goto_artist);
+    toggles.append(&goto_album);
 
     // transport: prev · −10s · play · +10s · next
     let prev = circle("media-skip-backward-symbolic", 48, "Previous");
@@ -562,6 +634,8 @@ fn build_now_playing() -> (gtk::Widget, Np) {
             fwd,
             shuffle,
             repeat,
+            goto_artist,
+            goto_album,
             format,
             stack: stack.clone(),
         },
@@ -579,6 +653,9 @@ struct LibUi {
     folders_scroller: gtk::ScrolledWindow,
     tracks_scroller: gtk::ScrolledWindow,
     seg: Vec<(&'static str, gtk::ToggleButton)>,
+    sort_btn: gtk::MenuButton,
+    sort_label: gtk::Label,
+    sort_opts: Vec<(Sort, gtk::Button)>,
 }
 
 /// A vertically-scrolling viewport for a virtualised browse list.
@@ -637,12 +714,57 @@ fn build_library() -> LibUi {
         segbar.append(&b);
         seg.push((name, b));
     }
+    // --- Sort menu (Title / Artist / Year) — applies to Albums & Tracks tabs ---
+    let sort_label = gtk::Label::new(Some("Title"));
+    let sort_btn = gtk::MenuButton::new();
+    sort_btn.add_css_class("flat");
+    sort_btn.set_tooltip_text(Some("Sort"));
+    {
+        let sb_box = gtk::Box::new(Orientation::Horizontal, 6);
+        let icon = gtk::Image::from_icon_name("view-sort-descending-symbolic");
+        sb_box.append(&icon);
+        sb_box.append(&sort_label);
+        sort_btn.set_child(Some(&sb_box));
+    }
+    let mut sort_opts = Vec::new();
+    {
+        let pbox = gtk::Box::new(Orientation::Vertical, 0);
+        pbox.set_margin_top(4);
+        pbox.set_margin_bottom(4);
+        for (s, label) in [
+            (Sort::Title, "Title"),
+            (Sort::Artist, "Artist"),
+            (Sort::Year, "Year — newest"),
+        ] {
+            let ob = gtk::Button::with_label(label);
+            ob.add_css_class("flat");
+            ob.set_hexpand(true);
+            if let Some(c) = ob.child().and_downcast::<gtk::Label>() {
+                c.set_xalign(0.0);
+            }
+            pbox.append(&ob);
+            sort_opts.push((s, ob));
+        }
+        let pop = gtk::Popover::new();
+        pop.set_child(Some(&pbox));
+        sort_btn.set_popover(Some(&pop));
+    }
+
     let header = gtk::Box::new(Orientation::Horizontal, 12);
     header.set_margin_top(12);
     header.set_margin_start(16);
     header.set_margin_end(16);
     header.set_margin_bottom(8);
+    // Keep the segmented control centred, with the sort menu pinned to the right.
+    let lead = gtk::Box::new(Orientation::Horizontal, 0);
+    lead.set_hexpand(true);
+    let trail = gtk::Box::new(Orientation::Horizontal, 0);
+    trail.set_hexpand(true);
+    trail.append(&sort_btn);
+    sort_btn.set_halign(gtk::Align::End);
+    header.append(&lead);
     header.append(&segbar);
+    header.append(&trail);
 
     let browse = gtk::Box::new(Orientation::Vertical, 0);
     browse.append(&header);
@@ -683,6 +805,9 @@ fn build_library() -> LibUi {
         folders_scroller,
         tracks_scroller,
         seg,
+        sort_btn,
+        sort_label,
+        sort_opts,
     }
 }
 
@@ -998,6 +1123,44 @@ fn wire_segmented(state: &SharedState, ui: &SharedUi, seg: &[(&'static str, gtk:
     }
 }
 
+/// Wire the browse sort menu: each option sets the active sort, updates the menu
+/// label, and repopulates the current tab (Albums via [`refresh_library`], Tracks
+/// via [`show_browse_tab`]; Artists/Folders keep their natural order).
+fn wire_sort(
+    state: &SharedState,
+    ui: &SharedUi,
+    sort_btn: &gtk::MenuButton,
+    opts: &[(Sort, gtk::Button)],
+) {
+    for (s, btn) in opts {
+        let (state, ui, s, sort_btn) = (state.clone(), ui.clone(), *s, sort_btn.clone());
+        btn.connect_clicked(move |_| {
+            ui.sort.set(s);
+            ui.sort_label.set_text(sort_label_text(s));
+            sort_btn.popdown();
+            let active = ui
+                .browse_stack
+                .visible_child_name()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            match active.as_str() {
+                "albums" => refresh_library(&state, &ui),
+                "tracks" => show_browse_tab(&state, &ui, "tracks"),
+                _ => {}
+            }
+        });
+    }
+}
+
+fn sort_label_text(s: Sort) -> &'static str {
+    match s {
+        Sort::Title => "Title",
+        Sort::Artist => "Artist",
+        Sort::Year => "Year — newest",
+        Sort::Album => "Album",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Playback control (queue driven by the app; engine = play/enqueue/stop)
 // ---------------------------------------------------------------------------
@@ -1029,7 +1192,16 @@ fn start_current(state: &SharedState, ui: &SharedUi) {
     {
         let mut s = state.borrow_mut();
         s.paused = false;
-        s.player.play(track.path.clone());
+        // A .cue track decodes a sub-range of its source file; everything else is
+        // a whole-file play.
+        match track.cue_range() {
+            Some((start, end)) => s.player.play_range(track.source_path.clone(), start, end),
+            None => s.player.play(track.path.clone()),
+        }
+        // Log to recently-played history (indexed tracks only).
+        if track.id > 0 {
+            let _ = s.library.record_play(track.id);
+        }
     }
     update_mini(state, ui);
     refresh_queue(state, ui);
@@ -1291,6 +1463,178 @@ fn build_album_detail(
     adw::NavigationPage::new(&wrap_scroller(&content), &album.album)
 }
 
+/// The track currently loaded in the queue, if any.
+fn current_track(state: &SharedState) -> Option<Track> {
+    let s = state.borrow();
+    s.current.and_then(|i| s.queue.get(i).cloned())
+}
+
+/// Push the detail page for `artist` and reveal the Library tab (works from the
+/// browse list, search results, or the now-playing nav buttons).
+fn open_artist_detail(state: &SharedState, ui: &SharedUi, artist: &str) {
+    let albums = state.borrow().library.artist_albums(artist).unwrap_or_default();
+    let page = build_artist_detail(state, ui, artist, albums);
+    ui.nav.push(&page);
+    ui.stack.set_visible_child_name("library");
+}
+
+/// Push the album detail page for `(album, album_artist)`, looking the `Album` up
+/// in the cached list and synthesising it from the tracks if it isn't cached.
+fn open_album_for(state: &SharedState, ui: &SharedUi, album: &str, album_artist: Option<&str>) {
+    let found = {
+        let s = state.borrow();
+        s.albums
+            .iter()
+            .find(|a| a.album == album && a.album_artist.as_deref() == album_artist)
+            .cloned()
+    };
+    let tracks = state
+        .borrow()
+        .library
+        .album_tracks(album, album_artist)
+        .unwrap_or_default();
+    if tracks.is_empty() {
+        ui.toast("No tracks for this album");
+        return;
+    }
+    let al = found.unwrap_or_else(|| Album {
+        album: album.to_string(),
+        album_artist: album_artist.map(|s| s.to_string()),
+        year: tracks.iter().find_map(|t| t.year),
+        track_count: tracks.len() as u32,
+        total_ms: tracks.iter().filter_map(|t| t.duration_ms).sum(),
+        art_hash: tracks.iter().find_map(|t| t.art_hash.clone()),
+    });
+    let page = build_album_detail(state, ui, &al, tracks);
+    ui.nav.push(&page);
+    ui.stack.set_visible_child_name("library");
+}
+
+/// Build an artist-detail navigation page: an avatar hero, Play / Shuffle / Add
+/// actions over all the artist's tracks, and the list of their albums (each
+/// drilling into [`build_album_detail`]). Mirrors [`build_album_detail`].
+fn build_artist_detail(
+    state: &SharedState,
+    ui: &SharedUi,
+    artist: &str,
+    albums: Vec<Album>,
+) -> adw::NavigationPage {
+    let header = gtk::Box::new(Orientation::Horizontal, 16);
+    let avatar = gtk::Box::new(Orientation::Vertical, 0);
+    avatar.set_size_request(132, 132);
+    avatar.add_css_class("art-lg");
+    let img = gtk::Image::from_icon_name("avatar-default-symbolic");
+    img.set_pixel_size(72);
+    img.set_hexpand(true);
+    img.set_vexpand(true);
+    img.add_css_class("dim-label");
+    avatar.append(&img);
+    header.append(&avatar);
+
+    let titles = gtk::Box::new(Orientation::Vertical, 4);
+    titles.set_valign(gtk::Align::Center);
+    let t = gtk::Label::new(Some(artist));
+    t.add_css_class("title-2");
+    t.set_xalign(0.0);
+    t.set_wrap(true);
+    let track_count: u32 = albums.iter().map(|a| a.track_count).sum();
+    let m = gtk::Label::new(Some(&format!(
+        "{} album{} · {} track{}",
+        albums.len(),
+        if albums.len() == 1 { "" } else { "s" },
+        track_count,
+        if track_count == 1 { "" } else { "s" },
+    )));
+    m.add_css_class("dim-label");
+    m.add_css_class("caption");
+    m.set_xalign(0.0);
+    titles.append(&t);
+    titles.append(&m);
+    header.append(&titles);
+
+    // actions: Play · Shuffle · Add to queue (across all the artist's tracks)
+    let actions = gtk::Box::new(Orientation::Horizontal, 8);
+    let play_btn = gtk::Button::with_label("Play");
+    play_btn.add_css_class("suggested-action");
+    play_btn.add_css_class("pill");
+    let shuffle_btn = gtk::Button::from_icon_name("media-playlist-shuffle-symbolic");
+    shuffle_btn.set_tooltip_text(Some("Shuffle play"));
+    shuffle_btn.add_css_class("pill");
+    let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
+    add_btn.set_tooltip_text(Some("Add artist to queue"));
+    add_btn.add_css_class("pill");
+    actions.append(&play_btn);
+    actions.append(&shuffle_btn);
+    actions.append(&add_btn);
+    {
+        let (state, ui, name) = (state.clone(), ui.clone(), artist.to_string());
+        play_btn.connect_clicked(move |_| play_artist(&state, &ui, &name));
+    }
+    {
+        let (state, ui, name) = (state.clone(), ui.clone(), artist.to_string());
+        shuffle_btn.connect_clicked(move |_| {
+            let mut v = state.borrow().library.artist_tracks(&name).unwrap_or_default();
+            shuffle_vec(&mut v);
+            play_list(&state, &ui, v, 0);
+        });
+    }
+    {
+        let (state, ui, name) = (state.clone(), ui.clone(), artist.to_string());
+        add_btn.connect_clicked(move |_| {
+            let v = state.borrow().library.artist_tracks(&name).unwrap_or_default();
+            enqueue_tracks(&state, &ui, v);
+        });
+    }
+
+    // album list
+    let lb = boxed_list();
+    for al in &albums {
+        let (s1, u1, a1) = (state.clone(), ui.clone(), al.clone());
+        let (s2, u2, a2) = (state.clone(), ui.clone(), al.clone());
+        let row = row_widget(
+            &ui.art,
+            al.art_hash.as_deref(),
+            &al.album,
+            al.album_artist.as_deref().unwrap_or(artist),
+            Some(&al.meta()),
+            Some(("media-playback-start-symbolic", "Play album")),
+            move || open_album_for(&s1, &u1, &a1.album, a1.album_artist.as_deref()),
+            move || {
+                let tracks = s2
+                    .borrow()
+                    .library
+                    .album_tracks(&a2.album, a2.album_artist.as_deref())
+                    .unwrap_or_default();
+                play_list(&s2, &u2, tracks, 0);
+            },
+        );
+        lb.append(&row);
+    }
+
+    let back = gtk::Button::from_icon_name("go-previous-symbolic");
+    back.add_css_class("flat");
+    back.set_halign(gtk::Align::Start);
+    back.set_tooltip_text(Some("Back"));
+    {
+        let ui = ui.clone();
+        back.connect_clicked(move |_| {
+            ui.nav.pop();
+        });
+    }
+
+    let content = gtk::Box::new(Orientation::Vertical, 16);
+    content.set_margin_top(12);
+    content.set_margin_bottom(20);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.append(&back);
+    content.append(&header);
+    content.append(&actions);
+    content.append(&lb);
+
+    adw::NavigationPage::new(&wrap_scroller(&content), artist)
+}
+
 fn enqueue_track(state: &SharedState, ui: &SharedUi, track: Track) {
     state.borrow_mut().queue.push(track);
     refresh_queue(state, ui);
@@ -1329,36 +1673,96 @@ fn refresh_queue(state: &SharedState, ui: &SharedUi) {
         let s = state.borrow();
         (s.queue.clone(), s.current)
     };
-    if queue.is_empty() {
-        let l = gtk::Label::new(Some("Queue is empty — play an album or add tracks from search."));
+
+    // Up Next = the tracks after the current one (the playing track lives in the
+    // mini-player / Playing page, not in this list). Indices are kept absolute so
+    // jump/remove still address the real queue slot.
+    let start = current.map(|c| c + 1).unwrap_or(0);
+    let upcoming: Vec<usize> = (start..queue.len()).collect();
+    ui.queue_title.set_text(&if upcoming.is_empty() {
+        "Up Next".to_string()
+    } else {
+        format!("Up Next · {}", upcoming.len())
+    });
+
+    if upcoming.is_empty() {
+        let l = gtk::Label::new(Some("Nothing queued — play an album or add tracks from search."));
         l.add_css_class("dim-label");
         l.set_wrap(true);
         l.set_margin_top(16);
         ui.queue_box.append(&l);
-        return;
+    } else {
+        let lb = boxed_list();
+        for i in upcoming {
+            let t = &queue[i];
+            let (s1, u1) = (state.clone(), ui.clone());
+            let (s2, u2) = (state.clone(), ui.clone());
+            let row = row_widget(
+                &ui.art,
+                t.art_hash.as_deref(),
+                &t.display_title(),
+                &t.subtitle(),
+                None,
+                Some(("list-remove-symbolic", "Remove from queue")),
+                move || jump_to(&s1, &u1, i),
+                move || remove_from_queue(&s2, &u2, i),
+            );
+            lb.append(&row);
+        }
+        ui.queue_box.append(&lb);
     }
-    let lb = boxed_list();
-    for (i, t) in queue.iter().enumerate() {
-        let (s1, u1) = (state.clone(), ui.clone());
-        let (s2, u2) = (state.clone(), ui.clone());
-        let subtitle = if current == Some(i) {
-            format!("▶ {}", t.subtitle())
-        } else {
-            t.subtitle()
-        };
-        let row = row_widget(
-            &ui.art,
-            t.art_hash.as_deref(),
-            &t.display_title(),
-            &subtitle,
-            None,
-            Some(("list-remove-symbolic", "Remove from queue")),
-            move || jump_to(&s1, &u1, i),
-            move || remove_from_queue(&s2, &u2, i),
-        );
-        lb.append(&row);
+
+    // Recently played (global history): tap to play now, ＋ to add to queue.
+    let recent = state.borrow().library.recent_plays(15).unwrap_or_default();
+    if !recent.is_empty() {
+        let header = section_label("Recently Played");
+        header.set_margin_top(16);
+        ui.queue_box.append(&header);
+        let lb = boxed_list();
+        for t in &recent {
+            let (s1, u1, t1) = (state.clone(), ui.clone(), t.clone());
+            let (s2, u2, t2) = (state.clone(), ui.clone(), t.clone());
+            let row = row_widget(
+                &ui.art,
+                t.art_hash.as_deref(),
+                &t.display_title(),
+                &t.subtitle(),
+                Some(&fmt_dur_ms(t.duration_ms.unwrap_or(0))),
+                Some(("list-add-symbolic", "Add to queue")),
+                move || play_track_now(&s1, &u1, t1.clone()),
+                move || enqueue_track(&s2, &u2, t2.clone()),
+            );
+            lb.append(&row);
+        }
+        ui.queue_box.append(&lb);
     }
-    ui.queue_box.append(&lb);
+}
+
+/// Append `track` to the queue and start playing it immediately.
+fn play_track_now(state: &SharedState, ui: &SharedUi, track: Track) {
+    let i = {
+        let mut s = state.borrow_mut();
+        s.queue.push(track);
+        s.queue.len() - 1
+    };
+    jump_to(state, ui, i);
+}
+
+/// Stop playback and empty the queue.
+fn clear_queue(state: &SharedState, ui: &SharedUi) {
+    {
+        let mut s = state.borrow_mut();
+        s.player.stop();
+        s.queue.clear();
+        s.current = None;
+        s.playing = false;
+        s.paused = false;
+    }
+    ui.title.set_subtitle("■ idle");
+    set_play_icon(ui, false);
+    update_now_playing_empty(ui, true);
+    update_mini(state, ui);
+    refresh_queue(state, ui);
 }
 
 fn jump_to(state: &SharedState, ui: &SharedUi, i: usize) {
@@ -1473,7 +1877,7 @@ fn on_ended(state: &SharedState, ui: &SharedUi) {
 // ---------------------------------------------------------------------------
 
 fn refresh_library(state: &SharedState, ui: &SharedUi) {
-    let albums = state.borrow().library.albums(player_library::Sort::Title).unwrap_or_default();
+    let albums = state.borrow().library.albums(ui.sort.get()).unwrap_or_default();
     let n_tracks = state
         .borrow()
         .library
@@ -1563,7 +1967,7 @@ fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
                 },
                 {
                     let (state, ui) = (state.clone(), ui.clone());
-                    move |items: &[Artist], pos| play_artist(&state, &ui, &items[pos].name)
+                    move |items: &[Artist], pos| open_artist_detail(&state, &ui, &items[pos].name)
                 },
             );
             ui.artists_scroller.set_child(Some(&lv));
@@ -1600,7 +2004,7 @@ fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
             let tracks = state
                 .borrow()
                 .library
-                .tracks(player_library::Sort::Artist)
+                .tracks(ui.sort.get())
                 .unwrap_or_default();
             let lv = list_view(
                 tracks,
@@ -1773,7 +2177,7 @@ fn render_search_results(state: &SharedState, ui: &SharedUi, results: SearchResu
                 &meta,
                 None,
                 Some(("media-playback-start-symbolic", "Play all")),
-                move || play_artist(&s1, &u1, &n1),
+                move || open_artist_detail(&s1, &u1, &n1),
                 move || play_artist(&s2, &u2, &n2),
             );
             lb.append(&row);
@@ -1890,6 +2294,14 @@ fn show_track(_state: &SharedState, ui: &SharedUi, track: &Track) {
     ui.mp_title.set_label(&track.display_title());
     ui.mp_artist.set_label(&track.subtitle());
     fill(&ui.np_format, &format_chip(&track.signal_spec()));
+    let has_artist = track
+        .album_artist
+        .as_deref()
+        .or(track.artist.as_deref())
+        .is_some_and(|a| !a.is_empty());
+    let has_album = track.album.as_deref().is_some_and(|a| !a.is_empty());
+    ui.np_goto_artist.set_sensitive(has_artist);
+    ui.np_goto_album.set_sensitive(has_album);
 }
 
 fn update_now_playing_empty(ui: &SharedUi, empty: bool) {

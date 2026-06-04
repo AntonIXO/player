@@ -14,18 +14,27 @@ symphonia = { version = "0.5", default-features = false, features = [
     "pcm",
     "alac",
     "isomp4",
+    # Lossy: mp3/aac register their own readers; vorbis needs the ogg demuxer.
+    # AAC-in-.m4a is already covered by isomp4 above. (symphonia 0.5 has no Opus
+    # decoder, so .opus files index but won't play — out of scope.)
+    "mp3",
+    "aac",
+    "vorbis",
+    "ogg",
 ] }
-alsa = "0.9"
-rtrb = "0.3"
-crossbeam-channel = "0.5"
+alsa = "0.11"
+rtrb = "0.3.4"
+crossbeam-channel = "0.5.15"
 thiserror = "2"
-libc = "0.2"
-clap = { version = "4", features = ["derive"] }
-gtk4 = { version = "0.9", features = ["v4_16"] }
-libadwaita = { version = "0.7", features = ["v1_6"] }
-async-channel = "2"
+libc = "0.2.186"
+clap = { version = "4.6.1", features = ["derive"] }
+gtk4 = { version = "0.11.3", features = ["v4_16"] }
+libadwaita = { version = "0.9.1", features = ["v1_6"] }
+async-channel = "2.5.0"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 strip = "symbols"
+codegen-units = 1
+panic = "abort"       

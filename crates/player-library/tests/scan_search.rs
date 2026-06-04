@@ -44,6 +44,91 @@ fn unique_dir() -> PathBuf {
 }
 
 #[test]
+fn cue_sheet_splits_into_tracks() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not found — skipping cue integration test");
+        return;
+    }
+
+    let root = unique_dir();
+    let music = root.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    let db = root.join("library.db");
+    let art = root.join("art");
+
+    // One 3s audio file split by a cue into two tracks (0:00 and 0:01).
+    let flac = music.join("album.flac");
+    gen(&flac, "whole file", "Embedded Artist", "Embedded Album", 3.0);
+    let cue = music.join("album.cue");
+    std::fs::write(
+        &cue,
+        "PERFORMER \"Test Artist\"\n\
+         TITLE \"Test Album\"\n\
+         FILE \"album.flac\" WAVE\n\
+         \x20\x20TRACK 01 AUDIO\n\
+         \x20\x20\x20\x20TITLE \"First\"\n\
+         \x20\x20\x20\x20INDEX 01 00:00:00\n\
+         \x20\x20TRACK 02 AUDIO\n\
+         \x20\x20\x20\x20TITLE \"Second\"\n\
+         \x20\x20\x20\x20INDEX 01 00:01:00\n",
+    )
+    .unwrap();
+
+    let lib = Library::open(&db, &art).unwrap();
+
+    // Initial scan: two cue tracks added, the whole file is NOT indexed standalone.
+    let s = lib.scan(&music).unwrap();
+    assert_eq!(s.added, 2, "two cue tracks added");
+    assert_eq!(lib.stats().unwrap().tracks, 2, "only cue tracks (not the file)");
+
+    let tracks = lib.album_tracks("Test Album", Some("Test Artist")).unwrap();
+    assert_eq!(tracks.len(), 2, "cue album has two tracks");
+
+    let first = tracks.iter().find(|t| t.title.as_deref() == Some("First")).unwrap();
+    let second = tracks.iter().find(|t| t.title.as_deref() == Some("Second")).unwrap();
+
+    // Offsets + the source file the engine will decode.
+    assert_eq!(first.start_ms, Some(0));
+    assert_eq!(first.duration_ms, Some(1000), "track 1 = gap to track 2's start");
+    assert_eq!(second.start_ms, Some(1000));
+    assert!(second.duration_ms.unwrap() >= 1500, "track 2 runs to file end");
+    assert!(
+        first.source_path.ends_with("album.flac") && second.source_path.ends_with("album.flac"),
+        "cue tracks decode the referenced file"
+    );
+    assert!(first.cue_range().is_some(), "cue track exposes a decode range");
+
+    // Re-scan with no change → the unchanged cue is skipped.
+    let s = lib.scan(&music).unwrap();
+    assert_eq!(s.added, 0);
+    assert_eq!(s.unchanged, 2, "unchanged cue contributes its track count");
+
+    // Editing the cue (drop track 2) rebuilds it down to a single track.
+    std::fs::write(
+        &cue,
+        "PERFORMER \"Test Artist\"\n\
+         TITLE \"Test Album\"\n\
+         FILE \"album.flac\" WAVE\n\
+         \x20\x20TRACK 01 AUDIO\n\
+         \x20\x20\x20\x20TITLE \"First\"\n\
+         \x20\x20\x20\x20INDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    lib.scan(&music).unwrap();
+    assert_eq!(lib.stats().unwrap().tracks, 1, "cue rebuilt to one track");
+
+    // Removing the cue drops its rows; the file is no longer "owned" by a cue,
+    // so it reappears as a single whole-file track.
+    std::fs::remove_file(&cue).unwrap();
+    lib.scan(&music).unwrap();
+    let all = lib.tracks(Sort::Title).unwrap();
+    assert_eq!(all.len(), 1, "cue gone → file indexed as one standalone track");
+    assert_eq!(all[0].start_ms, None, "standalone track has no cue offset");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn scan_incremental_and_search() {
     if !ffmpeg_ok() {
         eprintln!("ffmpeg not found — skipping scan_search integration test");

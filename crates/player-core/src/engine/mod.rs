@@ -239,6 +239,13 @@ where
 pub enum Cmd {
     /// Replace the queue with this track and start it now.
     Play(PathBuf),
+    /// Replace the queue with a sub-range of this file and start it now (a
+    /// `.cue` track): seek to `start`, decode until `end`.
+    PlayRange {
+        path: PathBuf,
+        start: Duration,
+        end: Duration,
+    },
     /// Append to the queue (gapless if it shares the current wire spec).
     Enqueue(PathBuf),
     /// Hold output (hardware pause) without dropping the current track.
@@ -314,6 +321,13 @@ impl Player {
     pub fn play(&self, path: PathBuf) {
         self.interrupt.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.send(Cmd::Play(path));
+    }
+
+    /// Play a sub-range `[start, end)` of `path` (a `.cue` track). Like
+    /// [`Player::play`] but the decoder seeks to `start` and stops at `end`.
+    pub fn play_range(&self, path: PathBuf, start: Duration, end: Duration) {
+        self.interrupt.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(Cmd::PlayRange { path, start, end });
     }
 
     pub fn enqueue(&self, path: PathBuf) {

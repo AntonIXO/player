@@ -1,14 +1,16 @@
-//! SQLite schema + connection setup. One `track` table, an external-content
-//! FTS5 index kept in sync by triggers, and a `meta` key/value table. Album art
-//! is cached as files keyed by blake3 hash (see `scan`/`Library::art_path`), so
-//! no blobs live in the database.
+//! SQLite schema + connection setup. One `track` table plus a `meta` key/value
+//! table. Search is served entirely from an in-memory fuzzy index built off
+//! this table (see [`crate::SearchIndex`]) — there is no FTS5 virtual table, so
+//! scans pay no per-row index-maintenance cost. Album art is cached as files
+//! keyed by blake3 hash (see `scan`/`Library::art_path`), so no blobs live in
+//! the database.
 
 use rusqlite::Connection;
 use std::path::Path;
 
 use crate::Result;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Open (creating if needed) a connection with the library pragmas applied and
 /// the schema migrated to the current version.
@@ -20,6 +22,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // Read-latency tuning for the typeahead workload on a memory-constrained
+    // phone: memory-map up to 128 MB of the DB (skip the read() syscall + page
+    // copy), keep an ~8 MB page cache, and build temp B-trees (sorts/GROUP BY
+    // during index build) in RAM rather than spilling to disk.
+    conn.pragma_update(None, "mmap_size", 128i64 * 1024 * 1024)?;
+    conn.pragma_update(None, "cache_size", -8_000i64)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     // Wait rather than fail when the writer thread holds the file briefly.
     conn.busy_timeout(std::time::Duration::from_secs(15))?;
     migrate(&conn)?;
@@ -29,13 +38,21 @@ pub fn open(path: &Path) -> Result<Connection> {
 fn migrate(conn: &Connection) -> Result<()> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if v < 1 {
-        conn.execute_batch(SCHEMA_V1)?;
+        conn.execute_batch(SCHEMA_BASE)?;
+    }
+    // v1 databases were created with an FTS5 mirror + sync triggers; the fuzzy
+    // index replaced them, so drop them on upgrade (no data migration needed —
+    // the index is rebuilt from `track` at runtime).
+    if v == 1 {
+        conn.execute_batch(DROP_FTS_V1)?;
+    }
+    if v < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     Ok(())
 }
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_BASE: &str = r#"
 CREATE TABLE track (
   id            INTEGER PRIMARY KEY,
   path          TEXT NOT NULL UNIQUE,
@@ -61,28 +78,15 @@ CREATE TABLE track (
 CREATE INDEX track_folder_idx ON track(folder);
 CREATE INDEX track_album_idx  ON track(album, album_artist);
 
-CREATE VIRTUAL TABLE track_fts USING fts5(
-  title, artist, album_artist, album, composer, genre, folder,
-  content='track', content_rowid='id',
-  tokenize='unicode61 remove_diacritics 2'
-);
-
-CREATE TRIGGER track_ai AFTER INSERT ON track BEGIN
-  INSERT INTO track_fts(rowid, title, artist, album_artist, album, composer, genre, folder)
-  VALUES (new.id, new.title, new.artist, new.album_artist, new.album, new.composer, new.genre, new.folder);
-END;
-CREATE TRIGGER track_ad AFTER DELETE ON track BEGIN
-  INSERT INTO track_fts(track_fts, rowid, title, artist, album_artist, album, composer, genre, folder)
-  VALUES ('delete', old.id, old.title, old.artist, old.album_artist, old.album, old.composer, old.genre, old.folder);
-END;
-CREATE TRIGGER track_au AFTER UPDATE ON track BEGIN
-  INSERT INTO track_fts(track_fts, rowid, title, artist, album_artist, album, composer, genre, folder)
-  VALUES ('delete', old.id, old.title, old.artist, old.album_artist, old.album, old.composer, old.genre, old.folder);
-  INSERT INTO track_fts(rowid, title, artist, album_artist, album, composer, genre, folder)
-  VALUES (new.id, new.title, new.artist, new.album_artist, new.album, new.composer, new.genre, new.folder);
-END;
-
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+"#;
+
+/// Drop the legacy FTS5 mirror + triggers when upgrading a v1 database.
+const DROP_FTS_V1: &str = r#"
+DROP TRIGGER IF EXISTS track_ai;
+DROP TRIGGER IF EXISTS track_ad;
+DROP TRIGGER IF EXISTS track_au;
+DROP TABLE IF EXISTS track_fts;
 "#;
 
 /// Column list shared by the row-building queries (keeps SELECTs in sync with

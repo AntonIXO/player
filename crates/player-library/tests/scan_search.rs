@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use player_library::{Filter, Library, Sort};
+use player_library::{Filter, Library, SearchIndex, Sort};
 
 fn ffmpeg_ok() -> bool {
     Command::new("ffmpeg")
@@ -63,7 +63,7 @@ fn scan_incremental_and_search() {
     gen(&b, "Für Alina", "Arvo Pärt", "Alina", 1.0);
     gen(&c, "So What", "Miles Davis", "Kind of Blue", 1.0);
 
-    let mut lib = Library::open(&db, &art).unwrap();
+    let lib = Library::open(&db, &art).unwrap();
 
     // initial scan
     let s = lib.scan(&music).unwrap();
@@ -106,28 +106,36 @@ fn scan_incremental_and_search() {
     assert_eq!(s.removed, 1, "one removed");
     assert_eq!(lib.stats().unwrap().tracks, 2);
 
-    // FTS5 accent folding: "part" matches "Pärt"
-    let r = lib.search_grouped("part", Filter::All).unwrap();
+    // unified fuzzy search, served from the in-memory index (built off the DB)
+    let idx = SearchIndex::build(&lib).unwrap();
+
+    // accent folding: ascii "part" fuzzy-matches "Pärt" (nucleo Smart normalize)
+    let r = idx.query(&lib, "part", Filter::All, 20).unwrap();
     assert!(
         r.tracks.iter().any(|t| t.artist.as_deref() == Some("Arvo Pärt")),
-        "accent-folded FTS finds Pärt via 'part'"
+        "ascii 'part' fuzzy-matches Pärt"
+    );
+    // a single All query fills artists + albums + tracks together
+    assert!(
+        r.artists.iter().any(|a| a.name == "Arvo Pärt"),
+        "artist group surfaces Pärt"
     );
     // and the accented form works too
-    assert!(!lib.search_grouped("pärt", Filter::All).unwrap().tracks.is_empty());
+    assert!(!idx.query(&lib, "pärt", Filter::All, 20).unwrap().tracks.is_empty());
 
-    // grouped: searching the album name surfaces the album group
-    let r = lib.search_grouped("alina", Filter::All).unwrap();
+    // searching the album name surfaces the album group
+    let r = idx.query(&lib, "alina", Filter::All, 20).unwrap();
     assert!(r.albums.iter().any(|al| al.album == "Alina"));
 
-    // filter chip: Albums filter narrows the match to the album column
-    let r = lib.search_grouped("blue", Filter::Albums).unwrap();
-    assert!(r.albums.is_empty(), "Kind of Blue was deleted");
+    // filter scoping: Albums filter returns only the albums group
+    let r = idx.query(&lib, "part", Filter::Albums, 20).unwrap();
+    assert!(
+        r.tracks.is_empty() && r.artists.is_empty() && r.folders.is_empty(),
+        "Albums filter scopes to the albums group only"
+    );
 
-    // nucleo typeahead, accent-insensitive
-    let hits = lib.search_typeahead("part", 10);
-    assert!(hits.iter().any(|t| t.artist.as_deref() == Some("Arvo Pärt")));
-    // empty query returns the library (capped)
-    assert_eq!(lib.search_typeahead("", 10).len(), 2);
+    // empty query returns the library (capped) for the in-scope group
+    assert_eq!(idx.query(&lib, "", Filter::Tracks, 10).unwrap().tracks.len(), 2);
 
     let _ = std::fs::remove_dir_all(&root);
 }

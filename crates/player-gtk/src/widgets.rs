@@ -3,7 +3,6 @@
 //! they live apart from the wiring in `main.rs` to keep that file focused on
 //! behaviour rather than widget plumbing.
 
-use std::path::Path;
 use std::rc::Rc;
 
 use gtk4 as gtk;
@@ -12,6 +11,8 @@ use libadwaita as adw;
 use adw::prelude::*;
 use gtk::{Orientation, SelectionMode};
 use player_library::Album;
+
+use crate::art::ArtCache;
 
 /// Album-art sizes used across the shell (list row · mini-player · hero).
 pub(crate) const ART_ROW: i32 = 46;
@@ -67,34 +68,26 @@ pub(crate) fn boxed_list() -> gtk::ListBox {
     lb
 }
 
-/// A vertically-stacked, padded container for a browse-tab list.
-pub(crate) fn list_tab_box() -> gtk::Box {
-    let b = gtk::Box::new(Orientation::Vertical, 0);
-    b.set_margin_top(8);
-    b.set_margin_start(16);
-    b.set_margin_end(16);
-    b.set_margin_bottom(20);
-    b
-}
-
-/// A boxed-list row: art · title/subtitle · mono meta · optional trailing button.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn row_widget(
-    art_dir: &Path,
+/// The inner content of a list row: art · title/subtitle · mono meta · optional
+/// trailing button. No row-activation gesture — the caller decides how taps are
+/// handled (a `ListView`/`GridView` factory lets the view drive activation; the
+/// `ListBox` path wraps this in [`row_widget`] which adds its own gesture). The
+/// trailing circle button always claims its own clicks.
+pub(crate) fn row_inner(
+    cache: &ArtCache,
     art_hash: Option<&str>,
     title: &str,
     subtitle: &str,
     meta: Option<&str>,
     trailing: Option<(&str, &str)>,
-    on_activate: impl Fn() + 'static,
     on_trailing: impl Fn() + 'static,
-) -> gtk::ListBoxRow {
+) -> gtk::Box {
     let row = gtk::Box::new(Orientation::Horizontal, 13);
     row.set_margin_top(8);
     row.set_margin_bottom(8);
     row.set_margin_start(12);
     row.set_margin_end(8);
-    row.append(&art_widget(art_dir, art_hash, ART_ROW, false));
+    row.append(&art_widget(cache, art_hash, ART_ROW, false));
 
     let texts = gtk::Box::new(Orientation::Vertical, 1);
     texts.set_hexpand(true);
@@ -124,20 +117,33 @@ pub(crate) fn row_widget(
         b.connect_clicked(move |_| on_trailing());
         row.append(&b);
     }
+    row
+}
 
-    let lbr = gtk::ListBoxRow::new();
-    lbr.set_child(Some(&row));
-    lbr.set_activatable(true);
-    // `ListBoxRow::activate` is a *keyboard* action signal — it does NOT fire on a
-    // pointer tap (that was the "touching a track does nothing" bug). Drive taps
-    // with an explicit `GestureClick` and keep `connect_activate` for the Enter
-    // key. The trailing circle button claims its own clicks, so tapping it won't
-    // also fire the row gesture.
+/// A boxed-list row (for `GtkListBox`): [`row_inner`] plus a `GestureClick` for
+/// taps and Enter-key activation. (A `ListBoxRow::activate` is a keyboard-only
+/// action signal — driving taps with the gesture was the original
+/// "touching a track does nothing" fix.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn row_widget(
+    cache: &ArtCache,
+    art_hash: Option<&str>,
+    title: &str,
+    subtitle: &str,
+    meta: Option<&str>,
+    trailing: Option<(&str, &str)>,
+    on_activate: impl Fn() + 'static,
+    on_trailing: impl Fn() + 'static,
+) -> gtk::ListBoxRow {
+    let content = row_inner(cache, art_hash, title, subtitle, meta, trailing, on_trailing);
     let on_activate = Rc::new(on_activate);
-    lbr.connect_activate({
+    let lbr = gtk::ListBoxRow::new();
+    lbr.set_child(Some(&content));
+    lbr.set_activatable(true);
+    {
         let on_activate = on_activate.clone();
-        move |_| on_activate()
-    });
+        lbr.connect_activate(move |_| on_activate());
+    }
     let tap = gtk::GestureClick::new();
     tap.connect_released(move |g, _, _, _| {
         g.set_state(gtk::EventSequenceState::Claimed);
@@ -147,10 +153,10 @@ pub(crate) fn row_widget(
     lbr
 }
 
-pub(crate) fn album_cell(art_dir: &Path, al: &Album) -> gtk::Box {
+pub(crate) fn album_cell(cache: &ArtCache, al: &Album) -> gtk::Box {
     let cell = gtk::Box::new(Orientation::Vertical, 6);
     cell.add_css_class("album-cell");
-    let art = art_widget(art_dir, al.art_hash.as_deref(), 110, false);
+    let art = art_widget(cache, al.art_hash.as_deref(), 110, false);
     art.set_size_request(110, 110);
     cell.append(&art);
     let t = gtk::Label::new(Some(&al.album));
@@ -169,17 +175,14 @@ pub(crate) fn album_cell(art_dir: &Path, al: &Album) -> gtk::Box {
     cell
 }
 
-pub(crate) fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
+pub(crate) fn art_widget(cache: &ArtCache, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
     // A fixed square `Box` with `overflow: hidden` + the `.art` radius clips its
     // child to rounded corners (the standard GTK4 recipe — an `AspectFrame` does
-    // not). The art must be an *exact* `size × size` square: a bare `Picture`
-    // reports its source pixels as its natural size, so in a vertically- or
-    // horizontally-unconstrained parent (the now-playing hero, the mini-player
-    // bar) it balloons past `size` — `set_size_request` is only a *minimum*.
-    // Pinning min == max via `gtk::SizeGroup`-style fixed sizing isn't available,
-    // so we wrap the cover in an `AspectFrame`-free fixed box and constrain the
-    // `Picture` itself to the same request with non-expanding `Fill` alignment;
-    // the overflow-hidden frame then crops the Cover-fit overscan to the square.
+    // not). The cover is shown via a `gtk::Image`, which paints a paintable at
+    // exactly `pixel_size` (a bare `Picture` reports its source pixels as its
+    // natural size and balloons past `size` in an unconstrained parent like the
+    // now-playing hero / mini-player). The texture is loaded asynchronously
+    // through the cache; a placeholder icon shows until it arrives.
     let frame = gtk::Box::new(Orientation::Vertical, 0);
     frame.set_size_request(size, size);
     frame.set_halign(gtk::Align::Center);
@@ -191,27 +194,29 @@ pub(crate) fn art_widget(art_dir: &Path, hash: Option<&str>, size: i32, big: boo
     if big {
         frame.add_css_class("art-lg");
     }
-    match hash {
-        Some(h) if art_dir.join(h).exists() => {
-            // A `gtk::Image` backed by the file paints at exactly `pixel_size`
-            // (it never reports a larger natural size the way `Picture` does), so
-            // the square is honoured in every container. Covers are square, so
-            // the contain-fit matches the previous cover-crop visually.
-            let img = gtk::Image::from_file(art_dir.join(h));
+
+    frame.add_css_class("art-placeholder");
+    let icon = gtk::Image::from_icon_name("folder-music-symbolic");
+    icon.set_pixel_size((size as f32 * 0.42) as i32);
+    icon.add_css_class("dim-label");
+    icon.set_hexpand(true);
+    icon.set_vexpand(true);
+    frame.append(&icon);
+
+    if let Some(h) = hash {
+        let frame_weak = frame.downgrade();
+        cache.request(h, size, move |tex| {
+            let Some(frame) = frame_weak.upgrade() else { return };
+            while let Some(c) = frame.first_child() {
+                frame.remove(&c);
+            }
+            frame.remove_css_class("art-placeholder");
+            let img = gtk::Image::from_paintable(Some(tex));
             img.set_pixel_size(size);
             img.set_hexpand(true);
             img.set_vexpand(true);
             frame.append(&img);
-        }
-        _ => {
-            frame.add_css_class("art-placeholder");
-            let icon = gtk::Image::from_icon_name("folder-music-symbolic");
-            icon.set_pixel_size((size as f32 * 0.42) as i32);
-            icon.add_css_class("dim-label");
-            icon.set_hexpand(true);
-            icon.set_vexpand(true);
-            frame.append(&icon);
-        }
+        });
     }
     frame.upcast()
 }

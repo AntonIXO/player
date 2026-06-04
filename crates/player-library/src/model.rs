@@ -150,24 +150,26 @@ impl Folder {
     }
 }
 
-/// Grouped search output (Albums / Folders / Tracks) for the Search screen.
+/// Grouped search output for the Search screen. A single fuzzy query fills all
+/// of these at once (see [`crate::SearchIndex::query`]); `Folders` is secondary
+/// and only populated for [`Filter::All`].
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
+    pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
-    pub folders: Vec<Folder>,
     pub tracks: Vec<Track>,
+    pub folders: Vec<Folder>,
 }
 
-/// Which field the search filter chips narrow to.
+/// Which entity group(s) the search filter chips scope to. `All` returns
+/// artists, albums and tracks together (the default unified search).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Filter {
     #[default]
     All,
+    Tracks,
     Albums,
     Artists,
-    AlbumArtists,
-    Composers,
-    Genres,
 }
 
 /// Sort order for browse lists.

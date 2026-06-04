@@ -23,6 +23,18 @@
 #
 # rusqlite's bundled SQLite C compiles with the cross GCC; alsa-sys needs the
 # aarch64 ALSA dev headers found via pkg-config.
+#
+# `target-cpu=cortex-a75` tunes codegen for the Poco F1's SDM845 (Kryo 385). The
+# A75 (big) and A55 (LITTLE) clusters share the same ARMv8.2-A instruction set,
+# so this is safe to run on either cluster while tuning for the performance
+# cores. Scoped to the aarch64 targets only, so the native x86_64 dev build is
+# untouched. The native pmbootstrap chroot builds for the musl target (no
+# `--target`), so it picks up the musl entry below; the `gnu` entry covers the
+# `cross` path.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-cpu=cortex-a75"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=cortex-a75"]

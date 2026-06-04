@@ -16,7 +16,7 @@ use player_core::{
     append_bytes, capture_raw, play_queue_blocking, run_playback, AlsaSink, Decoder, Event, Flow,
     Packer, StreamSpec, DEFAULT_PERIOD, DEFAULT_PERIODS,
 };
-use player_library::{Filter, Library};
+use player_library::{Filter, Library, SearchIndex};
 
 #[derive(Parser)]
 #[command(name = "player-cli", about = "bit-perfect ALSA player core CLI")]
@@ -97,19 +97,16 @@ enum Cmd {
         force: bool,
     },
 
-    /// Search the library index.
+    /// Search the library index (unified fuzzy: artists + albums + tracks).
     Search {
         /// Query terms.
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
         #[arg(long)]
         db: Option<PathBuf>,
-        /// all | albums | artists | album-artists | composers | genres.
+        /// Scope the results: all | tracks | albums | artists.
         #[arg(long, default_value = "all")]
         filter: String,
-        /// Grouped Albums/Folders/Tracks (FTS5) instead of fuzzy typeahead (nucleo).
-        #[arg(long)]
-        group: bool,
     },
 
     /// Print library counts (tracks / albums / artists / folders).
@@ -143,12 +140,7 @@ fn main() -> ExitCode {
             return loopback_verify_queue(&files, &out, &input)
         }
         Cmd::Scan { root, db, force } => lib_scan(&root, db, force).map_err(to_core_err),
-        Cmd::Search {
-            query,
-            db,
-            filter,
-            group,
-        } => lib_search(query, db, &filter, group).map_err(to_core_err),
+        Cmd::Search { query, db, filter } => lib_search(query, db, &filter).map_err(to_core_err),
         Cmd::LibraryStats { db } => lib_stats(db).map_err(to_core_err),
         Cmd::Devices => devices(),
     };
@@ -570,17 +562,15 @@ fn open_library(db: Option<PathBuf>) -> player_library::Result<Library> {
 
 fn parse_filter(s: &str) -> Filter {
     match s.to_ascii_lowercase().as_str() {
+        "tracks" => Filter::Tracks,
         "albums" => Filter::Albums,
         "artists" => Filter::Artists,
-        "album-artists" | "albumartists" => Filter::AlbumArtists,
-        "composers" => Filter::Composers,
-        "genres" => Filter::Genres,
         _ => Filter::All,
     }
 }
 
 fn lib_scan(root: &Path, db: Option<PathBuf>, force: bool) -> player_library::Result<()> {
-    let mut lib = open_library(db)?;
+    let lib = open_library(db)?;
     println!("scanning {} {}…", root.display(), if force { "(force) " } else { "" });
     let stats = lib.scan_with_progress(root, force, |p| {
         if p.seen % 500 == 0 || p.seen == p.total {
@@ -601,40 +591,45 @@ fn lib_scan(root: &Path, db: Option<PathBuf>, force: bool) -> player_library::Re
     Ok(())
 }
 
-fn lib_search(
-    query: Vec<String>,
-    db: Option<PathBuf>,
-    filter: &str,
-    group: bool,
-) -> player_library::Result<()> {
+fn lib_search(query: Vec<String>, db: Option<PathBuf>, filter: &str) -> player_library::Result<()> {
     let lib = open_library(db)?;
+    let idx = SearchIndex::build(&lib)?;
     let q = query.join(" ");
+    let r = idx.query(&lib, &q, parse_filter(filter), 30)?;
 
-    if group {
-        let r = lib.search_grouped(&q, parse_filter(filter))?;
-        if !r.albums.is_empty() {
-            println!("Albums");
-            for a in &r.albums {
-                println!(
-                    "  {} — {}  [{}]",
-                    a.album,
-                    a.album_artist.as_deref().unwrap_or("Unknown Artist"),
-                    a.meta()
-                );
-            }
+    if !r.artists.is_empty() {
+        println!("Artists");
+        for a in &r.artists {
+            println!(
+                "  {}  [{} album{} · {} track{}]",
+                a.name,
+                a.album_count,
+                if a.album_count == 1 { "" } else { "s" },
+                a.track_count,
+                if a.track_count == 1 { "" } else { "s" },
+            );
         }
-        if !r.folders.is_empty() {
-            println!("Folders");
-            for f in &r.folders {
-                println!("  {}  [{}]", f.name(), f.meta());
-            }
+    }
+    if !r.albums.is_empty() {
+        println!("Albums");
+        for a in &r.albums {
+            println!(
+                "  {} — {}  [{}]",
+                a.album,
+                a.album_artist.as_deref().unwrap_or("Unknown Artist"),
+                a.meta()
+            );
         }
+    }
+    if !r.folders.is_empty() {
+        println!("Folders");
+        for f in &r.folders {
+            println!("  {}  [{}]", f.name(), f.meta());
+        }
+    }
+    if !r.tracks.is_empty() {
         println!("Tracks");
         for t in &r.tracks {
-            println!("  {} — {}  [{}]", t.display_title(), t.subtitle(), t.format_spec());
-        }
-    } else {
-        for t in lib.search_typeahead(&q, 30) {
             println!("  {} — {}  [{}]", t.display_title(), t.subtitle(), t.format_spec());
         }
     }

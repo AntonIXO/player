@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher};
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
@@ -91,13 +90,13 @@ pub struct LibraryStats {
     pub folders: u64,
 }
 
-/// The library: a SQLite connection plus an in-memory nucleo haystack for
-/// typeahead. Use on one thread (e.g. the GTK main loop or the CLI).
+/// The library: a SQLite connection for writes (scan), browse queries, and the
+/// persisted key/value store. Search is served separately by a [`SearchIndex`]
+/// (typically owned by a worker thread). Use a `Library` on one thread.
 pub struct Library {
     conn: Connection,
     db_path: PathBuf,
     art_dir: PathBuf,
-    hays: Vec<Hay>,
 }
 
 impl Library {
@@ -106,14 +105,11 @@ impl Library {
     pub fn open(db_path: &Path, art_dir: &Path) -> Result<Self> {
         let conn = db::open(db_path)?;
         std::fs::create_dir_all(art_dir)?;
-        let mut lib = Library {
+        Ok(Library {
             conn,
             db_path: db_path.to_path_buf(),
             art_dir: art_dir.to_path_buf(),
-            hays: Vec::new(),
-        };
-        lib.reload_index()?;
-        Ok(lib)
+        })
     }
 
     /// Open at the platform-default XDG locations (`$XDG_DATA_HOME/player/library.db`
@@ -141,28 +137,21 @@ impl Library {
 
     // --- scanning ----------------------------------------------------------
 
-    /// Incrementally scan `root` and rebuild the typeahead index.
-    pub fn scan(&mut self, root: &Path) -> Result<ScanStats> {
+    /// Incrementally scan `root`. Callers that hold a [`SearchIndex`] should
+    /// rebuild it afterwards (`SearchIndex::build`) to pick up the changes.
+    pub fn scan(&self, root: &Path) -> Result<ScanStats> {
         self.scan_with_progress(root, false, |_| {})
     }
 
     /// Scan with a progress callback (called from worker threads). `force`
     /// re-extracts unchanged files too (see [`scan::scan`]).
     pub fn scan_with_progress(
-        &mut self,
+        &self,
         root: &Path,
         force: bool,
         progress: impl Fn(ScanProgress) + Send + Sync,
     ) -> Result<ScanStats> {
-        let stats = scan::scan(&self.db_path, &self.art_dir, root, force, progress)?;
-        self.reload_index()?;
-        Ok(stats)
-    }
-
-    /// Rebuild the in-memory typeahead index from the current database (call
-    /// after an external process — e.g. a scan on another thread — has written).
-    pub fn refresh(&mut self) -> Result<()> {
-        self.reload_index()
+        scan::scan(&self.db_path, &self.art_dir, root, force, progress)
     }
 
     /// Start watching `root` for live changes (opt-in). The returned receiver
@@ -185,86 +174,22 @@ impl Library {
         })
     }
 
-    // --- search ------------------------------------------------------------
-
-    /// Instant fuzzy typeahead over title/artist/album. Empty query returns the
-    /// first `limit` tracks by title.
-    pub fn search_typeahead(&self, query: &str, limit: usize) -> Vec<Track> {
-        let q = query.trim();
-        if q.is_empty() {
-            return self
-                .tracks_sorted(Sort::Title, Some(limit))
-                .unwrap_or_default();
-        }
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pat = Pattern::parse(q, CaseMatching::Ignore, Normalization::Smart);
-        let ids: Vec<i64> = pat
-            .match_list(self.hays.iter(), &mut matcher)
-            .into_iter()
-            .take(limit)
-            .map(|(h, _score)| h.id)
-            .collect();
-        self.tracks_by_ids(&ids).unwrap_or_default()
-    }
-
-    /// Grouped search (Albums / Folders / Tracks) for the Search screen.
-    pub fn search_grouped(&self, query: &str, filter: Filter) -> Result<SearchResults> {
-        let Some(expr) = search::fts_expr(query, filter) else {
-            return Ok(SearchResults::default());
-        };
-        Ok(SearchResults {
-            albums: self.fts_albums(&expr, 20)?,
-            folders: self.fts_folders(&expr, 20)?,
-            tracks: self.fts_tracks(&expr, 50)?,
-        })
-    }
-
     // --- browse ------------------------------------------------------------
 
     pub fn albums(&self, sort: Sort) -> Result<Vec<Album>> {
-        let order = match sort {
-            Sort::Artist => "track.album_artist COLLATE NOCASE, track.album COLLATE NOCASE",
-            _ => "track.album COLLATE NOCASE",
-        };
-        let sql = format!(
-            "SELECT track.album, track.album_artist, MAX(track.year), COUNT(*), \
-                 COALESCE(SUM(track.duration_ms),0), MAX(track.art_hash) \
-             FROM track WHERE track.album IS NOT NULL AND track.album <> '' \
-             GROUP BY track.album_artist, track.album ORDER BY {order}"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], row_to_album)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        load_albums(&self.conn, album_order(sort))
     }
 
     pub fn artists(&self) -> Result<Vec<Artist>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT COALESCE(NULLIF(album_artist,''), artist) AS a, \
-                 COUNT(DISTINCT album), COUNT(*) FROM track \
-             WHERE COALESCE(NULLIF(album_artist,''), artist) IS NOT NULL \
-             GROUP BY a ORDER BY a COLLATE NOCASE",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Artist {
-                name: r.get(0)?,
-                album_count: r.get::<_, i64>(1)? as u32,
-                track_count: r.get::<_, i64>(2)? as u32,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        load_artists(&self.conn)
     }
 
     pub fn folders(&self) -> Result<Vec<Folder>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT folder, COUNT(*), COALESCE(SUM(duration_ms),0) FROM track \
-             GROUP BY folder ORDER BY folder COLLATE NOCASE",
-        )?;
-        let rows = stmt.query_map([], row_to_folder)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        load_folders(&self.conn)
     }
 
     pub fn tracks(&self, sort: Sort) -> Result<Vec<Track>> {
-        self.tracks_sorted(sort, None)
+        load_tracks_sorted(&self.conn, track_order(sort), None)
     }
 
     /// All tracks of one album (ordered disc/track), ready for gapless enqueue.
@@ -361,101 +286,133 @@ impl Library {
         })
     }
 
-    // --- internals ---------------------------------------------------------
+}
 
-    fn tracks_sorted(&self, sort: Sort, limit: Option<usize>) -> Result<Vec<Track>> {
-        let order = match sort {
-            Sort::Title => "track.title COLLATE NOCASE",
-            Sort::Artist => {
-                "track.artist COLLATE NOCASE, track.album COLLATE NOCASE, track.disc_no, track.track_no"
-            }
-            Sort::Album => "track.album COLLATE NOCASE, track.disc_no, track.track_no",
-        };
-        let lim = match limit {
-            Some(n) => format!(" LIMIT {n}"),
-            None => String::new(),
-        };
-        let sql = format!(
-            "SELECT {} FROM track ORDER BY {order}{lim}",
-            db::TRACK_COLS
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], db::row_to_track)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
+/// In-memory fuzzy search index. Three nucleo haystacks (tracks, albums,
+/// artists — plus a secondary folders one) built once from the `track` table,
+/// so the album/artist/folder groupings (a `GROUP BY` each) run at build time
+/// rather than per keystroke. Cheap to query (all matching is in RAM; only the
+/// matched track rows are fetched back from the DB), and `Send`, so it can live
+/// on a search worker thread.
+pub struct SearchIndex {
+    track_hays: Vec<Hay>,
+    albums: Vec<Album>,
+    album_hays: Vec<Hay>,
+    artists: Vec<Artist>,
+    artist_hays: Vec<Hay>,
+    folders: Vec<Folder>,
+    folder_hays: Vec<Hay>,
+}
 
-    /// Fetch tracks by id, preserving the order of `ids` (used for ranked hits).
-    fn tracks_by_ids(&self, ids: &[i64]) -> Result<Vec<Track>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT {} FROM track WHERE track.id IN ({placeholders})",
-            db::TRACK_COLS
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let bind: Vec<&dyn ToSql> = ids.iter().map(|i| i as &dyn ToSql).collect();
-        let mut by_id: HashMap<i64, Track> = HashMap::new();
-        let rows = stmt.query_map(bind.as_slice(), db::row_to_track)?;
-        for t in rows {
-            let t = t?;
-            by_id.insert(t.id, t);
-        }
-        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
-    }
+impl SearchIndex {
+    /// Build the index from a library's current database contents. Rebuild
+    /// after a scan to pick up changes.
+    pub fn build(lib: &Library) -> Result<Self> {
+        let conn = &lib.conn;
+        let track_hays = load_track_hays(conn)?;
 
-    fn fts_tracks(&self, expr: &str, limit: usize) -> Result<Vec<Track>> {
-        let sql = format!(
-            "SELECT {} FROM track_fts JOIN track ON track.id = track_fts.rowid \
-             WHERE track_fts MATCH ?1 ORDER BY rank LIMIT ?2",
-            db::TRACK_COLS
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![expr, limit as i64], db::row_to_track)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    fn fts_albums(&self, expr: &str, limit: usize) -> Result<Vec<Album>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track.album, track.album_artist, MAX(track.year), COUNT(*), \
-                 COALESCE(SUM(track.duration_ms),0), MAX(track.art_hash) \
-             FROM track_fts JOIN track ON track.id = track_fts.rowid \
-             WHERE track_fts MATCH ?1 AND track.album IS NOT NULL AND track.album <> '' \
-             GROUP BY track.album_artist, track.album \
-             ORDER BY track.album COLLATE NOCASE LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![expr, limit as i64], row_to_album)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    fn fts_folders(&self, expr: &str, limit: usize) -> Result<Vec<Folder>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track.folder, COUNT(*), COALESCE(SUM(track.duration_ms),0) \
-             FROM track_fts JOIN track ON track.id = track_fts.rowid \
-             WHERE track_fts MATCH ?1 GROUP BY track.folder \
-             ORDER BY COUNT(*) DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![expr, limit as i64], row_to_folder)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
-    /// Rebuild the nucleo haystack from the current DB contents.
-    fn reload_index(&mut self) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, TRIM(COALESCE(title,'')||' '||COALESCE(artist,'')||' '|| \
-                 COALESCE(album,'')||' '||COALESCE(album_artist,'')) FROM track",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Hay {
-                id: r.get(0)?,
-                text: r.get(1)?,
+        let albums = load_albums(conn, album_order(Sort::Album))?;
+        let album_hays = albums
+            .iter()
+            .enumerate()
+            .map(|(i, a)| Hay {
+                id: i as i64,
+                text: match a.album_artist.as_deref() {
+                    Some(aa) if !aa.is_empty() => format!("{} {}", a.album, aa),
+                    _ => a.album.clone(),
+                },
             })
-        })?;
-        self.hays = rows.collect::<rusqlite::Result<_>>()?;
-        Ok(())
+            .collect();
+
+        let artists = load_artists(conn)?;
+        let artist_hays = artists
+            .iter()
+            .enumerate()
+            .map(|(i, a)| Hay {
+                id: i as i64,
+                text: a.name.clone(),
+            })
+            .collect();
+
+        let folders = load_folders(conn)?;
+        let folder_hays = folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Hay {
+                id: i as i64,
+                text: f.path.clone(),
+            })
+            .collect();
+
+        Ok(SearchIndex {
+            track_hays,
+            albums,
+            album_hays,
+            artists,
+            artist_hays,
+            folders,
+            folder_hays,
+        })
+    }
+
+    /// Unified fuzzy search. [`Filter::All`] fills artists, albums and tracks
+    /// (plus the secondary folders group) from one call; a specific filter
+    /// scopes to that single group. `limit` caps each group. An empty query
+    /// returns the first `limit` of each in-scope group (title order for
+    /// tracks). `lib` is used only to fetch the matched track rows.
+    pub fn query(
+        &self,
+        lib: &Library,
+        query: &str,
+        filter: Filter,
+        limit: usize,
+    ) -> Result<SearchResults> {
+        let conn = &lib.conn;
+        let q = query.trim();
+        let want = |f: Filter| filter == Filter::All || filter == f;
+        let mut out = SearchResults::default();
+
+        if q.is_empty() {
+            if want(Filter::Tracks) {
+                out.tracks = load_tracks_sorted(conn, track_order(Sort::Title), Some(limit))?;
+            }
+            if want(Filter::Albums) {
+                out.albums = self.albums.iter().take(limit).cloned().collect();
+            }
+            if want(Filter::Artists) {
+                out.artists = self.artists.iter().take(limit).cloned().collect();
+            }
+            if filter == Filter::All {
+                out.folders = self.folders.iter().take(limit).cloned().collect();
+            }
+            return Ok(out);
+        }
+
+        // One matcher, reused across every group of this query.
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        if want(Filter::Tracks) {
+            let ids = search::match_topn(&mut matcher, &self.track_hays, q, limit);
+            out.tracks = load_tracks_by_ids(conn, &ids)?;
+        }
+        if want(Filter::Albums) {
+            out.albums = search::match_topn(&mut matcher, &self.album_hays, q, limit)
+                .into_iter()
+                .filter_map(|i| self.albums.get(i as usize).cloned())
+                .collect();
+        }
+        if want(Filter::Artists) {
+            out.artists = search::match_topn(&mut matcher, &self.artist_hays, q, limit)
+                .into_iter()
+                .filter_map(|i| self.artists.get(i as usize).cloned())
+                .collect();
+        }
+        if filter == Filter::All {
+            out.folders = search::match_topn(&mut matcher, &self.folder_hays, q, limit)
+                .into_iter()
+                .filter_map(|i| self.folders.get(i as usize).cloned())
+                .collect();
+        }
+        Ok(out)
     }
 }
 
@@ -483,4 +440,110 @@ fn row_to_folder(r: &rusqlite::Row) -> rusqlite::Result<Folder> {
         track_count: r.get::<_, i64>(1)? as u32,
         total_ms: r.get::<_, i64>(2)? as u64,
     })
+}
+
+// --- shared query helpers (used by both `Library` browse and `SearchIndex`) --
+
+fn album_order(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Artist => "track.album_artist COLLATE NOCASE, track.album COLLATE NOCASE",
+        _ => "track.album COLLATE NOCASE",
+    }
+}
+
+fn track_order(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Title => "track.title COLLATE NOCASE",
+        Sort::Artist => {
+            "track.artist COLLATE NOCASE, track.album COLLATE NOCASE, track.disc_no, track.track_no"
+        }
+        Sort::Album => "track.album COLLATE NOCASE, track.disc_no, track.track_no",
+    }
+}
+
+fn load_albums(conn: &Connection, order: &str) -> Result<Vec<Album>> {
+    let sql = format!(
+        "SELECT track.album, track.album_artist, MAX(track.year), COUNT(*), \
+             COALESCE(SUM(track.duration_ms),0), MAX(track.art_hash) \
+         FROM track WHERE track.album IS NOT NULL AND track.album <> '' \
+         GROUP BY track.album_artist, track.album ORDER BY {order}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_album)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn load_artists(conn: &Connection) -> Result<Vec<Artist>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(NULLIF(album_artist,''), artist) AS a, \
+             COUNT(DISTINCT album), COUNT(*) FROM track \
+         WHERE COALESCE(NULLIF(album_artist,''), artist) IS NOT NULL \
+         GROUP BY a ORDER BY a COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Artist {
+            name: r.get(0)?,
+            album_count: r.get::<_, i64>(1)? as u32,
+            track_count: r.get::<_, i64>(2)? as u32,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn load_folders(conn: &Connection) -> Result<Vec<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT folder, COUNT(*), COALESCE(SUM(duration_ms),0) FROM track \
+         GROUP BY folder ORDER BY folder COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], row_to_folder)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn load_tracks_sorted(conn: &Connection, order: &str, limit: Option<usize>) -> Result<Vec<Track>> {
+    let lim = match limit {
+        Some(n) => format!(" LIMIT {n}"),
+        None => String::new(),
+    };
+    let sql = format!("SELECT {} FROM track ORDER BY {order}{lim}", db::TRACK_COLS);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], db::row_to_track)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Fetch tracks by id, preserving the order of `ids` (used for ranked hits).
+fn load_tracks_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Track>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {} FROM track WHERE track.id IN ({placeholders})",
+        db::TRACK_COLS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let bind: Vec<&dyn ToSql> = ids.iter().map(|i| i as &dyn ToSql).collect();
+    let mut by_id: HashMap<i64, Track> = HashMap::new();
+    let rows = stmt.query_map(bind.as_slice(), db::row_to_track)?;
+    for t in rows {
+        let t = t?;
+        by_id.insert(t.id, t);
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+}
+
+/// Build the tracks haystack: `title artist album album_artist` per track id.
+fn load_track_hays(conn: &Connection) -> Result<Vec<Hay>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, TRIM(COALESCE(title,'')||' '||COALESCE(artist,'')||' '|| \
+             COALESCE(album,'')||' '||COALESCE(album_artist,'')) FROM track",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Hay {
+            id: r.get(0)?,
+            text: r.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

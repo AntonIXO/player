@@ -23,11 +23,17 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use adw::prelude::*;
-use gtk::{gio, glib, Orientation, SelectionMode};
+use gtk::{gio, glib, Orientation};
 use player_core::{Event, Player, StreamSpec};
-use player_library::{fmt_dur_ms, fmt_khz, Album, Filter, Library, Track};
+use player_library::{
+    fmt_dur_ms, fmt_khz, Album, Artist, Filter, Folder, Library, SearchIndex, SearchResults, Track,
+};
 
+mod art;
+mod list;
 mod widgets;
+use art::ArtCache;
+use list::{grid_view, list_view};
 use widgets::*;
 
 /// Mutable app state (single-threaded: GTK main loop).
@@ -87,22 +93,30 @@ struct Ui {
     /// Monotonic seek-debounce generation: each slider move bumps it and arms a
     /// timeout; only the latest generation actually commits the engine seek.
     seek_gen: Cell<u64>,
-    // library
+    // library — each browse tab is a ScrolledWindow whose child is a freshly
+    // built (virtualised) ListView/GridView, so only visible rows are realised.
     nav: adw::NavigationView,
-    albums_flow: gtk::FlowBox,
+    albums_scroller: gtk::ScrolledWindow,
     az_box: gtk::Box,
     library_empty: gtk::Widget, // outer Stack: "empty" | "browse"
     browse_stack: gtk::Stack,   // "albums" | "artists" | "folders" | "tracks"
-    artists_box: gtk::Box,
-    folders_box: gtk::Box,
-    tracks_box: gtk::Box,
+    artists_scroller: gtk::ScrolledWindow,
+    folders_scroller: gtk::ScrolledWindow,
+    tracks_scroller: gtk::ScrolledWindow,
     // search
     search_entry: gtk::SearchEntry,
     search_results: gtk::Box,
     filter: RefCell<Filter>,
     filter_buttons: Vec<(Filter, gtk::ToggleButton)>,
+    /// Sender into the background search worker (own connection + fuzzy index).
+    search_tx: async_channel::Sender<SearchMsg>,
+    /// Monotonic search generation: each keystroke/filter change bumps it; a
+    /// result is rendered only if its seq still matches (latest-wins).
+    search_seq: Cell<u64>,
     // queue
     queue_box: gtk::Box,
+    /// Async, cached cover-art textures (decoded off the main thread).
+    art: ArtCache,
 }
 
 type SharedState = Rc<RefCell<State>>;
@@ -133,7 +147,7 @@ fn apply_theme(theme: Option<&str>) {
 
 fn load_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(include_str!("style.css"));
+    provider.load_from_string(include_str!("style.css"));
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -170,6 +184,11 @@ fn build_ui(app: &adw::Application) {
 
     // Theme: restore the persisted color scheme.
     apply_theme(library.get_meta("theme").ok().flatten().as_deref());
+
+    // Background search worker: owns its own read connection + the in-memory
+    // fuzzy index, so per-keystroke search never blocks the main thread. It is
+    // told to Reindex after a scan.
+    let (search_tx, search_rx) = spawn_search_worker(db_path.clone(), art_dir.clone());
 
     // engine events → main loop
     let (ev_tx, ev_rx) = async_channel::unbounded::<Event>();
@@ -294,18 +313,21 @@ fn build_ui(app: &adw::Application) {
         seeking: Cell::new(false),
         seek_gen: Cell::new(0),
         nav: lib.nav.clone(),
-        albums_flow: lib.albums_flow.clone(),
+        albums_scroller: lib.albums_scroller.clone(),
         az_box: lib.az_box.clone(),
         library_empty: lib.outer.clone().upcast(),
         browse_stack: lib.browse_stack.clone(),
-        artists_box: lib.artists_box.clone(),
-        folders_box: lib.folders_box.clone(),
-        tracks_box: lib.tracks_box.clone(),
+        artists_scroller: lib.artists_scroller.clone(),
+        folders_scroller: lib.folders_scroller.clone(),
+        tracks_scroller: lib.tracks_scroller.clone(),
         search_entry: search_entry.clone(),
         search_results,
         filter: RefCell::new(Filter::All),
         filter_buttons,
+        search_tx: search_tx.clone(),
+        search_seq: Cell::new(0),
         queue_box,
+        art: ArtCache::new(state.borrow().art_dir.clone()),
     });
 
     wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
@@ -365,6 +387,18 @@ fn build_ui(app: &adw::Application) {
                     Event::Position(frames) => on_position(&state, &ui, frames),
                     Event::Ended => on_ended(&state, &ui),
                     Event::Error(e) => ui.toast(&format!("⚠ {e}")),
+                }
+            }
+        });
+    }
+
+    // search results pump: render only the latest-requested generation.
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        glib::spawn_future_local(async move {
+            while let Ok(hits) = search_rx.recv().await {
+                if hits.seq == ui.search_seq.get() {
+                    render_search_results(&state, &ui, hits.results);
                 }
             }
         });
@@ -537,14 +571,22 @@ fn build_now_playing() -> (gtk::Widget, Np) {
 /// Widgets the library page exposes to the rest of the app.
 struct LibUi {
     nav: adw::NavigationView,
-    albums_flow: gtk::FlowBox,
+    albums_scroller: gtk::ScrolledWindow,
     az_box: gtk::Box,
     outer: gtk::Stack, // "empty" | "browse"
     browse_stack: gtk::Stack,
-    artists_box: gtk::Box,
-    folders_box: gtk::Box,
-    tracks_box: gtk::Box,
+    artists_scroller: gtk::ScrolledWindow,
+    folders_scroller: gtk::ScrolledWindow,
+    tracks_scroller: gtk::ScrolledWindow,
     seg: Vec<(&'static str, gtk::ToggleButton)>,
+}
+
+/// A vertically-scrolling viewport for a virtualised browse list.
+fn browse_scroller() -> gtk::ScrolledWindow {
+    let s = gtk::ScrolledWindow::new();
+    s.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    s.set_vexpand(true);
+    s
 }
 
 /// The four browse tabs, in display order.
@@ -556,20 +598,9 @@ const BROWSE_TABS: [(&str, &str); 4] = [
 ];
 
 fn build_library() -> LibUi {
-    // --- Albums grid (with A–Z fast index) ---
-    let flow = gtk::FlowBox::new();
-    flow.set_selection_mode(SelectionMode::None);
-    // Fixed 3-up grid, matching the design's `repeat(3, …)`. FlowBox squeezes the
-    // homogeneous cells to a third of the width rather than dropping to 2 columns.
-    flow.set_min_children_per_line(3);
-    flow.set_max_children_per_line(3);
-    flow.set_homogeneous(true);
-    flow.set_column_spacing(12);
-    flow.set_row_spacing(12);
-    flow.set_valign(gtk::Align::Start);
-
-    let scroller = wrap_scroller(&flow);
-    scroller.set_hexpand(true);
+    // --- Albums grid (a GridView, set by refresh_library) + A–Z fast index ---
+    let albums_scroller = browse_scroller();
+    albums_scroller.set_hexpand(true);
 
     let az = gtk::Box::new(Orientation::Vertical, 1);
     az.add_css_class("az-index");
@@ -577,20 +608,20 @@ fn build_library() -> LibUi {
     az.set_margin_end(2);
 
     let albums_row = gtk::Box::new(Orientation::Horizontal, 0);
-    albums_row.append(&scroller);
+    albums_row.append(&albums_scroller);
     albums_row.append(&az);
 
-    // --- Artists / Folders / Tracks list tabs ---
-    let artists_box = list_tab_box();
-    let folders_box = list_tab_box();
-    let tracks_box = list_tab_box();
+    // --- Artists / Folders / Tracks list tabs (virtualised, set on demand) ---
+    let artists_scroller = browse_scroller();
+    let folders_scroller = browse_scroller();
+    let tracks_scroller = browse_scroller();
 
     let browse_stack = gtk::Stack::new();
     browse_stack.set_vexpand(true);
     browse_stack.add_named(&albums_row, Some("albums"));
-    browse_stack.add_named(&wrap_scroller(&artists_box), Some("artists"));
-    browse_stack.add_named(&wrap_scroller(&folders_box), Some("folders"));
-    browse_stack.add_named(&wrap_scroller(&tracks_box), Some("tracks"));
+    browse_stack.add_named(&artists_scroller, Some("artists"));
+    browse_stack.add_named(&folders_scroller, Some("folders"));
+    browse_stack.add_named(&tracks_scroller, Some("tracks"));
     browse_stack.set_visible_child_name("albums");
 
     // --- Segmented header (linked toggles) ---
@@ -644,13 +675,13 @@ fn build_library() -> LibUi {
 
     LibUi {
         nav,
-        albums_flow: flow,
+        albums_scroller,
         az_box: az,
         outer,
         browse_stack,
-        artists_box,
-        folders_box,
-        tracks_box,
+        artists_scroller,
+        folders_scroller,
+        tracks_scroller,
         seg,
     }
 }
@@ -663,11 +694,9 @@ fn build_search() -> (gtk::Widget, gtk::SearchEntry, gtk::Box, Vec<(Filter, gtk:
     let chips_inner = gtk::Box::new(Orientation::Horizontal, 8);
     let filters = [
         ("All", Filter::All),
+        ("Tracks", Filter::Tracks),
         ("Albums", Filter::Albums),
         ("Artists", Filter::Artists),
-        ("Album Artists", Filter::AlbumArtists),
-        ("Composers", Filter::Composers),
-        ("Genres", Filter::Genres),
     ];
     let mut buttons = Vec::new();
     for (label, f) in filters {
@@ -925,14 +954,15 @@ fn wire(
         stack.connect_visible_child_name_notify(move |_| update_mini(&state, &ui));
     }
 
-    // search: typed query + filter chips
+    // search: typed query + filter chips. Debounced; the query runs on the
+    // worker thread and results are rendered by the search-results pump.
     {
-        let (state, ui) = (state.clone(), ui.clone());
+        let ui = ui.clone();
         let entry = ui.search_entry.clone();
-        entry.connect_search_changed(move |_| run_search(&state, &ui));
+        entry.connect_search_changed(move |_| kick_search(&ui));
     }
     for (f, btn) in &ui.filter_buttons {
-        let (state, ui, f) = (state.clone(), ui.clone(), *f);
+        let (ui, f) = (ui.clone(), *f);
         btn.connect_toggled(move |b| {
             if !b.is_active() {
                 return;
@@ -943,19 +973,10 @@ fn wire(
                     ob.set_active(false);
                 }
             }
-            run_search(&state, &ui);
+            kick_search(&ui);
         });
     }
-
-    // album activated → open its detail page
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        let flow = ui.albums_flow.clone();
-        flow.connect_child_activated(move |_, child| {
-            let i = child.index() as usize;
-            open_album_detail(&state, &ui, i);
-        });
-    }
+    // (Album activation is wired by `refresh_library` on the GridView itself.)
 }
 
 /// Wire the Albums/Artists/Folders/Tracks segmented switcher (radio behaviour).
@@ -1146,16 +1167,16 @@ fn prev_track(state: &SharedState, ui: &SharedUi) {
 
 /// Open the detail page for the album at `index` in the cached album list.
 fn open_album_detail(state: &SharedState, ui: &SharedUi, index: usize) {
-    let (album, tracks, art_dir) = {
+    let (album, tracks) = {
         let s = state.borrow();
         let Some(al) = s.albums.get(index).cloned() else { return };
         let tracks = s
             .library
             .album_tracks(&al.album, al.album_artist.as_deref())
             .unwrap_or_default();
-        (al, tracks, s.art_dir.clone())
+        (al, tracks)
     };
-    let page = build_album_detail(state, ui, &album, tracks, &art_dir);
+    let page = build_album_detail(state, ui, &album, tracks);
     ui.nav.push(&page);
 }
 
@@ -1166,12 +1187,11 @@ fn build_album_detail(
     ui: &SharedUi,
     album: &Album,
     tracks: Vec<Track>,
-    art_dir: &Path,
 ) -> adw::NavigationPage {
     let tracks = Rc::new(tracks);
 
     let header = gtk::Box::new(Orientation::Horizontal, 16);
-    let art = art_widget(art_dir, album.art_hash.as_deref(), 132, true);
+    let art = art_widget(&ui.art, album.art_hash.as_deref(), 132, true);
     header.append(&art);
     let titles = gtk::Box::new(Orientation::Vertical, 4);
     titles.set_valign(gtk::Align::Center);
@@ -1228,9 +1248,10 @@ fn build_album_detail(
     for (i, tr) in tracks.iter().enumerate() {
         let (state, ui, all) = (state.clone(), ui.clone(), tracks.clone());
         let (s2, u2, tc) = (state.clone(), ui.clone(), tr.clone());
+        let cache = ui.art.clone();
         let n = tr.track_no.map(|n| format!("{n}.  ")).unwrap_or_default();
         let row = row_widget(
-            art_dir,
+            &cache,
             tr.art_hash.as_deref(),
             &format!("{n}{}", tr.display_title()),
             &tr.subtitle(),
@@ -1304,9 +1325,9 @@ fn refresh_queue(state: &SharedState, ui: &SharedUi) {
     while let Some(c) = ui.queue_box.first_child() {
         ui.queue_box.remove(&c);
     }
-    let (queue, current, art_dir) = {
+    let (queue, current) = {
         let s = state.borrow();
-        (s.queue.clone(), s.current, s.art_dir.clone())
+        (s.queue.clone(), s.current)
     };
     if queue.is_empty() {
         let l = gtk::Label::new(Some("Queue is empty — play an album or add tracks from search."));
@@ -1326,7 +1347,7 @@ fn refresh_queue(state: &SharedState, ui: &SharedUi) {
             t.subtitle()
         };
         let row = row_widget(
-            &art_dir,
+            &ui.art,
             t.art_hash.as_deref(),
             &t.display_title(),
             &subtitle,
@@ -1453,7 +1474,6 @@ fn on_ended(state: &SharedState, ui: &SharedUi) {
 
 fn refresh_library(state: &SharedState, ui: &SharedUi) {
     let albums = state.borrow().library.albums(player_library::Sort::Title).unwrap_or_default();
-    let art_dir = state.borrow().art_dir.clone();
     let n_tracks = state
         .borrow()
         .library
@@ -1461,14 +1481,12 @@ fn refresh_library(state: &SharedState, ui: &SharedUi) {
         .map(|s| s.tracks)
         .unwrap_or(0);
 
-    while let Some(c) = ui.albums_flow.first_child() {
-        ui.albums_flow.remove(&c);
-    }
     while let Some(c) = ui.az_box.first_child() {
         ui.az_box.remove(&c);
     }
 
     if n_tracks == 0 {
+        ui.albums_scroller.set_child(gtk::Widget::NONE);
         if let Some(s) = ui.library_empty.downcast_ref::<gtk::Stack>() {
             s.set_visible_child_name("empty");
         }
@@ -1479,10 +1497,22 @@ fn refresh_library(state: &SharedState, ui: &SharedUi) {
         s.set_visible_child_name("browse");
     }
 
-    for al in &albums {
-        ui.albums_flow.append(&album_cell(&art_dir, al));
-    }
-    build_az_index(state, ui, &albums);
+    // Albums grid: a virtualised GridView. Activation opens the album detail by
+    // its position in the cached album list (kept in sync via `queue_albums`).
+    let grid = grid_view(
+        albums.clone(),
+        3,
+        {
+            let cache = ui.art.clone();
+            move |al: &Album| album_cell(&cache, al).upcast()
+        },
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_albums: &[Album], pos| open_album_detail(&state, &ui, pos)
+        },
+    );
+    ui.albums_scroller.set_child(Some(&grid));
+    build_az_index(ui, &albums, &grid);
 
     // remember albums for activation lookup
     state.borrow_mut().queue_albums(albums);
@@ -1498,98 +1528,106 @@ fn refresh_library(state: &SharedState, ui: &SharedUi) {
     }
 }
 
-/// Populate and reveal a browse tab. Albums are already filled by
-/// [`refresh_library`]; Artists/Folders/Tracks are filled on demand here.
+/// Populate and reveal a browse tab. Albums are filled by [`refresh_library`];
+/// Artists/Folders/Tracks are built here on demand as virtualised `ListView`s.
 fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
     ui.browse_stack.set_visible_child_name(name);
-    let art_dir = state.borrow().art_dir.clone();
     match name {
         "artists" => {
-            clear_box(&ui.artists_box);
             let artists = state.borrow().library.artists().unwrap_or_default();
-            let lb = boxed_list();
-            for a in &artists {
-                let (state, ui, name) = (state.clone(), ui.clone(), a.name.clone());
-                let meta = format!(
-                    "{} album{} · {} track{}",
-                    a.album_count,
-                    if a.album_count == 1 { "" } else { "s" },
-                    a.track_count,
-                    if a.track_count == 1 { "" } else { "s" }
-                );
-                let row = row_widget(
-                    &art_dir,
-                    None,
-                    &a.name,
-                    &meta,
-                    None,
-                    Some(("media-playback-start-symbolic", "Play all")),
-                    {
-                        let (state, ui, name) = (state.clone(), ui.clone(), name.clone());
-                        move || play_artist(&state, &ui, &name)
-                    },
-                    move || play_artist(&state, &ui, &name),
-                );
-                lb.append(&row);
-            }
-            ui.artists_box.append(&lb);
+            let lv = list_view(
+                artists,
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |a: &Artist| {
+                        let meta = format!(
+                            "{} album{} · {} track{}",
+                            a.album_count,
+                            if a.album_count == 1 { "" } else { "s" },
+                            a.track_count,
+                            if a.track_count == 1 { "" } else { "s" },
+                        );
+                        let cache = ui.art.clone();
+                        let (state, ui, name) = (state.clone(), ui.clone(), a.name.clone());
+                        row_inner(
+                            &cache,
+                            None,
+                            &name.clone(),
+                            &meta,
+                            None,
+                            Some(("media-playback-start-symbolic", "Play all")),
+                            move || play_artist(&state, &ui, &name),
+                        )
+                        .upcast()
+                    }
+                },
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |items: &[Artist], pos| play_artist(&state, &ui, &items[pos].name)
+                },
+            );
+            ui.artists_scroller.set_child(Some(&lv));
         }
         "folders" => {
-            clear_box(&ui.folders_box);
             let folders = state.borrow().library.folders().unwrap_or_default();
-            let lb = boxed_list();
-            for f in &folders {
-                let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
-                let row = row_widget(
-                    &art_dir,
-                    None,
-                    f.name(),
-                    &f.path,
-                    Some(&f.meta()),
-                    Some(("media-playback-start-symbolic", "Play folder")),
-                    {
-                        let (state, ui, path) = (state.clone(), ui.clone(), path.clone());
-                        move || play_folder(&state, &ui, &path)
-                    },
-                    move || play_folder(&state, &ui, &path),
-                );
-                lb.append(&row);
-            }
-            ui.folders_box.append(&lb);
+            let lv = list_view(
+                folders,
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |f: &Folder| {
+                        let cache = ui.art.clone();
+                        let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
+                        row_inner(
+                            &cache,
+                            None,
+                            f.name(),
+                            &f.path,
+                            Some(&f.meta()),
+                            Some(("media-playback-start-symbolic", "Play folder")),
+                            move || play_folder(&state, &ui, &path),
+                        )
+                        .upcast()
+                    }
+                },
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |items: &[Folder], pos| play_folder(&state, &ui, &items[pos].path)
+                },
+            );
+            ui.folders_scroller.set_child(Some(&lv));
         }
         "tracks" => {
-            clear_box(&ui.tracks_box);
             let tracks = state
                 .borrow()
                 .library
                 .tracks(player_library::Sort::Artist)
                 .unwrap_or_default();
-            let lb = boxed_list();
-            let all = Rc::new(tracks.clone());
-            for (i, t) in tracks.iter().enumerate() {
-                let (state, ui, all) = (state.clone(), ui.clone(), all.clone());
-                let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
-                let row = row_widget(
-                    &art_dir,
-                    t.art_hash.as_deref(),
-                    &t.display_title(),
-                    &t.subtitle(),
-                    Some(&t.format_spec()),
-                    Some(("list-add-symbolic", "Add to queue")),
-                    move || play_list(&state, &ui, (*all).clone(), i),
-                    move || enqueue_track(&s2, &u2, tc.clone()),
-                );
-                lb.append(&row);
-            }
-            ui.tracks_box.append(&lb);
+            let lv = list_view(
+                tracks,
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |t: &Track| {
+                        let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
+                        row_inner(
+                            &ui.art,
+                            t.art_hash.as_deref(),
+                            &t.display_title(),
+                            &t.subtitle(),
+                            Some(&t.format_spec()),
+                            Some(("list-add-symbolic", "Add to queue")),
+                            move || enqueue_track(&s2, &u2, tc.clone()),
+                        )
+                        .upcast()
+                    }
+                },
+                {
+                    let (state, ui) = (state.clone(), ui.clone());
+                    move |items: &[Track], pos| play_list(&state, &ui, items.to_vec(), pos)
+                },
+            );
+            ui.tracks_scroller.set_child(Some(&lv));
         }
         _ => {}
-    }
-}
-
-fn clear_box(b: &gtk::Box) {
-    while let Some(c) = b.first_child() {
-        b.remove(&c);
     }
 }
 
@@ -1611,7 +1649,7 @@ fn play_folder(state: &SharedState, ui: &SharedUi, folder: &str) {
     play_list(state, ui, tracks, 0);
 }
 
-fn build_az_index(state: &SharedState, ui: &SharedUi, albums: &[Album]) {
+fn build_az_index(ui: &SharedUi, albums: &[Album], grid: &gtk::GridView) {
     let mut last = '\0';
     for (i, al) in albums.iter().enumerate() {
         let c = al
@@ -1626,79 +1664,151 @@ fn build_az_index(state: &SharedState, ui: &SharedUi, albums: &[Album]) {
         last = c;
         let b = gtk::Button::with_label(&c.to_string());
         b.add_css_class("flat");
-        let (ui2, idx) = (ui.clone(), i as i32);
+        let (grid, idx) = (grid.clone(), i as u32);
         b.connect_clicked(move |_| {
-            if let Some(child) = ui2.albums_flow.child_at_index(idx) {
-                child.grab_focus();
-            }
+            grid.scroll_to(idx, gtk::ListScrollFlags::NONE, None);
         });
         ui.az_box.append(&b);
     }
-    let _ = state;
 }
 
-fn run_search(state: &SharedState, ui: &SharedUi) {
-    let query = ui.search_entry.text().to_string();
-    let filter = *ui.filter.borrow();
-    let art_dir = state.borrow().art_dir.clone();
+/// A request to / result from the background search worker.
+enum SearchMsg {
+    Query { seq: u64, text: String, filter: Filter },
+    /// Rebuild the in-memory fuzzy index (after a scan changed the library).
+    Reindex,
+}
 
-    // clear
+struct SearchHits {
+    seq: u64,
+    results: SearchResults,
+}
+
+/// Spawn the search worker: it owns its own read-only library connection and an
+/// in-memory [`SearchIndex`], answers `Query` messages off the main thread, and
+/// rebuilds the index on `Reindex`. Bursts that pile up while it is busy are
+/// coalesced to the latest query (older keystrokes never render — latest-wins).
+fn spawn_search_worker(
+    db: PathBuf,
+    art: PathBuf,
+) -> (async_channel::Sender<SearchMsg>, async_channel::Receiver<SearchHits>) {
+    let (qtx, qrx) = async_channel::unbounded::<SearchMsg>();
+    let (rtx, rrx) = async_channel::unbounded::<SearchHits>();
+    std::thread::spawn(move || {
+        let Ok(lib) = Library::open(&db, &art) else { return };
+        let mut index = SearchIndex::build(&lib).ok();
+        while let Ok(first) = qrx.recv_blocking() {
+            // Coalesce the burst that piled up while we were busy: keep only the
+            // latest query and honour any Reindex.
+            let mut latest: Option<(u64, String, Filter)> = None;
+            let mut reindex = false;
+            let mut pending = Some(first);
+            while let Some(m) = pending.take().or_else(|| qrx.try_recv().ok()) {
+                match m {
+                    SearchMsg::Query { seq, text, filter } => latest = Some((seq, text, filter)),
+                    SearchMsg::Reindex => reindex = true,
+                }
+            }
+            if reindex {
+                index = SearchIndex::build(&lib).ok();
+            }
+            if let (Some((seq, text, filter)), Some(idx)) = (latest, index.as_ref()) {
+                if let Ok(results) = idx.query(&lib, &text, filter, 50) {
+                    let _ = rtx.send_blocking(SearchHits { seq, results });
+                }
+            }
+        }
+    });
+    (qtx, rrx)
+}
+
+/// Handle a search-entry change or filter toggle: bump the generation (dropping
+/// any in-flight result), and — after a short debounce — hand the query to the
+/// worker. An empty query just clears the results.
+fn kick_search(ui: &SharedUi) {
+    let text = ui.search_entry.text().to_string();
+    let seq = ui.search_seq.get().wrapping_add(1);
+    ui.search_seq.set(seq);
+    if text.trim().is_empty() {
+        clear_search_results(ui);
+        return;
+    }
+    let filter = *ui.filter.borrow();
+    let ui = ui.clone();
+    glib::timeout_add_local_once(Duration::from_millis(80), move || {
+        if ui.search_seq.get() != seq {
+            return; // a newer keystroke superseded this one before it was sent
+        }
+        let _ = ui.search_tx.try_send(SearchMsg::Query { seq, text, filter });
+    });
+}
+
+fn clear_search_results(ui: &SharedUi) {
     while let Some(c) = ui.search_results.first_child() {
         ui.search_results.remove(&c);
     }
-    if query.trim().is_empty() {
-        return;
+}
+
+/// Render the unified grouped results (Artists · Albums · Tracks · Folders).
+fn render_search_results(state: &SharedState, ui: &SharedUi, results: SearchResults) {
+    clear_search_results(ui);
+
+    if !results.artists.is_empty() {
+        ui.search_results.append(&section_label("Artists"));
+        let lb = boxed_list();
+        for a in &results.artists {
+            let meta = format!(
+                "{} album{} · {} track{}",
+                a.album_count,
+                if a.album_count == 1 { "" } else { "s" },
+                a.track_count,
+                if a.track_count == 1 { "" } else { "s" },
+            );
+            let (s1, u1, n1) = (state.clone(), ui.clone(), a.name.clone());
+            let (s2, u2, n2) = (state.clone(), ui.clone(), a.name.clone());
+            let row = row_widget(
+                &ui.art,
+                None,
+                &a.name,
+                &meta,
+                None,
+                Some(("media-playback-start-symbolic", "Play all")),
+                move || play_artist(&s1, &u1, &n1),
+                move || play_artist(&s2, &u2, &n2),
+            );
+            lb.append(&row);
+        }
+        ui.search_results.append(&lb);
     }
 
-    let grouped = state
-        .borrow()
-        .library
-        .search_grouped(&query, filter)
-        .unwrap_or_default();
-    // Tracks: nucleo typeahead for the forgiving "All" case, FTS otherwise.
-    let tracks = if filter == Filter::All {
-        state.borrow().library.search_typeahead(&query, 50)
-    } else {
-        grouped.tracks.clone()
-    };
-
-    if !grouped.albums.is_empty() {
+    if !results.albums.is_empty() {
         ui.search_results.append(&section_label("Albums"));
         let lb = boxed_list();
-        for al in &grouped.albums {
-            let title = al.album.clone();
-            let artist = al.album_artist.clone();
-            let meta = al.meta();
-            let art = al.art_hash.clone();
-            let (state, ui, alc) = (state.clone(), ui.clone(), al.clone());
+        for al in &results.albums {
             let row = row_widget(
-                &art_dir,
-                art.as_deref(),
-                &title,
-                artist.as_deref().unwrap_or("Unknown Artist"),
-                Some(&meta),
+                &ui.art,
+                al.art_hash.as_deref(),
+                &al.album,
+                al.album_artist.as_deref().unwrap_or("Unknown Artist"),
+                Some(&al.meta()),
                 Some(("media-playback-start-symbolic", "Play album")),
                 {
                     // Activate → album detail (drill-down).
-                    let (state, ui, alc) = (state.clone(), ui.clone(), alc.clone());
+                    let (state, ui, alc) = (state.clone(), ui.clone(), al.clone());
                     move || {
-                        let (tracks, art_dir) = {
-                            let s = state.borrow();
-                            (
-                                s.library
-                                    .album_tracks(&alc.album, alc.album_artist.as_deref())
-                                    .unwrap_or_default(),
-                                s.art_dir.clone(),
-                            )
-                        };
-                        let page = build_album_detail(&state, &ui, &alc, tracks, &art_dir);
+                        let tracks = state
+                            .borrow()
+                            .library
+                            .album_tracks(&alc.album, alc.album_artist.as_deref())
+                            .unwrap_or_default();
+                        let page = build_album_detail(&state, &ui, &alc, tracks);
                         ui.nav.push(&page);
                         ui.stack.set_visible_child_name("library");
                     }
                 },
                 {
                     // Trailing ▶ → play the album immediately.
-                    let (state, ui, alc) = (state.clone(), ui.clone(), alc.clone());
+                    let (state, ui, alc) = (state.clone(), ui.clone(), al.clone());
                     move || {
                         let tracks = state
                             .borrow()
@@ -1714,13 +1824,37 @@ fn run_search(state: &SharedState, ui: &SharedUi) {
         ui.search_results.append(&lb);
     }
 
-    if !grouped.folders.is_empty() {
+    if !results.tracks.is_empty() {
+        ui.search_results.append(&section_label("Tracks"));
+        let lb = boxed_list();
+        let tracks_rc = Rc::new(results.tracks.clone());
+        for (i, t) in results.tracks.iter().enumerate() {
+            let (state, ui, all) = (state.clone(), ui.clone(), tracks_rc.clone());
+            let (s2, u2, tclone) = (state.clone(), ui.clone(), t.clone());
+            let cache = ui.art.clone();
+            let row = row_widget(
+                &cache,
+                t.art_hash.as_deref(),
+                &t.display_title(),
+                &t.subtitle(),
+                Some(&t.format_spec()),
+                Some(("list-add-symbolic", "Add to queue")),
+                move || play_list(&state, &ui, (*all).clone(), i),
+                move || enqueue_track(&s2, &u2, tclone.clone()),
+            );
+            lb.append(&row);
+        }
+        ui.search_results.append(&lb);
+    }
+
+    if !results.folders.is_empty() {
         ui.search_results.append(&section_label("Folders"));
         let lb = boxed_list();
-        for f in &grouped.folders {
+        for f in &results.folders {
+            let cache = ui.art.clone();
             let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
             let row = row_widget(
-                &art_dir,
+                &cache,
                 None,
                 f.name(),
                 &f.path,
@@ -1736,34 +1870,13 @@ fn run_search(state: &SharedState, ui: &SharedUi) {
         }
         ui.search_results.append(&lb);
     }
-
-    ui.search_results.append(&section_label("Tracks"));
-    let lb = boxed_list();
-    let tracks_rc = Rc::new(tracks.clone());
-    for (i, t) in tracks.iter().enumerate() {
-        let (state, ui, all) = (state.clone(), ui.clone(), tracks_rc.clone());
-        let (s2, u2, tclone) = (state.clone(), ui.clone(), t.clone());
-        let row = row_widget(
-            &art_dir,
-            t.art_hash.as_deref(),
-            &t.display_title(),
-            &t.subtitle(),
-            Some(&t.format_spec()),
-            Some(("list-add-symbolic", "Add to queue")),
-            move || play_list(&state, &ui, (*all).clone(), i),
-            move || enqueue_track(&s2, &u2, tclone.clone()),
-        );
-        lb.append(&row);
-    }
-    ui.search_results.append(&lb);
 }
 
 // ---------------------------------------------------------------------------
 // Now-playing display helpers
 // ---------------------------------------------------------------------------
 
-fn show_track(state: &SharedState, ui: &SharedUi, track: &Track) {
-    let art_dir = state.borrow().art_dir.clone();
+fn show_track(_state: &SharedState, ui: &SharedUi, track: &Track) {
     ui.title.set_subtitle(&format!("▶ {}", track.display_title()));
     ui.np_title.set_label(&track.display_title());
     ui.np_subtitle.set_label(&track.subtitle());
@@ -1772,8 +1885,8 @@ fn show_track(state: &SharedState, ui: &SharedUi, track: &Track) {
     ui.np_elapsed.set_label("0:00");
     ui.np_seek.set_value(0.0);
     ui.mp_progress.set_fraction(0.0);
-    fill(&ui.np_art, &art_widget(&art_dir, track.art_hash.as_deref(), ART_HERO, true));
-    fill(&ui.mp_art, &art_widget(&art_dir, track.art_hash.as_deref(), ART_MINI, false));
+    fill(&ui.np_art, &art_widget(&ui.art, track.art_hash.as_deref(), ART_HERO, true));
+    fill(&ui.mp_art, &art_widget(&ui.art, track.art_hash.as_deref(), ART_MINI, false));
     ui.mp_title.set_label(&track.display_title());
     ui.mp_artist.set_label(&track.subtitle());
     fill(&ui.np_format, &format_chip(&track.signal_spec()));
@@ -1821,7 +1934,7 @@ fn start_scan(state: &SharedState, ui: &SharedUi, root: PathBuf, force: bool) {
     let (tx, rx) = async_channel::unbounded::<ScanMsg>();
 
     std::thread::spawn(move || match Library::open(&db, &art) {
-        Ok(mut lib) => {
+        Ok(lib) => {
             let tx2 = tx.clone();
             let res = lib.scan_with_progress(&root, force, move |p| {
                 let _ = tx2.send_blocking(ScanMsg::Progress(p.seen, p.total));
@@ -1841,7 +1954,7 @@ fn start_scan(state: &SharedState, ui: &SharedUi, root: PathBuf, force: bool) {
                     ui.title.set_subtitle(&format!("Scanning {seen}/{total}…"));
                 }
                 ScanMsg::Done(Ok(s)) => {
-                    let _ = state.borrow_mut().library.refresh();
+                    let _ = ui.search_tx.try_send(SearchMsg::Reindex);
                     refresh_library(&state, &ui);
                     ui.title.set_subtitle("■ idle");
                     ui.toast(&format!(
@@ -1884,12 +1997,10 @@ fn respawn_player(state: &SharedState, device: String) {
     s.paused = false;
 }
 
-/// Open the preferences window: output device, library folder + live watch, theme.
+/// Open the preferences dialog: output device, library folder + live watch, theme.
 fn open_settings(state: &SharedState, ui: &SharedUi) {
-    let win = adw::PreferencesWindow::new();
-    win.set_title(Some("Settings"));
-    win.set_transient_for(Some(&ui.window));
-    win.set_modal(true);
+    let dialog = adw::PreferencesDialog::new();
+    dialog.set_title("Settings");
     let page = adw::PreferencesPage::new();
 
     // --- Output device ---
@@ -1946,11 +2057,11 @@ fn open_settings(state: &SharedState, ui: &SharedUi) {
     choose.set_tooltip_text(Some("Choose and scan a music folder"));
     {
         let (state, ui, folder_row) = (state.clone(), ui.clone(), folder_row.clone());
-        let win = win.clone();
+        let win = ui.window.clone();
         choose.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder().title("Choose your music folder").build();
+            let chooser = gtk::FileDialog::builder().title("Choose your music folder").build();
             let (state, ui, folder_row) = (state.clone(), ui.clone(), folder_row.clone());
-            dialog.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
+            chooser.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
                 if let Ok(folder) = res {
                     if let Some(path) = folder.path() {
                         folder_row.set_subtitle(&path.display().to_string());
@@ -2007,8 +2118,8 @@ fn open_settings(state: &SharedState, ui: &SharedUi) {
     appg.add(&theme_row);
     page.add(&appg);
 
-    win.add(&page);
-    win.present();
+    dialog.add(&page);
+    dialog.present(Some(&ui.window));
 }
 
 /// Enable or disable live folder-watching. When on, a background thread bridges

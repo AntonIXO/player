@@ -1,9 +1,13 @@
-//! Search helpers: the FTS5 MATCH-expression builder (with filter-chip column
-//! narrowing) and the in-memory nucleo haystack used for instant typeahead.
+//! Search helpers: the in-memory nucleo haystack entry plus the top-N fuzzy
+//! matcher used for instant typeahead across every entity group.
 
-use crate::model::Filter;
+use nucleo::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo::Matcher;
 
-/// One entry in the nucleo haystack: the track id plus the text matched against.
+/// One entry in a nucleo haystack: an id plus the text matched against. For the
+/// tracks haystack the id is the `track.id`; for the albums/artists/folders
+/// haystacks it is the index into the corresponding cached `Vec` (those
+/// entities are derived once at index-build time and kept in RAM).
 pub(crate) struct Hay {
     pub id: i64,
     pub text: String,
@@ -15,35 +19,15 @@ impl AsRef<str> for Hay {
     }
 }
 
-/// Build an FTS5 MATCH expression from a raw query and a filter chip. Each term
-/// becomes a prefix token (`dar*`); terms are implicitly ANDed. Returns `None`
-/// when the query has no usable tokens. Punctuation is stripped so user input
-/// can never form invalid FTS syntax.
-pub(crate) fn fts_expr(query: &str, filter: Filter) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(sanitize_term)
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("{t}*"))
-        .collect();
-    if terms.is_empty() {
-        return None;
-    }
-    let body = terms.join(" ");
-    let col = match filter {
-        Filter::All => return Some(body),
-        Filter::Albums => "album",
-        Filter::Artists => "artist",
-        Filter::AlbumArtists => "album_artist",
-        Filter::Composers => "composer",
-        Filter::Genres => "genre",
-    };
-    // `{col} : (a* b*)` restricts every term to that column.
-    Some(format!("{{{col}}} : ({body})"))
-}
-
-/// Keep only alphanumerics (Unicode-aware); the `unicode61 remove_diacritics`
-/// tokenizer folds accents on the index side so this need not.
-fn sanitize_term(t: &str) -> String {
-    t.chars().filter(|c| c.is_alphanumeric()).collect()
+/// Fuzzy-match `query` against `hays` and return the ids of the top `limit`
+/// entries by descending score. `matcher` is threaded through so one allocation
+/// is reused across all of a query's entity groups. Callers must guard against
+/// an empty/whitespace `query` (nucleo would match everything).
+pub(crate) fn match_topn(matcher: &mut Matcher, hays: &[Hay], query: &str, limit: usize) -> Vec<i64> {
+    let pat = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+    pat.match_list(hays.iter(), matcher)
+        .into_iter()
+        .take(limit)
+        .map(|(h, _score)| h.id)
+        .collect()
 }

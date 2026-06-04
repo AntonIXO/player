@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=3
+pkgrel=4
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -52,6 +52,11 @@ prepare() {
 build() {
 	cd "$builddir"
 	# Native musl/aarch64 build inside the chroot: no --target, no linker flags.
+	# Tune codegen for the SDM845 (Kryo 385 = Cortex-A75 big + A55 LITTLE, which
+	# share the ARMv8.2-A ISA, so a75-tuned code runs safely on both clusters).
+	# Set via RUSTFLAGS here — not only in .cargo/config.toml — so it applies
+	# regardless of the chroot rustc's exact musl host triple.
+	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort"
 	cargo build --release --frozen -p player-gtk -p player-cli
 }
 

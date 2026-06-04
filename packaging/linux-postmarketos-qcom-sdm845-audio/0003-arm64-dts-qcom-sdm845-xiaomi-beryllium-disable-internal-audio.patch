@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000003 Mon Sep 17 00:00:00 2001
+From: Anton <fourth@devpins.org>
+Date: Thu, 4 Jun 2026 00:00:00 +0000
+Subject: [PATCH] arm64: dts: qcom: sdm845-xiaomi-beryllium: disable internal audio
+
+This device is a dedicated bit-perfect player feeding a USB DAC (Chord
+Mojo 2), which is a separate ALSA card on the USB bus. The on-board audio
+path is never used, so disable it to free the SLIMbus clock/IRQ domain and
+stop the idle WCD9340 codec from sitting on the SoC:
+
+  - &sound    : the on-board ASoC machine card
+  - &wcd9340  : the WCD9340 codec (SLIMbus device)
+  - &slim     : the SLIMbus NGD controller (audio-only on SDM845)
+  - &slimbam  : the SLIMbus BAM DMA controller
+
+Nothing on beryllium uses SLIMbus except the codec, so this is safe and
+fully reversible (reflash a kernel without the patch to restore internal
+audio). The hunk appends overrides at the end of the shared -common.dtsi,
+so it covers both the EBBG and Tianma panel variants; it locates by the
+trailing &q6voicedai block, so the line number is approximate.
+
+Signed-off-by: Anton <fourth@devpins.org>
+---
+ arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+--- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
+@@ -936,3 +936,9 @@
+ 		reg = <VOICEMMODE1>;
+ 	};
+ };
++
++/* Dedicated USB-DAC appliance: free SLIMbus + the internal codec (audio is USB-only). */
++&sound { status = "disabled"; };
++&wcd9340 { status = "disabled"; };
++&slim { status = "disabled"; };
++&slimbam { status = "disabled"; };
+--
+2.51.0

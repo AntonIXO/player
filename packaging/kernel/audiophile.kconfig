@@ -6,9 +6,11 @@
 #   pmbootstrap kconfig edit linux-postmarketos-qcom-sdm845
 # or by editing the symbols directly and re-running `pmbootstrap kconfig check`.
 #
-# Everything the two guides ask for that ISN'T listed here is already enabled in
-# the shipped config: CONFIG_HZ_1000, CONFIG_PREEMPT (full), HIGH_RES_TIMERS,
-# IRQ_FORCED_THREADING, CPU_FREQ_GOV_PERFORMANCE. Only the deltas below remain.
+# Everything the audio-tuning guides ask for that ISN'T listed here is already
+# enabled in the shipped config: CONFIG_HZ_1000, CONFIG_PREEMPT (full),
+# HIGH_RES_TIMERS, IRQ_FORCED_THREADING, CPU_FREQ_GOV_PERFORMANCE, SND_USB_AUDIO=y,
+# USB_DWC3_QCOM=y. Only the deltas below remain. (PREEMPT_RT is available on mainline
+# — ARCH_SUPPORTS_RT=y — but needs CONFIG_EXPERT and on-device validation; not enabled.)
 
 # --- Full-tickless isolated audio core ---------------------------------------
 # Was NO_HZ_IDLE. NO_HZ_FULL lets a core run tickless when a single RT task owns
@@ -18,6 +20,8 @@ CONFIG_NO_HZ_FULL=y
 # CONFIG_NO_HZ_IDLE is unset by the above (mutually exclusive); kept implicit.
 CONFIG_RCU_NOCB_CPU=y
 
+
+CONFIG_IRQ_FORCED_THREADING=y
 # --- USB audio driver BUILT-IN (=y) via a built-in ALSA core -----------------
 # The 7.x pmOS config ships the ALSA core modular (CONFIG_SND=m), and a built-in
 # driver can't depend on a modular core, so SND_USB_AUDIO=y alone silently
@@ -35,6 +39,16 @@ CONFIG_SND_USB_AUDIO=y
 # (snd_usb_audio.nrpacks=1 / .low_latency=1 in 90-audio-cmdline.conf), NOT
 # modprobe.d — modprobe.d/audio.conf is inert while built-in (kept, harmless).
 # kconfigcheck only *prefers* SND_USB_AUDIO=m (non-gating INFO); =y still passes.
+
+# --- USB host VBUS (PMI8998 OTG boost) ---------------------------------------
+# beryllium forces dr_mode="host" (patch 0002), but dwc3-qcom never drives 5 V
+# VBUS and mainline has no PMI8998 OTG-boost regulator, so the port is dead
+# unless VBUS is fed from outside the phone. Patch 0004 teaches
+# qcom_usb_vbus-regulator about pmi8998 and patch 0005 adds the always-on
+# regulator node; build the driver in so the phone self-powers the DAC over a
+# plain OTG cable (like the downstream Android kernel does). Off by default in
+# the shipped pmOS config.
+CONFIG_REGULATOR_QCOM_USB_VBUS=y
 
 # --- ThinLTO -----------------------------------------------------------------
 # Cross-module inlining + better codegen; the kernel already builds with LLVM=1
@@ -56,7 +70,21 @@ CONFIG_LTO_CLANG_THIN=y
 # setting with zero audio impact; enabling it makes the community check green.
 CONFIG_SECURITY_YAMA=y
 
+# --- Full-dynticks CPU-time accounting ("Beyond ArchQ" §5.1) ------------------
+# Make the "Cputime accounting" choice explicit. TICK_CPU_ACCOUNTING `depends on
+# !NO_HZ_FULL`, so with NO_HZ_FULL=y the build already resolves the choice to GEN
+# (the shipped config's stale CONFIG_TICK_CPU_ACCOUNTING=y gets overridden by
+# syncconfig). Setting it here is config hygiene / explicit intent — the kernel
+# binary is functionally identical. GEN selects VIRT_CPU_ACCOUNTING + CONTEXT_TRACKING_USER.
+# CONFIG_TICK_CPU_ACCOUNTING is unset by selecting GEN below.
+CONFIG_VIRT_CPU_ACCOUNTING=y
+CONFIG_VIRT_CPU_ACCOUNTING_GEN=y
+CONFIG_CONTEXT_TRACKING_USER=y
+
 # --- DELIBERATELY NOT TOUCHED (would fail pmb:kconfigcheck-community / break systemd):
 #   CONFIG_BPF_SYSCALL, CONFIG_IPV6, CONFIG_NETFILTER  (required by the userspace)
 #   CONFIG_COMPACTION, CONFIG_MIGRATION                (selected by THP/hotplug; risky)
 #   CONFIG_FTRACE and other DEBUG_* strips             (need EXPERT; marginal benefit)
+#   CONFIG_SND_PCM_TIMER=n ("Beyond ArchQ" §5.2)       (prompt is EXPERT-gated → syncconfig
+#                                                       reverts to default y; not worth EXPERT)
+#   CONFIG_SWAP=n ("Beyond ArchQ" §5.3)                (removes zram → OOM risk under Phosh)

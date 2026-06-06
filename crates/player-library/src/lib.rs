@@ -58,6 +58,7 @@ pub fn track_from_path(path: &Path) -> Track {
             art_hash: None,
             source_path: path.to_path_buf(),
             start_ms: None,
+            loved: false,
         },
         Err(_) => Track {
             id: -1,
@@ -80,6 +81,7 @@ pub fn track_from_path(path: &Path) -> Track {
             art_hash: None,
             source_path: path.to_path_buf(),
             start_ms: None,
+            loved: false,
         },
     }
 }
@@ -294,6 +296,42 @@ impl Library {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    // --- loved (favourite) tracks ------------------------------------------
+
+    /// Mark `track_id` loved or not. Loving inserts a row (keeping the original
+    /// `loved_at` if already present); unloving deletes it.
+    pub fn set_loved(&self, track_id: i64, loved: bool) -> Result<()> {
+        if loved {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            self.conn.execute(
+                "INSERT INTO loved_tracks(track_id, loved_at) VALUES(?1, ?2) \
+                 ON CONFLICT(track_id) DO NOTHING",
+                params![track_id, now],
+            )?;
+        } else {
+            self.conn
+                .execute("DELETE FROM loved_tracks WHERE track_id = ?1", params![track_id])?;
+        }
+        Ok(())
+    }
+
+    /// All loved tracks, most-recently-loved first (joined back to `track`, so
+    /// loved rows for since-removed files are skipped).
+    pub fn loved_tracks(&self) -> Result<Vec<Track>> {
+        let sql = format!(
+            "SELECT {} FROM track \
+             JOIN loved_tracks ON loved_tracks.track_id = track.id \
+             ORDER BY loved_tracks.loved_at DESC",
+            db::TRACK_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], db::row_to_track)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // --- persisted key/value (settings + last session) ---------------------
 
     /// Read a persisted value from the `meta` table.
@@ -405,11 +443,14 @@ impl SearchIndex {
         })
     }
 
-    /// Unified fuzzy search. [`Filter::All`] fills artists, albums and tracks
-    /// (plus the secondary folders group) from one call; a specific filter
-    /// scopes to that single group. `limit` caps each group. An empty query
-    /// returns the first `limit` of each in-scope group (title order for
-    /// tracks). `lib` is used only to fetch the matched track rows.
+    /// Fuzzy search, scoped by `filter`. A specific filter (Tracks/Albums/Artists)
+    /// matches *only* that group's haystack — the GTK shell always sends one scope
+    /// (its segmented control has no "All"), so an Albums search never pays to match
+    /// the tracks/artists haystacks. [`Filter::All`] (still used by the CLI and the
+    /// tests) fills artists, albums and tracks plus the secondary folders group from
+    /// one call. `limit` caps each group. An empty query returns the first `limit`
+    /// of each in-scope group (title order for tracks). `lib` is used only to fetch
+    /// the matched track rows.
     pub fn query(
         &self,
         lib: &Library,

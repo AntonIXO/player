@@ -117,6 +117,9 @@ struct Track {
     dec: Decoder,
     packer: Packer,
     spec: StreamSpec,
+    /// Decode range for a `.cue` track (`start`, `end` within the source file);
+    /// `None` for a whole-file track. Used to make an in-place seek track-relative.
+    range: Option<(Duration, Duration)>,
 }
 
 /// A queued item: a file plus an optional decode range (`Some` for a `.cue`
@@ -183,10 +186,28 @@ fn apply_cmd(
             // Seek the current track in place: discard buffered audio, reposition
             // the decoder, and rebase the next segment to the landed frame. Seek
             // (re)starts playback at the new position.
+            //
+            // For a `.cue` track the incoming `d` is *track-relative* (the UI knows
+            // only the sub-range). Offset it into the file by the range start, then
+            // re-apply the decode limit so playback still stops at the range end and
+            // rebase the per-track position so it stays 0-based at the track start.
             if let Some(track) = cur.as_mut() {
                 writer.flush();
-                match track.dec.seek(d) {
-                    Ok(landed) => writer.set_next_pos_base(landed),
+                let target = match track.range {
+                    Some((start, end)) => start + d.min(end.saturating_sub(start)),
+                    None => d,
+                };
+                match track.dec.seek(target) {
+                    Ok(landed) => match track.range {
+                        Some((start, end)) => {
+                            let rate = track.dec.spec.rate as u64;
+                            let start_fr = (start.as_millis() as u64) * rate / 1000;
+                            let end_fr = (end.as_millis() as u64) * rate / 1000;
+                            track.dec.set_limit(end_fr.saturating_sub(landed));
+                            writer.set_next_pos_base(landed.saturating_sub(start_fr));
+                        }
+                        None => writer.set_next_pos_base(landed),
+                    },
                     Err(e) => emit(Event::Error(e.to_string())),
                 }
                 *paused = false;
@@ -300,6 +321,7 @@ pub(crate) fn run_interactive(
                             dec,
                             packer: Packer::new(spec.fmt),
                             spec,
+                            range: src.range,
                         });
                     }
                     Err(e) => emit(Event::Error(e.to_string())),

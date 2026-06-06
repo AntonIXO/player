@@ -1,6 +1,6 @@
-//! The Search page: a debounced search entry + filter chips over the background
-//! search worker (own DB connection + in-memory fuzzy index), and the grouped
-//! results renderer (Artists · Albums · Tracks · Folders).
+//! The Search page: a debounced search entry + a Tracks/Albums/Artists segmented
+//! scope over the background search worker (own DB connection + in-memory fuzzy
+//! index), and the grouped results renderer (Artists · Albums · Tracks).
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -13,7 +13,7 @@ use adw::prelude::*;
 use gtk::{glib, Orientation};
 use player_library::{Filter, Library, SearchIndex, SearchResults};
 
-use crate::playback::{enqueue_track, play_artist, play_folder, play_list};
+use crate::playback::{enqueue_track, play_artist, play_list, toggle_loved};
 use crate::state::{SharedState, SharedUi};
 use crate::ui::library::{build_album_detail, open_artist_detail};
 use crate::widgets::{boxed_list, clamp, row_widget, section_label, wrap_scroller};
@@ -36,34 +36,40 @@ pub(crate) fn build_search(
     entry.set_placeholder_text(Some("Search your library"));
     entry.set_hexpand(true);
 
-    let chips_inner = gtk::Box::new(Orientation::Horizontal, 8);
+    // Three scoped searches as a linked segmented control (mirrors the Library
+    // header). There is no "All": every query is scoped to a single group, so a
+    // Tracks search never matches the album/artist haystacks (see
+    // `SearchIndex::query`) — that scoping is the speed win.
+    let segbar = gtk::Box::new(Orientation::Horizontal, 0);
+    segbar.add_css_class("linked");
+    segbar.set_halign(gtk::Align::Center);
+    segbar.set_margin_top(8);
     let filters = [
-        ("All", Filter::All),
-        ("Tracks", Filter::Tracks),
-        ("Albums", Filter::Albums),
-        ("Artists", Filter::Artists),
+        ("Tracks", "view-list-symbolic", Filter::Tracks),
+        ("Albums", "media-optical-symbolic", Filter::Albums),
+        ("Artists", "avatar-default-symbolic", Filter::Artists),
     ];
     let mut buttons = Vec::new();
-    for (label, f) in filters {
-        let b = gtk::ToggleButton::with_label(label);
-        b.add_css_class("pill");
-        if f == Filter::All {
+    for (label, icon, f) in filters {
+        let content = gtk::Box::new(Orientation::Horizontal, 6);
+        content.set_halign(gtk::Align::Center);
+        content.append(&gtk::Image::from_icon_name(icon));
+        content.append(&gtk::Label::new(Some(label)));
+        let b = gtk::ToggleButton::new();
+        b.set_child(Some(&content));
+        if f == Filter::Albums {
             b.set_active(true);
         }
-        chips_inner.append(&b);
+        segbar.append(&b);
         buttons.push((f, b));
     }
-    let chips = gtk::ScrolledWindow::new();
-    chips.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
-    chips.set_child(Some(&chips_inner));
-    chips.set_margin_top(8);
 
     let top = gtk::Box::new(Orientation::Vertical, 0);
     top.set_margin_top(10);
     top.set_margin_start(16);
     top.set_margin_end(16);
     top.append(&entry);
-    top.append(&chips);
+    top.append(&segbar);
 
     let results = gtk::Box::new(Orientation::Vertical, 0);
     results.set_margin_top(8);
@@ -144,7 +150,8 @@ pub(crate) fn clear_search_results(ui: &SharedUi) {
     }
 }
 
-/// Render the unified grouped results (Artists · Albums · Tracks · Folders).
+/// Render the grouped results (Artists · Albums · Tracks). With the scoped
+/// segmented control only one group is non-empty per query.
 pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results: SearchResults) {
     clear_search_results(ui);
 
@@ -167,6 +174,7 @@ pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results:
                 &a.name,
                 &meta,
                 None,
+                None,
                 Some(("media-playback-start-symbolic", "Play all")),
                 move || open_artist_detail(&s1, &u1, &n1),
                 move || play_artist(&s2, &u2, &n2),
@@ -186,6 +194,7 @@ pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results:
                 &al.album,
                 al.album_artist.as_deref().unwrap_or("Unknown Artist"),
                 Some(&al.meta()),
+                None,
                 Some(("media-playback-start-symbolic", "Play album")),
                 {
                     // Activate → album detail (drill-down).
@@ -224,8 +233,10 @@ pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results:
         let lb = boxed_list();
         let tracks_rc = Rc::new(results.tracks.clone());
         for (i, t) in results.tracks.iter().enumerate() {
+            let (id, loved) = (t.id, t.loved);
             let (state, ui, all) = (state.clone(), ui.clone(), tracks_rc.clone());
             let (s2, u2, tclone) = (state.clone(), ui.clone(), t.clone());
+            let (sh, uh) = (state.clone(), ui.clone());
             let cache = ui.art.clone();
             let row = row_widget(
                 &cache,
@@ -233,33 +244,10 @@ pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results:
                 &t.display_title(),
                 &t.subtitle(),
                 Some(&t.format_spec()),
+                Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
                 Some(("list-add-symbolic", "Add to queue")),
                 move || play_list(&state, &ui, (*all).clone(), i),
                 move || enqueue_track(&s2, &u2, tclone.clone()),
-            );
-            lb.append(&row);
-        }
-        ui.search_results.append(&lb);
-    }
-
-    if !results.folders.is_empty() {
-        ui.search_results.append(&section_label("Folders"));
-        let lb = boxed_list();
-        for f in &results.folders {
-            let cache = ui.art.clone();
-            let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
-            let row = row_widget(
-                &cache,
-                None,
-                f.name(),
-                &f.path,
-                Some(&f.meta()),
-                Some(("media-playback-start-symbolic", "Play folder")),
-                {
-                    let (state, ui, path) = (state.clone(), ui.clone(), path.clone());
-                    move || play_folder(&state, &ui, &path)
-                },
-                move || play_folder(&state, &ui, &path),
             );
             lb.append(&row);
         }

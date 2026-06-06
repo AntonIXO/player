@@ -219,6 +219,13 @@ mod tests {
         dec.set_limit(22_050);
         assert_eq!(count_frames(&mut dec), 22_050, "seek + limit is sample-exact");
 
+        // Re-seeking within a range and re-applying the limit resets the budget —
+        // the contract the engine's range-aware Cmd::Seek depends on (rewinding a
+        // .cue track restarts its sub-range cleanly rather than running short).
+        dec.seek(Duration::from_millis(250)).unwrap();
+        dec.set_limit(11_025);
+        assert_eq!(count_frames(&mut dec), 11_025, "re-seek + re-limit is sample-exact");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

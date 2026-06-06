@@ -46,7 +46,7 @@ use events::{on_ended, on_position, on_started, start_scan};
 use playback::{
     advance, clear_queue, current_total_ms, current_track, load_playlist, play_list, prev_track,
     quick_track, restore_session, save_playlist, save_session, seek_by, seek_to_fraction,
-    toggle_play,
+    toggle_loved, toggle_play,
 };
 use state::{SharedState, SharedUi, State, Ui};
 use ui::library::{
@@ -254,6 +254,7 @@ fn build_ui(app: &adw::Application) {
         np_total: np.total,
         np_seek: np.seek,
         np_play: np.play.clone(),
+        np_love: np.love.clone(),
         np_goto_artist: np.goto_artist.clone(),
         np_goto_album: np.goto_album.clone(),
         np_format: np.format,
@@ -268,11 +269,12 @@ fn build_ui(app: &adw::Application) {
         artists_scroller: lib.artists_scroller.clone(),
         folders_scroller: lib.folders_scroller.clone(),
         tracks_scroller: lib.tracks_scroller.clone(),
+        loved_scroller: lib.loved_scroller.clone(),
         sort: Cell::new(player_library::Sort::Title),
         sort_label: lib.sort_label.clone(),
         search_entry: search_entry.clone(),
         search_results,
-        filter: RefCell::new(player_library::Filter::All),
+        filter: RefCell::new(player_library::Filter::Albums),
         filter_buttons,
         search_tx: search_tx.clone(),
         search_seq: Cell::new(0),
@@ -315,6 +317,24 @@ fn build_ui(app: &adw::Application) {
                 }
                 _ => ui.toast("No album for this track"),
             }
+        });
+    }
+    // now-playing → love / unlove the current track
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        np.love.connect_clicked(move |b| {
+            let Some(t) = current_track(&state) else { return };
+            if t.id <= 0 {
+                ui.toast("This track isn't in your library");
+                return;
+            }
+            let now = !b.has_css_class("loved");
+            if now {
+                b.add_css_class("loved");
+            } else {
+                b.remove_css_class("loved");
+            }
+            toggle_loved(&state, &ui, t.id, now);
         });
     }
 

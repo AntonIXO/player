@@ -36,6 +36,9 @@ pub struct Track {
     /// Start offset into `source_path` for a `.cue` track; `None` (whole file)
     /// otherwise. With `duration_ms` this gives the track's decode range.
     pub start_ms: Option<u64>,
+    /// Whether the user has marked this track as loved (a row in `loved_tracks`).
+    /// Always `false` for non-indexed tracks (e.g. an ad-hoc Open / playlist file).
+    pub loved: bool,
 }
 
 impl Track {
@@ -166,9 +169,9 @@ impl Folder {
     }
 }
 
-/// Grouped search output for the Search screen. A single fuzzy query fills all
-/// of these at once (see [`crate::SearchIndex::query`]); `Folders` is secondary
-/// and only populated for [`Filter::All`].
+/// Grouped search output for the Search screen (see [`crate::SearchIndex::query`]).
+/// A scoped query fills just one of these; [`Filter::All`] fills all at once, with
+/// `folders` as a secondary group only populated in that mode.
 #[derive(Debug, Clone, Default)]
 pub struct SearchResults {
     pub artists: Vec<Artist>,
@@ -177,8 +180,10 @@ pub struct SearchResults {
     pub folders: Vec<Folder>,
 }
 
-/// Which entity group(s) the search filter chips scope to. `All` returns
-/// artists, albums and tracks together (the default unified search).
+/// Which entity group a search is scoped to. The GTK shell uses the three scoped
+/// variants (its segmented control is Tracks/Albums/Artists, no "All"), so each
+/// query matches a single haystack. `All` — used by the CLI and tests — returns
+/// artists, albums and tracks (plus folders) together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Filter {
     #[default]

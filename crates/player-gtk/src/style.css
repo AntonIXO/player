@@ -57,6 +57,11 @@ button.pill-toggle {
 }
 button.pill-toggle:hover { background: alpha(@window_fg_color, 0.12); }
 
+/* Loved heart: tint the heart icon red when the track is loved (used on track
+   rows and the now-playing toggle). */
+button.loved { color: @error_color; }
+button.loved image { color: @error_color; }
+
 /* Section headers in the search/queue lists. */
 .section-label {
   font-weight: 700;

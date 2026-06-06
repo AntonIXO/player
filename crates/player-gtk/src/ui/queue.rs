@@ -7,7 +7,7 @@ use libadwaita as adw;
 use adw::prelude::*;
 use player_library::fmt_dur_ms;
 
-use crate::playback::{enqueue_track, jump_to, play_track_now, remove_from_queue};
+use crate::playback::{enqueue_track, jump_to, play_track_now, remove_from_queue, toggle_loved};
 use crate::state::{SharedState, SharedUi};
 use crate::widgets::{boxed_list, row_widget, section_label};
 
@@ -41,14 +41,17 @@ pub(crate) fn refresh_queue(state: &SharedState, ui: &SharedUi) {
         let lb = boxed_list();
         for i in upcoming {
             let t = &queue[i];
+            let (id, loved) = (t.id, t.loved);
             let (s1, u1) = (state.clone(), ui.clone());
             let (s2, u2) = (state.clone(), ui.clone());
+            let (sh, uh) = (state.clone(), ui.clone());
             let row = row_widget(
                 &ui.art,
                 t.art_hash.as_deref(),
                 &t.display_title(),
                 &t.subtitle(),
                 None,
+                Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
                 Some(("list-remove-symbolic", "Remove from queue")),
                 move || jump_to(&s1, &u1, i),
                 move || remove_from_queue(&s2, &u2, i),
@@ -66,14 +69,17 @@ pub(crate) fn refresh_queue(state: &SharedState, ui: &SharedUi) {
         ui.queue_box.append(&header);
         let lb = boxed_list();
         for t in &recent {
+            let (id, loved) = (t.id, t.loved);
             let (s1, u1, t1) = (state.clone(), ui.clone(), t.clone());
             let (s2, u2, t2) = (state.clone(), ui.clone(), t.clone());
+            let (sh, uh) = (state.clone(), ui.clone());
             let row = row_widget(
                 &ui.art,
                 t.art_hash.as_deref(),
                 &t.display_title(),
                 &t.subtitle(),
                 Some(&fmt_dur_ms(t.duration_ms.unwrap_or(0))),
+                Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
                 Some(("list-add-symbolic", "Add to queue")),
                 move || play_track_now(&s1, &u1, t1.clone()),
                 move || enqueue_track(&s2, &u2, t2.clone()),

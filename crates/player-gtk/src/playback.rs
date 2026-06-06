@@ -199,6 +199,28 @@ pub(crate) fn enqueue_track(state: &SharedState, ui: &SharedUi, track: Track) {
     ui.toast("Added to queue");
 }
 
+/// Persist a track's loved state (the heart widget toggles its own look first).
+/// No-op with a toast for ad-hoc, non-indexed tracks (`id <= 0`). Keeps in-memory
+/// queue copies in sync and refreshes the Loved tab if it is the one on screen.
+pub(crate) fn toggle_loved(state: &SharedState, ui: &SharedUi, track_id: i64, loved: bool) {
+    if track_id <= 0 {
+        ui.toast("This track isn't in your library");
+        return;
+    }
+    if state.borrow().library.set_loved(track_id, loved).is_err() {
+        ui.toast("Couldn't update loved tracks");
+        return;
+    }
+    for t in state.borrow_mut().queue.iter_mut() {
+        if t.id == track_id {
+            t.loved = loved;
+        }
+    }
+    if ui.browse_stack.visible_child_name().as_deref() == Some("loved") {
+        crate::ui::library::show_browse_tab(state, ui, "loved");
+    }
+}
+
 pub(crate) fn enqueue_tracks(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) {
     let n = tracks.len();
     state.borrow_mut().queue.extend(tracks);

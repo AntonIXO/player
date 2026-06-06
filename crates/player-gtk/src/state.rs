@@ -65,6 +65,7 @@ pub(crate) struct Ui {
     pub(crate) np_total: gtk::Label,
     pub(crate) np_seek: gtk::Scale,
     pub(crate) np_play: gtk::Button,
+    pub(crate) np_love: gtk::Button,
     pub(crate) np_goto_artist: gtk::Button,
     pub(crate) np_goto_album: gtk::Button,
     pub(crate) np_format: gtk::Box,
@@ -85,6 +86,7 @@ pub(crate) struct Ui {
     pub(crate) artists_scroller: gtk::ScrolledWindow,
     pub(crate) folders_scroller: gtk::ScrolledWindow,
     pub(crate) tracks_scroller: gtk::ScrolledWindow,
+    pub(crate) loved_scroller: gtk::ScrolledWindow,
     /// Current browse sort (Albums/Tracks tabs); the menu button's label mirrors it.
     pub(crate) sort: Cell<Sort>,
     pub(crate) sort_label: gtk::Label,

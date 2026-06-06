@@ -39,6 +39,35 @@ pub(crate) fn circle(icon: &str, size: i32, tip: &str) -> gtk::Button {
     b
 }
 
+/// A track row's optional heart toggle: the initial loved state plus a callback
+/// invoked with the new state when tapped. Boxed so the row builders can stay
+/// non-generic over it (and so non-track rows can pass `None`).
+pub(crate) type Heart = Option<(bool, Box<dyn Fn(bool)>)>;
+
+/// Reflect `loved` on a heart button (filled/accented when loved, dim otherwise).
+fn style_heart(b: &gtk::Button, loved: bool) {
+    if loved {
+        b.add_css_class("loved");
+    } else {
+        b.remove_css_class("loved");
+    }
+    b.set_tooltip_text(Some(if loved { "Loved — tap to remove" } else { "Love this track" }));
+}
+
+/// Build a heart toggle that flips its own style on click and reports the new
+/// state to `on_toggle` (which persists it).
+fn heart_button(loved: bool, on_toggle: Box<dyn Fn(bool)>) -> gtk::Button {
+    let b = circle("emblem-favorite-symbolic", 32, "");
+    style_heart(&b, loved);
+    let bw = b.clone();
+    b.connect_clicked(move |_| {
+        let now = !bw.has_css_class("loved");
+        style_heart(&bw, now);
+        on_toggle(now);
+    });
+    b
+}
+
 pub(crate) fn flat_menu_item(icon: &str, label: &str) -> gtk::Button {
     let b = gtk::Button::new();
     b.add_css_class("flat");
@@ -73,12 +102,14 @@ pub(crate) fn boxed_list() -> gtk::ListBox {
 /// handled (a `ListView`/`GridView` factory lets the view drive activation; the
 /// `ListBox` path wraps this in [`row_widget`] which adds its own gesture). The
 /// trailing circle button always claims its own clicks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn row_inner(
     cache: &ArtCache,
     art_hash: Option<&str>,
     title: &str,
     subtitle: &str,
     meta: Option<&str>,
+    heart: Heart,
     trailing: Option<(&str, &str)>,
     on_trailing: impl Fn() + 'static,
 ) -> gtk::Box {
@@ -112,6 +143,10 @@ pub(crate) fn row_inner(
         row.append(&ml);
     }
 
+    if let Some((loved, on_toggle)) = heart {
+        row.append(&heart_button(loved, on_toggle));
+    }
+
     if let Some((icon, tip)) = trailing {
         let b = circle(icon, 32, tip);
         b.connect_clicked(move |_| on_trailing());
@@ -131,11 +166,12 @@ pub(crate) fn row_widget(
     title: &str,
     subtitle: &str,
     meta: Option<&str>,
+    heart: Heart,
     trailing: Option<(&str, &str)>,
     on_activate: impl Fn() + 'static,
     on_trailing: impl Fn() + 'static,
 ) -> gtk::ListBoxRow {
-    let content = row_inner(cache, art_hash, title, subtitle, meta, trailing, on_trailing);
+    let content = row_inner(cache, art_hash, title, subtitle, meta, heart, trailing, on_trailing);
     let on_activate = Rc::new(on_activate);
     let lbr = gtk::ListBoxRow::new();
     lbr.set_child(Some(&content));

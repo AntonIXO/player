@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::Result;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Open (creating if needed) a connection with the library pragmas applied and
 /// the schema migrated to the current version.
@@ -55,6 +55,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 4 {
         add_column_if_missing(conn, "track", "source_path", "TEXT")?;
         add_column_if_missing(conn, "track", "start_ms", "INTEGER")?;
+    }
+    // v5 adds the loved-tracks table (additive — no track rebuild).
+    if v < 5 {
+        conn.execute_batch(SCHEMA_LOVED)?;
     }
     if v < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -111,6 +115,20 @@ CREATE TABLE play_history (
   track_id  INTEGER PRIMARY KEY,
   played_at INTEGER NOT NULL
 );
+
+CREATE TABLE loved_tracks (
+  track_id  INTEGER PRIMARY KEY,
+  loved_at  INTEGER NOT NULL
+);
+"#;
+
+/// Loved (favourite) tracks (one row per track). Added in v5; `IF NOT EXISTS` so a
+/// fresh database (which already created it via `SCHEMA_BASE`) is unaffected.
+const SCHEMA_LOVED: &str = r#"
+CREATE TABLE IF NOT EXISTS loved_tracks (
+  track_id  INTEGER PRIMARY KEY,
+  loved_at  INTEGER NOT NULL
+);
 "#;
 
 /// Recently-played history (one row per track, newest play wins). Added in v3;
@@ -137,7 +155,8 @@ DROP TABLE IF EXISTS track_fts;
 pub const TRACK_COLS: &str = "track.id, track.path, track.folder, track.title, track.artist, \
      track.album_artist, track.album, track.composer, track.genre, track.track_no, track.disc_no, \
      track.year, track.duration_ms, track.codec, track.sample_rate, track.bits, track.channels, \
-     track.art_hash, track.source_path, track.start_ms";
+     track.art_hash, track.source_path, track.start_ms, \
+     EXISTS(SELECT 1 FROM loved_tracks WHERE loved_tracks.track_id = track.id)";
 
 /// Build a `Track` from a row selected with [`TRACK_COLS`] (in order).
 pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> {
@@ -169,5 +188,6 @@ pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> 
         art_hash: r.get(17)?,
         source_path,
         start_ms: r.get::<_, Option<i64>>(19)?.map(|v| v as u64),
+        loved: r.get(20)?,
     })
 }

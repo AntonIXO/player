@@ -13,7 +13,7 @@ use player_library::{fmt_dur_ms, Album, Artist, Folder, Sort, Track};
 
 use crate::list::{grid_view, list_view};
 use crate::playback::{
-    enqueue_track, enqueue_tracks, play_artist, play_folder, play_list, shuffle_vec,
+    enqueue_track, enqueue_tracks, play_artist, play_folder, play_list, shuffle_vec, toggle_loved,
 };
 use crate::state::{SharedState, SharedUi};
 use crate::widgets::{
@@ -30,6 +30,7 @@ pub(crate) struct LibUi {
     pub(crate) artists_scroller: gtk::ScrolledWindow,
     pub(crate) folders_scroller: gtk::ScrolledWindow,
     pub(crate) tracks_scroller: gtk::ScrolledWindow,
+    pub(crate) loved_scroller: gtk::ScrolledWindow,
     pub(crate) seg: Vec<(&'static str, gtk::ToggleButton)>,
     pub(crate) sort_btn: gtk::MenuButton,
     pub(crate) sort_label: gtk::Label,
@@ -44,12 +45,13 @@ fn browse_scroller() -> gtk::ScrolledWindow {
     s
 }
 
-/// The four browse tabs, in display order.
-const BROWSE_TABS: [(&str, &str); 4] = [
+/// The browse tabs, in display order.
+const BROWSE_TABS: [(&str, &str); 5] = [
     ("albums", "Albums"),
     ("artists", "Artists"),
     ("folders", "Folders"),
     ("tracks", "Tracks"),
+    ("loved", "Loved"),
 ];
 
 pub(crate) fn build_library() -> LibUi {
@@ -70,6 +72,7 @@ pub(crate) fn build_library() -> LibUi {
     let artists_scroller = browse_scroller();
     let folders_scroller = browse_scroller();
     let tracks_scroller = browse_scroller();
+    let loved_scroller = browse_scroller();
 
     let browse_stack = gtk::Stack::new();
     browse_stack.set_vexpand(true);
@@ -77,6 +80,7 @@ pub(crate) fn build_library() -> LibUi {
     browse_stack.add_named(&artists_scroller, Some("artists"));
     browse_stack.add_named(&folders_scroller, Some("folders"));
     browse_stack.add_named(&tracks_scroller, Some("tracks"));
+    browse_stack.add_named(&loved_scroller, Some("loved"));
     browse_stack.set_visible_child_name("albums");
 
     // --- Segmented header (linked toggles) ---
@@ -174,6 +178,7 @@ pub(crate) fn build_library() -> LibUi {
         artists_scroller,
         folders_scroller,
         tracks_scroller,
+        loved_scroller,
         seg,
         sort_btn,
         sort_label,
@@ -325,6 +330,7 @@ pub(crate) fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
                             &name.clone(),
                             &meta,
                             None,
+                            None,
                             Some(("media-playback-start-symbolic", "Play all")),
                             move || play_artist(&state, &ui, &name),
                         )
@@ -353,6 +359,7 @@ pub(crate) fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
                             f.name(),
                             &f.path,
                             Some(&f.meta()),
+                            None,
                             Some(("media-playback-start-symbolic", "Play folder")),
                             move || play_folder(&state, &ui, &path),
                         )
@@ -372,33 +379,56 @@ pub(crate) fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
                 .library
                 .tracks(ui.sort.get())
                 .unwrap_or_default();
-            let lv = list_view(
-                tracks,
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |t: &Track| {
-                        let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
-                        row_inner(
-                            &ui.art,
-                            t.art_hash.as_deref(),
-                            &t.display_title(),
-                            &t.subtitle(),
-                            Some(&t.format_spec()),
-                            Some(("list-add-symbolic", "Add to queue")),
-                            move || enqueue_track(&s2, &u2, tc.clone()),
-                        )
-                        .upcast()
-                    }
-                },
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |items: &[Track], pos| play_list(&state, &ui, items.to_vec(), pos)
-                },
-            );
-            ui.tracks_scroller.set_child(Some(&lv));
+            ui.tracks_scroller
+                .set_child(Some(&track_list_view(state, ui, tracks)));
+        }
+        "loved" => {
+            let tracks = state.borrow().library.loved_tracks().unwrap_or_default();
+            if tracks.is_empty() {
+                ui.loved_scroller.set_child(Some(&status_page(
+                    "emblem-favorite-symbolic",
+                    "No Loved Tracks Yet",
+                    "Tap the heart on any track to add it here.",
+                )));
+            } else {
+                ui.loved_scroller
+                    .set_child(Some(&track_list_view(state, ui, tracks)));
+            }
         }
         _ => {}
     }
+}
+
+/// A virtualised track list shared by the Tracks and Loved browse tabs: each row
+/// carries a heart toggle and an add-to-queue action; activating a row plays the
+/// list from that position.
+fn track_list_view(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) -> gtk::ListView {
+    list_view(
+        tracks,
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |t: &Track| {
+                let (id, loved) = (t.id, t.loved);
+                let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
+                let (sh, uh) = (state.clone(), ui.clone());
+                row_inner(
+                    &ui.art,
+                    t.art_hash.as_deref(),
+                    &t.display_title(),
+                    &t.subtitle(),
+                    Some(&t.format_spec()),
+                    Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
+                    Some(("list-add-symbolic", "Add to queue")),
+                    move || enqueue_track(&s2, &u2, tc.clone()),
+                )
+                .upcast()
+            }
+        },
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |items: &[Track], pos| play_list(&state, &ui, items.to_vec(), pos)
+        },
+    )
 }
 
 fn build_az_index(ui: &SharedUi, albums: &[Album], grid: &gtk::GridView) {
@@ -505,8 +535,10 @@ pub(crate) fn build_album_detail(
     // track list
     let lb = boxed_list();
     for (i, tr) in tracks.iter().enumerate() {
+        let (id, loved) = (tr.id, tr.loved);
         let (state, ui, all) = (state.clone(), ui.clone(), tracks.clone());
         let (s2, u2, tc) = (state.clone(), ui.clone(), tr.clone());
+        let (sh, uh) = (state.clone(), ui.clone());
         let cache = ui.art.clone();
         let n = tr.track_no.map(|n| format!("{n}.  ")).unwrap_or_default();
         let row = row_widget(
@@ -515,6 +547,7 @@ pub(crate) fn build_album_detail(
             &format!("{n}{}", tr.display_title()),
             &tr.subtitle(),
             Some(&fmt_dur_ms(tr.duration_ms.unwrap_or(0))),
+            Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
             Some(("list-add-symbolic", "Add to queue")),
             move || play_list(&state, &ui, (*all).clone(), i),
             move || enqueue_track(&s2, &u2, tc.clone()),
@@ -683,6 +716,7 @@ fn build_artist_detail(
             &al.album,
             al.album_artist.as_deref().unwrap_or(artist),
             Some(&al.meta()),
+            None,
             Some(("media-playback-start-symbolic", "Play album")),
             move || open_album_for(&s1, &u1, &a1.album, a1.album_artist.as_deref()),
             move || {

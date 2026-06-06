@@ -27,6 +27,7 @@ pub(crate) struct Np {
     pub(crate) fwd: gtk::Button,
     pub(crate) shuffle: gtk::Button,
     pub(crate) repeat: gtk::Button,
+    pub(crate) love: gtk::Button,
     pub(crate) goto_artist: gtk::Button,
     pub(crate) goto_album: gtk::Button,
     pub(crate) format: gtk::Box,
@@ -71,6 +72,11 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     shuffle.add_css_class("pill-toggle");
     let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
     repeat.add_css_class("pill-toggle");
+    // Heart the current track (filled/accented when loved). Disabled until a
+    // library-indexed track is playing.
+    let love = circle("emblem-favorite-symbolic", 40, "Love this track");
+    love.add_css_class("pill-toggle");
+    love.set_sensitive(false);
     // Jump to the current track's artist / album detail page.
     let goto_artist = circle("avatar-default-symbolic", 40, "Go to artist");
     goto_artist.add_css_class("pill-toggle");
@@ -82,6 +88,7 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     toggles.set_halign(gtk::Align::Center);
     toggles.append(&shuffle);
     toggles.append(&repeat);
+    toggles.append(&love);
     toggles.append(&goto_artist);
     toggles.append(&goto_album);
 
@@ -164,6 +171,7 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
             fwd,
             shuffle,
             repeat,
+            love,
             goto_artist,
             goto_album,
             format,
@@ -194,6 +202,12 @@ pub(crate) fn show_track(_state: &SharedState, ui: &SharedUi, track: &Track) {
     let has_album = track.album.as_deref().is_some_and(|a| !a.is_empty());
     ui.np_goto_artist.set_sensitive(has_artist);
     ui.np_goto_album.set_sensitive(has_album);
+    ui.np_love.set_sensitive(track.id > 0);
+    if track.loved {
+        ui.np_love.add_css_class("loved");
+    } else {
+        ui.np_love.remove_css_class("loved");
+    }
 }
 
 pub(crate) fn update_now_playing_empty(ui: &SharedUi, empty: bool) {

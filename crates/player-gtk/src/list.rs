@@ -65,11 +65,15 @@ where
     view
 }
 
-/// A `GtkGridView` with a fixed column count over `items` (used for the album
-/// grid). `make_cell` builds one cell; `on_activate(items, index)` fires on tap.
+/// A `GtkGridView` over `items` (used for the album grid). It uses between
+/// `min_columns` and `max_columns` columns for the available width; pass equal
+/// values to pin a fixed count. Cells must size from the column width (no fixed
+/// width request) or a high `min_columns` forces the window wider than the screen.
+/// `make_cell` builds one cell; `on_activate(items, index)` fires on tap.
 pub(crate) fn grid_view<T, MakeCell, OnActivate>(
     items: Vec<T>,
-    columns: u32,
+    min_columns: u32,
+    max_columns: u32,
     make_cell: MakeCell,
     on_activate: OnActivate,
 ) -> gtk::GridView
@@ -81,8 +85,8 @@ where
     let items = Rc::new(items);
     let model = gtk::NoSelection::new(Some(store_of(&items)));
     let view = gtk::GridView::new(Some(model), Some(bind_factory(make_cell)));
-    view.set_min_columns(columns);
-    view.set_max_columns(columns);
+    view.set_min_columns(min_columns);
+    view.set_max_columns(max_columns);
     view.set_single_click_activate(true);
     view.add_css_class("album-grid");
     view.connect_activate(move |_, pos| on_activate(&items, pos as usize));

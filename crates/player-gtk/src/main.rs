@@ -50,7 +50,8 @@ use playback::{
 };
 use state::{SharedState, SharedUi, State, Ui};
 use ui::library::{
-    build_library, open_album_for, open_artist_detail, refresh_library, wire_segmented, wire_sort,
+    album_cover_px, build_library, open_album_for, open_artist_detail, rebuild_albums,
+    refresh_library, window_width, wire_segmented, wire_sort,
 };
 use ui::mini::build_mini;
 use ui::now_playing::{build_now_playing, update_mini, update_now_playing_empty};
@@ -159,8 +160,11 @@ fn build_ui(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Bit-Perfect Player")
-        .default_width(420)
-        .default_height(780)
+        // Phone-portrait by default (matches the Poco F1 / Phosh ~360 px logical
+        // width); fully resizable on desktop. The content is built to fit this
+        // width, so Phosh maximising to the screen never overflows.
+        .default_width(360)
+        .default_height(720)
         .build();
 
     let title = adw::WindowTitle::new("Bit-Perfect Player", "■ idle");
@@ -272,6 +276,7 @@ fn build_ui(app: &adw::Application) {
         loved_scroller: lib.loved_scroller.clone(),
         sort: Cell::new(player_library::Sort::Title),
         sort_label: lib.sort_label.clone(),
+        cover_px: Cell::new(110),
         search_entry: search_entry.clone(),
         search_results,
         filter: RefCell::new(player_library::Filter::Albums),
@@ -286,6 +291,26 @@ fn build_ui(app: &adw::Application) {
     wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
     wire_segmented(&state, &ui, &lib.seg);
     wire_sort(&state, &ui, &lib.sort_btn, &lib.sort_opts);
+
+    // Rescale the 3-up album covers as the window resizes / (un)maximises so the
+    // grid always fits the width. Rebuilds only when the quantised cover size
+    // actually changes (see album_cover_px).
+    {
+        let rescale = {
+            let (state, ui) = (state.clone(), ui.clone());
+            move || {
+                let px = album_cover_px(window_width(&ui));
+                if px != ui.cover_px.get() {
+                    ui.cover_px.set(px);
+                    rebuild_albums(&state, &ui);
+                }
+            }
+        };
+        let rescale = Rc::new(rescale);
+        let r1 = rescale.clone();
+        ui.window.connect_default_width_notify(move |_| r1());
+        ui.window.connect_maximized_notify(move |_| rescale());
+    }
 
     // header search toggle → Search page + focus the entry
     {

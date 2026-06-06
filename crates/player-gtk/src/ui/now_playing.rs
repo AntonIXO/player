@@ -100,7 +100,7 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     play.remove_css_class("flat");
     let fwd = circle("media-seek-forward-symbolic", 48, "Forward 10 seconds");
     let next = circle("media-skip-forward-symbolic", 48, "Next");
-    let transport = gtk::Box::new(Orientation::Horizontal, 8);
+    let transport = gtk::Box::new(Orientation::Horizontal, 4);
     transport.set_halign(gtk::Align::Center);
     for b in [&prev, &rewind, &play, &fwd, &next] {
         transport.append(b);
@@ -109,22 +109,12 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     let format = gtk::Box::new(Orientation::Horizontal, 8);
     format.set_halign(gtk::Align::Center);
 
-    let note_box = gtk::Box::new(Orientation::Horizontal, 7);
-    note_box.set_halign(gtk::Align::Center);
-    let headphones = gtk::Image::from_icon_name("audio-headphones-symbolic");
-    headphones.add_css_class("dim-label");
-    let note = gtk::Label::new(Some("Volume is the DAC's hardware knob — no software gain, by design."));
-    note.add_css_class("dim-label");
-    note.add_css_class("caption");
-    note.set_wrap(true);
-    note.set_justify(gtk::Justification::Center);
-    note_box.append(&headphones);
-    note_box.append(&note);
-
-    let content = gtk::Box::new(Orientation::Vertical, 16);
+    // Tight vertical rhythm so the whole Playing page fits a phone screen without
+    // scrolling (the volume-is-hardware note was dropped for the same reason).
+    let content = gtk::Box::new(Orientation::Vertical, 10);
     content.set_valign(gtk::Align::Center);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
     content.set_margin_start(28);
     content.set_margin_end(28);
     content.append(&art);
@@ -139,7 +129,6 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     content.append(&seekbox);
     content.append(&transport);
     content.append(&format);
-    content.append(&note_box);
 
     // empty state — a standard Adwaita status page.
     let empty = status_page(

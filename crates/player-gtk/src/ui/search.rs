@@ -39,10 +39,11 @@ pub(crate) fn build_search(
     // Three scoped searches as a linked segmented control (mirrors the Library
     // header). There is no "All": every query is scoped to a single group, so a
     // Tracks search never matches the album/artist haystacks (see
-    // `SearchIndex::query`) — that scoping is the speed win.
+    // `SearchIndex::query`) — that scoping is the speed win. The bar spans the
+    // full width of the entry, each segment taking an equal third.
     let segbar = gtk::Box::new(Orientation::Horizontal, 0);
     segbar.add_css_class("linked");
-    segbar.set_halign(gtk::Align::Center);
+    segbar.set_hexpand(true);
     segbar.set_margin_top(8);
     let filters = [
         ("Tracks", "view-list-symbolic", Filter::Tracks),
@@ -57,6 +58,7 @@ pub(crate) fn build_search(
         content.append(&gtk::Label::new(Some(label)));
         let b = gtk::ToggleButton::new();
         b.set_child(Some(&content));
+        b.set_hexpand(true);
         if f == Filter::Albums {
             b.set_active(true);
         }

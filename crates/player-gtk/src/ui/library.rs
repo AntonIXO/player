@@ -47,11 +47,11 @@ fn browse_scroller() -> gtk::ScrolledWindow {
 
 /// The browse tabs, in display order.
 const BROWSE_TABS: [(&str, &str); 5] = [
+    ("loved", "Loved"),
     ("albums", "Albums"),
     ("artists", "Artists"),
     ("folders", "Folders"),
     ("tracks", "Tracks"),
-    ("loved", "Loved"),
 ];
 
 pub(crate) fn build_library() -> LibUi {
@@ -247,6 +247,57 @@ fn sort_label_text(s: Sort) -> &'static str {
     }
 }
 
+/// The album-cover edge length (px) for a 3-up grid at window width `window_w`.
+/// Reserves ~96 px for the A–Z index and the grid/cell padding around three cells
+/// so the row fits a ~360 px phone, and quantises to 8 px so an interactive resize
+/// rebuilds the grid only every few steps. Clamped so covers never get unusably
+/// small on a phone or huge on a wide monitor.
+pub(crate) fn album_cover_px(window_w: i32) -> i32 {
+    let raw = ((window_w - 96).max(120) / 3).clamp(88, 240);
+    (raw / 8) * 8
+}
+
+/// Current window content width (allocated, falling back to the default before the
+/// first allocation).
+pub(crate) fn window_width(ui: &SharedUi) -> i32 {
+    let w = ui.window.width();
+    if w > 0 {
+        w
+    } else {
+        ui.window.default_width()
+    }
+}
+
+/// (Re)build the albums `GridView` at the current cover size (`ui.cover_px`) and
+/// refresh the A–Z index. Reads the cached album list from state, so a resize can
+/// rebuild without re-querying. No-op when the library is empty.
+pub(crate) fn rebuild_albums(state: &SharedState, ui: &SharedUi) {
+    let albums = state.borrow().albums.clone();
+    if albums.is_empty() {
+        return;
+    }
+    let px = ui.cover_px.get();
+    // Always 3 per row; the square covers are sized to the width (see album_cover_px).
+    let grid = grid_view(
+        albums.clone(),
+        3,
+        3,
+        {
+            let cache = ui.art.clone();
+            move |al: &Album| album_cell(&cache, al, px).upcast()
+        },
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |_albums: &[Album], pos| open_album_detail(&state, &ui, pos)
+        },
+    );
+    while let Some(c) = ui.az_box.first_child() {
+        ui.az_box.remove(&c);
+    }
+    ui.albums_scroller.set_child(Some(&grid));
+    build_az_index(ui, &albums, &grid, ui.sort.get());
+}
+
 pub(crate) fn refresh_library(state: &SharedState, ui: &SharedUi) {
     let albums = state.borrow().library.albums(ui.sort.get()).unwrap_or_default();
     let n_tracks = state
@@ -272,25 +323,11 @@ pub(crate) fn refresh_library(state: &SharedState, ui: &SharedUi) {
         s.set_visible_child_name("browse");
     }
 
-    // Albums grid: a virtualised GridView. Activation opens the album detail by
-    // its position in the cached album list (kept in sync via `queue_albums`).
-    let grid = grid_view(
-        albums.clone(),
-        3,
-        {
-            let cache = ui.art.clone();
-            move |al: &Album| album_cell(&cache, al).upcast()
-        },
-        {
-            let (state, ui) = (state.clone(), ui.clone());
-            move |_albums: &[Album], pos| open_album_detail(&state, &ui, pos)
-        },
-    );
-    ui.albums_scroller.set_child(Some(&grid));
-    build_az_index(ui, &albums, &grid);
-
-    // remember albums for activation lookup
+    // Cache the album list, size the covers to the current width, and build the
+    // grid. `rebuild_albums` is also called on resize so the 3-up grid scales.
     state.borrow_mut().queue_albums(albums);
+    ui.cover_px.set(album_cover_px(window_width(ui)));
+    rebuild_albums(state, ui);
 
     // Repopulate whichever non-album tab is currently showing.
     let active = ui
@@ -431,15 +468,23 @@ fn track_list_view(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) -> gt
     )
 }
 
-fn build_az_index(ui: &SharedUi, albums: &[Album], grid: &gtk::GridView) {
+/// The A–Z fast index only makes sense when the grid is in alphabetical order of
+/// a text field. It keys on whatever the active sort orders by (album title, or
+/// album artist) so consecutive entries collapse to one letter; for Year (numeric,
+/// ungrouped) it emits nothing — keying on album title there would yield ~one
+/// button per album and balloon the column past the screen.
+fn build_az_index(ui: &SharedUi, albums: &[Album], grid: &gtk::GridView, sort: Sort) {
+    let key = |al: &Album| -> Option<char> {
+        let s = match sort {
+            Sort::Year => return None,
+            Sort::Artist => al.album_artist.as_deref().unwrap_or(""),
+            _ => al.album.as_str(),
+        };
+        s.chars().next().map(|c| c.to_ascii_uppercase())
+    };
     let mut last = '\0';
     for (i, al) in albums.iter().enumerate() {
-        let c = al
-            .album
-            .chars()
-            .next()
-            .map(|c| c.to_ascii_uppercase())
-            .unwrap_or('#');
+        let Some(c) = key(al) else { continue };
         if c == last {
             continue;
         }

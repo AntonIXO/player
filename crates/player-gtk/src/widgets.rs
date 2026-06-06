@@ -189,23 +189,23 @@ pub(crate) fn row_widget(
     lbr
 }
 
-pub(crate) fn album_cell(cache: &ArtCache, al: &Album) -> gtk::Box {
+pub(crate) fn album_cell(cache: &ArtCache, al: &Album, art_px: i32) -> gtk::Box {
     let cell = gtk::Box::new(Orientation::Vertical, 6);
     cell.add_css_class("album-cell");
-    let art = art_widget(cache, al.art_hash.as_deref(), 110, false);
-    art.set_size_request(110, 110);
+    let art = art_widget(cache, al.art_hash.as_deref(), art_px, false);
+    art.set_size_request(art_px, art_px);
     cell.append(&art);
     let t = gtk::Label::new(Some(&al.album));
     t.add_css_class("heading");
     t.set_xalign(0.0);
     t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    t.set_max_width_chars(14);
+    t.set_max_width_chars(10);
     let a = gtk::Label::new(Some(al.album_artist.as_deref().unwrap_or("Unknown Artist")));
     a.add_css_class("dim-label");
     a.add_css_class("caption");
     a.set_xalign(0.0);
     a.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    a.set_max_width_chars(14);
+    a.set_max_width_chars(10);
     cell.append(&t);
     cell.append(&a);
     cell

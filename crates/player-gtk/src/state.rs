@@ -90,6 +90,9 @@ pub(crate) struct Ui {
     /// Current browse sort (Albums/Tracks tabs); the menu button's label mirrors it.
     pub(crate) sort: Cell<Sort>,
     pub(crate) sort_label: gtk::Label,
+    /// Album-cover edge length (px) for the 3-up grid, recomputed from the window
+    /// width on resize so the covers scale (see `ui::library::album_cover_px`).
+    pub(crate) cover_px: Cell<i32>,
     // search
     pub(crate) search_entry: gtk::SearchEntry,
     pub(crate) search_results: gtk::Box,

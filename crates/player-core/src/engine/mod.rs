@@ -19,7 +19,7 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, unbounded, Sender};
 use rtrb::Consumer;
 
-use crate::convert::{append_bytes, Packer};
+use crate::convert::Packer;
 use crate::decode::Decoder;
 use crate::error::Result;
 use crate::format::{DeviceFormats, StreamSpec};
@@ -30,7 +30,7 @@ mod audio_thread;
 mod decode_thread;
 mod ring;
 
-use decode_thread::SegmentWriter;
+use decode_thread::{build_producer, SegmentWriter};
 
 // ---------------------------------------------------------------------------
 // v1 single-shot path (unchanged).
@@ -183,34 +183,27 @@ where
     };
 
     let mut writer = SegmentWriter::new(ctl_tx);
-    let mut block: Vec<i32> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut result: Result<()> = Ok(());
 
     'outer: for path in paths {
-        let mut dec = match Decoder::open(path) {
-            Ok(d) => d,
+        // Whole files (no `.cue` range); a DSD file becomes a DoP stream.
+        let (mut producer, spec) = match build_producer(path, None, None, &formats, &emit) {
+            Ok(v) => v,
             Err(e) => {
                 result = Err(e);
                 break;
             }
         };
-        let mut spec = dec.spec;
-        if let Some(fmt) = formats.choose(spec.source_bits) {
-            spec.fmt = fmt;
-        }
         let fb = spec.bytes_per_frame();
         emit(Event::Started {
             spec,
             path: path.clone(),
         });
-        let mut packer = Packer::new(spec.fmt);
 
         loop {
-            match dec.next(&mut block) {
+            match producer.next_bytes(&mut scratch) {
                 Ok(true) => {
-                    scratch.clear();
-                    append_bytes(&mut scratch, &packer.pack(&block));
                     let Some(prod) = writer.producer_for(spec) else {
                         break 'outer; // audio thread gone
                     };
@@ -246,8 +239,12 @@ pub enum Cmd {
         start: Duration,
         end: Duration,
     },
+    /// Replace the queue with track `track` of a SACD `.iso` and start it now.
+    PlaySacd { path: PathBuf, track: usize },
     /// Append to the queue (gapless if it shares the current wire spec).
     Enqueue(PathBuf),
+    /// Append a SACD `.iso` track to the queue (gapless across same-rate tracks).
+    EnqueueSacd { path: PathBuf, track: usize },
     /// Hold output (hardware pause) without dropping the current track.
     Pause,
     /// Resume after a pause.
@@ -330,8 +327,20 @@ impl Player {
         let _ = self.cmd_tx.send(Cmd::PlayRange { path, start, end });
     }
 
+    /// Play track `track` of a SACD `.iso` now (replaces the queue). Like
+    /// [`Player::play`] but routed through the SACD/DoP path.
+    pub fn play_sacd(&self, path: PathBuf, track: usize) {
+        self.interrupt.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(Cmd::PlaySacd { path, track });
+    }
+
     pub fn enqueue(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::Enqueue(path));
+    }
+
+    /// Append a SACD `.iso` track to the queue (gapless across same-rate tracks).
+    pub fn enqueue_sacd(&self, path: PathBuf, track: usize) {
+        let _ = self.cmd_tx.send(Cmd::EnqueueSacd { path, track });
     }
 
     /// Hold output at the device without dropping the current track. Does not set

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "sacd"
+description = "Pure-Rust Super Audio CD reader: Scarletbook .iso/.dff/.dsf parsing and DST (Direct Stream Transfer) decoding, emitting native DSD. Ported from sacd-ripper (GPLv3)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+keywords = ["sacd", "dsd", "dst", "scarletbook", "audio"]
+categories = ["multimedia::audio", "parser-implementations"]
+
+[dependencies]
+thiserror.workspace = true

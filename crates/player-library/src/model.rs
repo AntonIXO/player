@@ -75,6 +75,30 @@ impl Track {
         })
     }
 
+    /// True if this is a track of a SACD `.iso` (`source_path` is a `.iso`, the
+    /// row is a synthetic `<iso>#NN`, and it carries no `.cue` time range). Such
+    /// tracks play through the engine's SACD/DoP path, not the decoder.
+    pub fn is_sacd(&self) -> bool {
+        self.start_ms.is_none()
+            && self.source_path != self.path
+            && self
+                .source_path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("iso"))
+                .unwrap_or(false)
+    }
+
+    /// The 0-based SACD track index parsed from the synthetic `<iso>#NN` path,
+    /// for [`player_core::Player::play_sacd`]. `None` if this isn't a SACD track.
+    pub fn sacd_track(&self) -> Option<usize> {
+        if !self.is_sacd() {
+            return None;
+        }
+        let s = self.path.to_string_lossy();
+        let n: usize = s.rsplit('#').next()?.parse().ok()?;
+        Some(n.saturating_sub(1))
+    }
+
     /// The signal-path string for the bit-perfect chip, without duration:
     /// `24-bit · 96 kHz · FLAC`.
     pub fn signal_spec(&self) -> String {

@@ -6,7 +6,7 @@
 //! drain and reopen the device.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +16,18 @@ use rtrb::Producer;
 
 use crate::convert::{append_bytes, Packer};
 use crate::decode::Decoder;
+use crate::dop::{dop_silence, DopPacker};
+use crate::dsd::{is_dsd_path, open_dsd, DsdSource};
+use crate::error::{Error, Result};
 use crate::format::{DeviceFormats, StreamSpec};
 use crate::sink::probe_formats;
 
 use super::ring::{push_block, ring_for_spec};
 use super::{Cmd, Ctl, Event};
+
+/// Milliseconds of DSD-silence DoP pre-roll written when a DoP device opens, so
+/// the DAC locks the marker pattern before real audio (avoids a start click).
+const DOP_PREROLL_MS: usize = 16;
 
 /// Owns the current ring producer and emits segment-lifecycle control events.
 /// Shared by the blocking queue player and the interactive [`super::Player`].
@@ -50,7 +57,7 @@ impl SegmentWriter {
     pub(crate) fn producer_for(&mut self, spec: StreamSpec) -> Option<&mut Producer<u8>> {
         let continues = self.prod.is_some() && self.cur.is_some_and(|c| c.same_wire(&spec));
         if !continues {
-            let (prod, consumer) = ring_for_spec(spec);
+            let (mut prod, consumer) = ring_for_spec(spec);
             let pos_base = self.next_pos_base;
             // Send Open *before* dropping the old producer: by the time the audio
             // thread observes the old consumer abandoned, the directive is queued.
@@ -66,6 +73,14 @@ impl SegmentWriter {
                 return None;
             }
             self.next_pos_base = 0;
+            // DoP: lead the segment with a few ms of DSD silence so the DAC locks
+            // the DoP marker pattern before real audio (prevents a start click).
+            // Leading silence only — the music samples are untouched.
+            if spec.is_dop {
+                let frames = (spec.rate as usize / 1000 * DOP_PREROLL_MS) & !1;
+                let silence = dop_silence(spec.fmt, spec.channels, frames);
+                let _ = push_block(&mut prod, &silence, spec.bytes_per_frame(), &mut || false);
+            }
             self.prod = Some(prod); // dropping the old producer abandons its consumer
             self.cur = Some(spec);
         }
@@ -113,25 +128,139 @@ impl SegmentWriter {
     }
 }
 
+/// A track's byte producer. PCM tracks decode then pack; DSD tracks read native
+/// DSD then DoP-pack. Both yield already-packed wire bytes, so everything
+/// downstream (ring, segment, audio thread) is identical.
+pub(crate) enum TrackProducer {
+    Pcm {
+        dec: Decoder,
+        packer: Packer,
+        block: Vec<i32>,
+    },
+    Dsd {
+        reader: Box<dyn DsdSource>,
+        dop: DopPacker,
+        buf: Vec<u8>,
+    },
+}
+
+impl TrackProducer {
+    /// Fill `out` (cleared here) with the next block of packed wire bytes.
+    /// Returns `false` at end of track.
+    pub(crate) fn next_bytes(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        match self {
+            TrackProducer::Pcm { dec, packer, block } => {
+                if dec.next(block)? {
+                    out.clear();
+                    append_bytes(out, &packer.pack(block));
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            TrackProducer::Dsd { reader, dop, buf } => {
+                if reader.next(buf)? {
+                    out.clear();
+                    out.extend_from_slice(dop.pack(buf));
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
 struct Track {
-    dec: Decoder,
-    packer: Packer,
+    producer: TrackProducer,
     spec: StreamSpec,
     /// Decode range for a `.cue` track (`start`, `end` within the source file);
-    /// `None` for a whole-file track. Used to make an in-place seek track-relative.
+    /// `None` for a whole-file track (and always `None` for DSD). Used to make an
+    /// in-place seek track-relative.
     range: Option<(Duration, Duration)>,
 }
 
-/// A queued item: a file plus an optional decode range (`Some` for a `.cue`
-/// track — seek to `start`, stop at `end`).
+/// Open a queued source into a packed-byte [`TrackProducer`] and its wire
+/// [`StreamSpec`], applying device-aware bit-perfect format choice. A DSD file
+/// (`.dsf`/`.dff`/`.iso`) becomes a DoP stream (`S24_3`/`S32` carrying DSD); a
+/// PCM file decodes as before. `.cue` ranges apply to PCM only; a seek error is
+/// reported via `emit` but is non-fatal (parity with the whole-file path).
+pub(crate) fn build_producer(
+    path: &Path,
+    range: Option<(Duration, Duration)>,
+    sacd_track: Option<usize>,
+    formats: &DeviceFormats,
+    emit: &Arc<dyn Fn(Event) + Send + Sync>,
+) -> Result<(TrackProducer, StreamSpec)> {
+    if is_dsd_path(path) {
+        let reader = open_dsd(path, sacd_track)?;
+        let dspec = reader.spec();
+        // DoP needs a 24-bit-capable container; pick the narrowest the device
+        // supports (S24_3, else S32). Hard-error if it has neither.
+        let fmt = formats.choose(24).ok_or_else(|| {
+            Error::Unsupported("device has no 24/32-bit PCM format to carry DoP".into())
+        })?;
+        let spec = dspec.dop_spec(fmt);
+        let dop = DopPacker::new(fmt, dspec.channels);
+        Ok((
+            TrackProducer::Dsd {
+                reader,
+                dop,
+                buf: Vec::new(),
+            },
+            spec,
+        ))
+    } else {
+        let mut dec = Decoder::open(path)?;
+        if let Some((start, end)) = range {
+            if let Err(e) = dec.seek(start) {
+                emit(Event::Error(e.to_string()));
+            }
+            if end > start {
+                let frames = (end - start).as_millis() as u64 * dec.spec.rate as u64 / 1000;
+                dec.set_limit(frames);
+            }
+        }
+        let mut spec = dec.spec;
+        if let Some(fmt) = formats.choose(spec.source_bits) {
+            spec.fmt = fmt;
+        }
+        let packer = Packer::new(spec.fmt);
+        Ok((
+            TrackProducer::Pcm {
+                dec,
+                packer,
+                block: Vec::new(),
+            },
+            spec,
+        ))
+    }
+}
+
+/// A queued item: a file plus, optionally, a `.cue` decode range (seek to
+/// `start`, stop at `end`) or a SACD `.iso` track selector.
 struct Source {
     path: PathBuf,
     range: Option<(Duration, Duration)>,
+    /// Track index within a multi-track SACD `.iso` (`None` = whole file / first).
+    sacd_track: Option<usize>,
 }
 
 impl Source {
     fn whole(path: PathBuf) -> Self {
-        Self { path, range: None }
+        Self {
+            path,
+            range: None,
+            sacd_track: None,
+        }
+    }
+
+    fn sacd(path: PathBuf, track: usize) -> Self {
+        Self {
+            path,
+            range: None,
+            sacd_track: Some(track),
+        }
     }
 }
 
@@ -167,13 +296,23 @@ fn apply_cmd(
             queue.push_back(Source {
                 path,
                 range: Some((start, end)),
+                sacd_track: None,
             });
             *cur = None;
             writer.flush();
             *paused = false;
             interrupt.store(false, Ordering::SeqCst);
         }
+        Cmd::PlaySacd { path, track } => {
+            queue.clear();
+            queue.push_back(Source::sacd(path, track));
+            *cur = None;
+            writer.flush();
+            *paused = false;
+            interrupt.store(false, Ordering::SeqCst);
+        }
         Cmd::Enqueue(p) => queue.push_back(Source::whole(p)),
+        Cmd::EnqueueSacd { path, track } => queue.push_back(Source::sacd(path, track)),
         Cmd::Pause => {
             writer.pause();
             *paused = true;
@@ -192,26 +331,30 @@ fn apply_cmd(
             // re-apply the decode limit so playback still stops at the range end and
             // rebase the per-track position so it stays 0-based at the track start.
             if let Some(track) = cur.as_mut() {
-                writer.flush();
-                let target = match track.range {
-                    Some((start, end)) => start + d.min(end.saturating_sub(start)),
-                    None => d,
-                };
-                match track.dec.seek(target) {
-                    Ok(landed) => match track.range {
-                        Some((start, end)) => {
-                            let rate = track.dec.spec.rate as u64;
-                            let start_fr = (start.as_millis() as u64) * rate / 1000;
-                            let end_fr = (end.as_millis() as u64) * rate / 1000;
-                            track.dec.set_limit(end_fr.saturating_sub(landed));
-                            writer.set_next_pos_base(landed.saturating_sub(start_fr));
-                        }
-                        None => writer.set_next_pos_base(landed),
-                    },
-                    Err(e) => emit(Event::Error(e.to_string())),
+                let range = track.range;
+                // Seek is PCM-only; DSD (DoP) is not seekable yet, so ignore it.
+                if let TrackProducer::Pcm { dec, .. } = &mut track.producer {
+                    writer.flush();
+                    let target = match range {
+                        Some((start, end)) => start + d.min(end.saturating_sub(start)),
+                        None => d,
+                    };
+                    match dec.seek(target) {
+                        Ok(landed) => match range {
+                            Some((start, end)) => {
+                                let rate = dec.spec.rate as u64;
+                                let start_fr = (start.as_millis() as u64) * rate / 1000;
+                                let end_fr = (end.as_millis() as u64) * rate / 1000;
+                                dec.set_limit(end_fr.saturating_sub(landed));
+                                writer.set_next_pos_base(landed.saturating_sub(start_fr));
+                            }
+                            None => writer.set_next_pos_base(landed),
+                        },
+                        Err(e) => emit(Event::Error(e.to_string())),
+                    }
+                    *paused = false;
+                    interrupt.store(false, Ordering::SeqCst);
                 }
-                *paused = false;
-                interrupt.store(false, Ordering::SeqCst);
             }
         }
         Cmd::Stop => {
@@ -247,7 +390,6 @@ pub(crate) fn run_interactive(
     let mut queue: VecDeque<Source> = VecDeque::new();
     let mut cur: Option<Track> = None;
     let mut paused = false;
-    let mut block: Vec<i32> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
 
     loop {
@@ -292,36 +434,20 @@ pub(crate) fn run_interactive(
         // 2) Ensure a current track, or idle until commanded.
         if cur.is_none() {
             match queue.pop_front() {
-                Some(src) => match Decoder::open(&src.path) {
-                    Ok(mut dec) => {
-                        // A .cue track decodes a sub-range: seek to its start and
-                        // cap the decode at its length. Per-track position rebases
-                        // to 0 because the GTK shell issues a fresh Play(Range) per
-                        // track (flush → new segment, pos_base 0).
-                        if let Some((start, end)) = src.range {
-                            if let Err(e) = dec.seek(start) {
-                                emit(Event::Error(e.to_string()));
-                            }
-                            if end > start {
-                                let frames = (end - start).as_millis() as u64
-                                    * dec.spec.rate as u64
-                                    / 1000;
-                                dec.set_limit(frames);
-                            }
-                        }
-                        let mut spec = dec.spec;
-                        if let Some(fmt) = formats.choose(spec.source_bits) {
-                            spec.fmt = fmt;
-                        }
+                // A .cue track decodes a sub-range (seek to start, cap the
+                // decode); a DSD file becomes a DoP stream. `build_producer`
+                // applies device-aware format choice. Per-track position rebases
+                // to 0 because the GTK shell issues a fresh Play(Range) per track.
+                Some(src) => match build_producer(&src.path, src.range, src.sacd_track, &formats, &emit) {
+                    Ok((producer, spec)) => {
+                        cur = Some(Track {
+                            producer,
+                            spec,
+                            range: src.range,
+                        });
                         emit(Event::Started {
                             spec,
                             path: src.path,
-                        });
-                        cur = Some(Track {
-                            dec,
-                            packer: Packer::new(spec.fmt),
-                            spec,
-                            range: src.range,
                         });
                     }
                     Err(e) => emit(Event::Error(e.to_string())),
@@ -350,14 +476,12 @@ pub(crate) fn run_interactive(
             }
         }
 
-        // 3) Decode and push one block.
+        // 3) Decode/read and push one packed block.
         if let Some(track) = cur.as_mut() {
             let spec = track.spec;
             let fb = spec.bytes_per_frame();
-            match track.dec.next(&mut block) {
+            match track.producer.next_bytes(&mut scratch) {
                 Ok(true) => {
-                    scratch.clear();
-                    append_bytes(&mut scratch, &track.packer.pack(&block));
                     match writer.producer_for(spec) {
                         Some(prod) => {
                             let pushed =

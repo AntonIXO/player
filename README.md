@@ -36,6 +36,16 @@ Linux desktop app first.
 - **`crates/player-cli`** — `probe`, `play`, `dump`, `loopback-verify`.
 - **`crates/player-gtk`** — minimal libadwaita shell (Open / Play / Stop, a
   bit-perfect format indicator, and **no volume slider** by design).
+- **`crates/sacd`** — pure-Rust SACD reader: Scarletbook `.iso` parsing + a full
+  DST (Direct Stream Transfer) decoder, emitting native DSD. Headless, no audio
+  deps; intended to be published as a standalone crate.
+- **DSD / DoP** — DSD sources play **bit-perfect** as **DoP** (DSD-over-PCM):
+  `dop.rs` wraps the unaltered DSD bitstream in `S32_LE`/`S24_3LE` PCM frames
+  with the standard `0x05`/`0xFA` markers, and the engine carries those bytes
+  exactly like PCM (the ring/segment/audio path is unchanged). Sources:
+  `.dsf`/`.dff` via the `dsd-reader` crate, SACD `.iso` via `crates/sacd`. DoP
+  only — the Mojo 2 (and most USB DACs) accept DSD over USB this way. Because the
+  whole project now links GPLv3 SACD code, the workspace is **GPL-3.0-or-later**.
 
 Why not the things NOTES.md suggested? `glib::MainContext::channel` is removed in
 current glib-rs (we use `async-channel` + `glib::spawn_future_local`); ALSA direct
@@ -54,7 +64,9 @@ cargo build --release
 
 ```sh
 player-cli probe FILE                       # codec / rate / depth / chosen format
+player-cli probe album.iso                  # SACD .iso: DSD rate, channels, DoP output
 player-cli play  FILE --device hw:1,0       # bit-perfect playback to a card
+player-cli play  track.dsf --device hw:1,0  # DSD via DoP (also .dff and SACD .iso)
 player-cli dump  FILE -o out.s32le          # decoded full-scale s32le (for diffing)
 player-cli loopback-verify FILE --seconds 8 # play+capture through snd-aloop, byte-compare
 player-cli play-queue A.flac B.flac         # gapless queue via the real-time engine

@@ -19,6 +19,10 @@ pub enum Error {
     #[error("no decodable audio track found")]
     NoTrack,
 
+    /// A DSD/SACD source (`.dsf`/`.dff`/`.iso`) could not be read.
+    #[error("DSD source error: {0}")]
+    Dsd(String),
+
     #[error("unsupported: {0}")]
     Unsupported(String),
 }

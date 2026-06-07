@@ -10,7 +10,8 @@ dither, and no software volume**. Final target: a Poco F1 DAP on postmarketOS/Ph
 feeding a Chord Mojo 2 USB DAC; it also runs as a normal Linux desktop app, which is
 the primary dev environment.
 
-A Cargo workspace of four crates:
+A Cargo workspace of five crates (license: **GPL-3.0-or-later** — the `sacd`
+crate is ported from the GPLv3 sacd-ripper, so the whole workspace matches):
 
 - **`player-core`** — the engine. No GTK, no DB; fully headless-testable. Decode →
   convert/pack → ALSA `hw:` output, plus the real-time gapless engine.
@@ -19,6 +20,10 @@ A Cargo workspace of four crates:
 - **`player-cli`** — `probe`/`play`/`dump`/`loopback-verify`/`play-queue`/`scan`/
   `search`/`devices`, etc. The CLI is also the **bit-perfect verification harness**.
 - **`player-gtk`** — the libadwaita DAP shell (built on `player-core` + `player-library`).
+- **`sacd`** — pure-Rust SACD reader: Scarletbook `.iso` parse + full DST decoder
+  (arithmetic coder + adaptive FIR), emitting **native DSD**. Headless, no audio
+  deps; publishable standalone. Ported from the C++ reference in `sacd/`
+  (vendored, git-ignored). Verified bit-correct vs real DSD & DST discs.
 
 ## The non-negotiable invariant
 
@@ -37,6 +42,17 @@ format from source bit depth, *widened* to the narrowest container the device su
 (device-aware; the Mojo 2 is `S32_LE`-only) → `convert.rs` packs by down-shifting
 `(32 - output_bits)`, pure integer math, recovering the native sample exactly →
 `sink/alsa.rs` blocking `writei` with exact rate/format negotiation.
+
+**DSD / DoP** (the parallel source path; still bit-perfect — DoP only re-frames DSD,
+never alters bits): `dsd.rs` is the `DsdSource` seam + `open_dsd` factory (`.dsf`/`.dff`
+via the `dsd-reader` crate; SACD `.iso` via the `sacd` crate). `dop.rs` `DopPacker`
+wraps interleaved **MSB-first** DSD bytes into `S32_LE`/`S24_3LE` PCM at `dsd_rate/16`
+with alternating `0x05`/`0xFA` markers — a normal `StreamSpec{is_dop:true}`. The engine
+seam (`engine/decode_thread.rs`) is a `TrackProducer` enum (`Pcm`=Decoder+Packer,
+`Dsd`=DsdSource+DopPacker) that yields already-packed bytes, so the ring/segment/audio
+thread are **unchanged**. DoP only (the Mojo 2 won't take native ALSA DSD); `alsa` 0.11
+does expose `DSD_U32_*` if ever wanted. Add DSD playback features here, *not* by
+touching the threads. Verify with the same loopback harness (DoP is just PCM bytes).
 
 ## Build / test / run
 

@@ -70,6 +70,11 @@ pub struct StreamSpec {
     /// Source bit depth as reported by the codec (informational + drives `fmt`).
     pub source_bits: u32,
     pub fmt: AlsaFmt,
+    /// This is a DoP (DSD-over-PCM) stream: the PCM frames carry a DSD bitstream
+    /// with 0x05/0xFA markers (see `dop.rs`). Still bit-perfect — the bytes are
+    /// written unchanged — but it must never be gaplessly merged with a true PCM
+    /// stream of the same rate/format (the DAC switches DoP↔PCM on a relock).
+    pub is_dop: bool,
 }
 
 impl StreamSpec {
@@ -79,6 +84,20 @@ impl StreamSpec {
             channels,
             source_bits,
             fmt: AlsaFmt::from_source_bits(source_bits),
+            is_dop: false,
+        }
+    }
+
+    /// A DoP stream: PCM `rate` (= DSD rate / 16) carrying DSD in container
+    /// `fmt` (`S24_3` or `S32`). `source_bits` is set to the container width so
+    /// device-aware widening leaves it untouched.
+    pub fn dop(rate: u32, channels: u32, fmt: AlsaFmt) -> Self {
+        StreamSpec {
+            rate,
+            channels,
+            source_bits: fmt.output_bits(),
+            fmt,
+            is_dop: true,
         }
     }
 
@@ -87,11 +106,15 @@ impl StreamSpec {
     }
 
     /// True if two specs share the same *wire* parameters (rate, channels, ALSA
-    /// format) and can therefore stream through one open device gaplessly.
-    /// `source_bits` is deliberately ignored: e.g. 20- and 24-bit both emit
-    /// `S24_3LE`, so they are gapless-compatible.
+    /// format, DoP-ness) and can therefore stream through one open device
+    /// gaplessly. `source_bits` is deliberately ignored: e.g. 20- and 24-bit
+    /// both emit `S24_3LE`, so they are gapless-compatible. `is_dop` is *not*
+    /// ignored: a DoP stream and a same-rate PCM stream must force a relock.
     pub fn same_wire(&self, other: &StreamSpec) -> bool {
-        self.rate == other.rate && self.channels == other.channels && self.fmt == other.fmt
+        self.rate == other.rate
+            && self.channels == other.channels
+            && self.fmt == other.fmt
+            && self.is_dop == other.is_dop
     }
 }
 

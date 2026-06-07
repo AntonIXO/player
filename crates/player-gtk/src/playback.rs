@@ -42,11 +42,15 @@ pub(crate) fn start_current(state: &SharedState, ui: &SharedUi) {
     {
         let mut s = state.borrow_mut();
         s.paused = false;
-        // A .cue track decodes a sub-range of its source file; everything else is
-        // a whole-file play.
-        match track.cue_range() {
-            Some((start, end)) => s.player.play_range(track.source_path.clone(), start, end),
-            None => s.player.play(track.path.clone()),
+        // SACD .iso track → the DoP path; a .cue track decodes a sub-range of its
+        // source file; everything else is a whole-file play.
+        if let Some(t) = track.sacd_track() {
+            s.player.play_sacd(track.source_path.clone(), t);
+        } else {
+            match track.cue_range() {
+                Some((start, end)) => s.player.play_range(track.source_path.clone(), start, end),
+                None => s.player.play(track.path.clone()),
+            }
         }
         // Log to recently-played history (indexed tracks only).
         if track.id > 0 {

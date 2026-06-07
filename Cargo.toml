@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/player-core", "crates/player-cli", "crates/player-gtk", "crates/player-library"]
+members = [
+    "crates/player-core",
+    "crates/player-cli",
+    "crates/player-gtk",
+    "crates/player-library",
+    "crates/sacd",
+]
 
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+# GPL-3.0 because the SACD/DST support (crates/sacd) is ported from the GPLv3
+# sacd-ripper project; the whole workspace is relicensed to match.
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 symphonia = { version = "0.6", default-features = false, features = [
@@ -37,6 +45,10 @@ clap = { version = "4.6.1", features = ["derive"] }
 gtk4 = { version = "0.11.3", features = ["v4_16"] }
 libadwaita = { version = "0.9.1", features = ["v1_6"] }
 async-channel = "2.5.0"
+# DSD: .dsf/.dff frame reader (interleaved, MSB-first); the SACD .iso path is
+# the in-tree `sacd` crate.
+dsd-reader = "0.3"
+sacd = { path = "crates/sacd" }
 
 [profile.release]
 opt-level = 3

@@ -47,12 +47,23 @@ pub(crate) fn on_started(state: &SharedState, ui: &SharedUi, spec: StreamSpec) {
     }
     set_play_icon(ui, true);
     // authoritative wire format from the engine
-    let chip = format!(
-        "{}-bit · {} · {}",
-        spec.source_bits,
-        fmt_khz(spec.rate),
-        spec.fmt.label()
-    );
+    let chip = if spec.is_dop {
+        // DoP: a PCM wire carrying DSD. The PCM rate is the DSD rate / 16; recover
+        // the DSD multiple (176.4 kHz → DSD64) for a meaningful label.
+        format!(
+            "DSD{} · DoP · {} · {}",
+            spec.rate * 16 / 44_100,
+            fmt_khz(spec.rate),
+            spec.fmt.label()
+        )
+    } else {
+        format!(
+            "{}-bit · {} · {}",
+            spec.source_bits,
+            fmt_khz(spec.rate),
+            spec.fmt.label()
+        )
+    };
     fill(&ui.np_format, &format_chip(&chip));
 }
 

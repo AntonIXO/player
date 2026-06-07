@@ -55,11 +55,24 @@ and the UI must clearly flag when output is *not* bit-perfect.
   cleanly, surface "device removed", and auto-resume when it returns.
 - Suspend/resume (`ESTRPIPE`) is already handled via `try_recover`; add a test.
 
-### 3.5 DSD / DoP
-- The Mojo 2 does DSD. Support **DoP** (DSD-over-PCM): wrap DSD bitstream in
-  S24/S32 PCM frames with the 0x05/0xFA markers, sent bit-perfect as PCM. Needs
-  a DSD source path (DSF/DFF demux — not in symphonia; add a small reader) and a
-  `DopPacker`. Large feature; gate behind a setting.
+### 3.5 DSD / DoP — **DONE**
+- The Mojo 2 does DSD. We support **DoP** (DSD-over-PCM): `dop.rs` wraps the DSD
+  bitstream in `S32_LE`/`S24_3LE` PCM frames with the `0x05`/`0xFA` markers, sent
+  bit-perfect as PCM. The DSD source seam is `dsd.rs` (`DsdSource`/`open_dsd`);
+  the engine's `TrackProducer` enum routes DSD through the **unchanged**
+  ring/segment/audio path (a DoP track is a PCM track whose bytes are DoP). A
+  short DSD-silence DoP pre-roll at device open lets the DAC lock the marker
+  pattern (no start-up click).
+- Sources: `.dsf`/`.dff` via the `dsd-reader` crate; **SACD `.iso`** (incl.
+  **DST**-compressed) via the pure-Rust `crates/sacd` — Scarletbook TOC + frame
+  reader + a full `libdstdec` DST decoder (arithmetic coder + adaptive FIR),
+  ported from sacd-ripper → workspace relicensed **GPL-3.0-or-later**. Verified
+  against real discs: an uncompressed-DSD SACD (`pillow.iso`) and a DST one
+  (`rr.iso`) both decode to the exact DSD64 frame size; the arithmetic coder's
+  self-check (flush == 1) passes every frame. Release decode is ~10× realtime.
+- The library indexes `.iso` as multi-track albums (like `.cue`) and `.dsf` via
+  `dsd-reader`+`id3`; the GTK shell plays them via `Player::play_sacd` and shows
+  a `DSD64 · DoP · …` chip.
 
 ### 3.6 Lossy codecs + optional dither
 - Add mp3/aac/ogg/opus decode (symphonia features). These aren't bit-perfect by

@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use player_core::{
-    append_bytes, capture_raw, play_queue_blocking, run_playback, AlsaSink, Decoder, Event, Flow,
-    Packer, StreamSpec, DEFAULT_PERIOD, DEFAULT_PERIODS,
+    append_bytes, capture_raw, is_dsd_path, open_dsd, play_queue_blocking, probe_formats,
+    run_playback, AlsaFmt, AlsaSink, Decoder, DeviceFormats, DopPacker, Event, Flow, Packer,
+    StreamSpec, DEFAULT_PERIOD, DEFAULT_PERIODS,
 };
 use player_library::{Filter, Library, SearchIndex};
 
@@ -192,6 +193,9 @@ fn devices() -> player_core::Result<()> {
 }
 
 fn probe(file: &Path) -> player_core::Result<()> {
+    if is_dsd_path(file) {
+        return probe_dsd(file);
+    }
     let dec = Decoder::open(file)?;
     let s = dec.spec;
     let dur = s
@@ -210,7 +214,27 @@ fn probe(file: &Path) -> player_core::Result<()> {
     Ok(())
 }
 
+/// Probe a DSD file (`.dsf`/`.dff`/`.iso`): report the DSD rate and the
+/// bit-perfect DoP output it maps to.
+fn probe_dsd(file: &Path) -> player_core::Result<()> {
+    let src = open_dsd(file, None)?;
+    let s = src.spec();
+    let dop = s.dop_spec(AlsaFmt::S32);
+    println!("file        : {}", file.display());
+    println!("codec       : {} (DSD, 1-bit)", s.label());
+    println!("dsd rate    : {} Hz", s.dsd_rate);
+    println!("channels    : {}", s.channels);
+    println!(
+        "dop output  : {} Hz, S24_3LE/S32_LE (DSD-over-PCM) — bit-perfect",
+        dop.rate
+    );
+    Ok(())
+}
+
 fn play(file: &Path, device: &str, seconds: f64) -> player_core::Result<()> {
+    if is_dsd_path(file) {
+        return play_dsd(file, device);
+    }
     let probe_spec = Decoder::open(file)?.spec;
     let maxf = max_frames(probe_spec.rate, seconds);
 
@@ -243,12 +267,50 @@ fn play(file: &Path, device: &str, seconds: f64) -> player_core::Result<()> {
     Ok(())
 }
 
+/// Play a DSD file (`.dsf`/`.dff`/`.iso`) as bit-perfect DoP through the gapless
+/// engine. (`seconds` is ignored for DSD — pick a short fixture for quick tests.)
+fn play_dsd(file: &Path, device: &str) -> player_core::Result<()> {
+    println!("playing (DSD → DoP) {} -> {device}", file.display());
+    let stats = play_queue_blocking(
+        &[file.to_path_buf()],
+        device,
+        DEFAULT_PERIOD,
+        DEFAULT_PERIODS,
+        |ev| match ev {
+            Event::Started { spec, .. } => println!(
+                "  DoP {} Hz, {} ch, {} — bit-perfect",
+                spec.rate,
+                spec.channels,
+                spec.fmt.label()
+            ),
+            Event::Error(e) => eprintln!("⚠ {e}"),
+            Event::Ended | Event::Position(_) => {}
+        },
+    )?;
+    println!(
+        "\ndone: {} frames, {} xrun(s), scheduling {:?}.",
+        stats.frames, stats.xruns, stats.sched
+    );
+    Ok(())
+}
+
 fn dump(file: &Path, out: Option<&Path>) -> player_core::Result<()> {
-    let mut dec = Decoder::open(file)?;
     let mut sink: Box<dyn Write> = match out {
         Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
     };
+    // DSD: dump raw native DSD bytes (interleaved, MSB-first) — comparable to a
+    // reference DSD extraction (e.g. for DST-decode verification).
+    if is_dsd_path(file) {
+        let mut src = open_dsd(file, None)?;
+        let mut buf: Vec<u8> = Vec::new();
+        while src.next(&mut buf)? {
+            sink.write_all(&buf)?;
+        }
+        sink.flush()?;
+        return Ok(());
+    }
+    let mut dec = Decoder::open(file)?;
     let mut block: Vec<i32> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     while dec.next(&mut block)? {
@@ -297,20 +359,53 @@ fn decode_to_bytes(
     Ok((bytes, spec, n_frames))
 }
 
+/// Build the bit-perfect DoP byte stream for a DSD file, choosing the DoP
+/// container from `device`'s formats. The DSD analogue of [`decode_to_bytes`]:
+/// the bytes are exactly what the sink writes, so the loopback compare is a
+/// transport bit-perfect proof for DSD.
+fn dsd_dop_bytes(
+    file: &Path,
+    device: &str,
+    seconds: f64,
+) -> player_core::Result<(Vec<u8>, StreamSpec, usize)> {
+    let formats = probe_formats(device).unwrap_or_else(|_| DeviceFormats::all());
+    let fmt = formats.choose(24).ok_or_else(|| {
+        player_core::Error::Unsupported("device can't carry DoP (no 24/32-bit format)".into())
+    })?;
+    let mut src = open_dsd(file, None)?;
+    let dspec = src.spec();
+    let spec = dspec.dop_spec(fmt);
+    let frame_bytes = spec.bytes_per_frame();
+    let maxf = max_frames(spec.rate, seconds);
+    let mut dop = DopPacker::new(fmt, dspec.channels);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    while src.next(&mut buf)? {
+        out.extend_from_slice(dop.pack(&buf));
+        if let Some(m) = maxf {
+            if out.len() / frame_bytes >= m as usize {
+                out.truncate(m as usize * frame_bytes);
+                break;
+            }
+        }
+    }
+    let n = out.len() / frame_bytes;
+    Ok((out, spec, n))
+}
+
 fn loopback_verify(file: &Path, out_dev: &str, in_dev: &str, seconds: f64) -> ExitCode {
-    let probe_rate = match Decoder::open(file) {
-        Ok(d) => d.spec.rate,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+    let built = if is_dsd_path(file) {
+        dsd_dop_bytes(file, out_dev, seconds)
+    } else {
+        match Decoder::open(file) {
+            Ok(d) => decode_to_bytes(file, max_frames(d.spec.rate, seconds)),
+            Err(e) => Err(e),
         }
     };
-    let maxf = max_frames(probe_rate, seconds);
-
-    let (played, spec, n_frames) = match decode_to_bytes(file, maxf) {
+    let (played, spec, n_frames) = match built {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("decode error: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };

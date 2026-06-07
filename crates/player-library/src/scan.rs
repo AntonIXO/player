@@ -27,6 +27,9 @@ use crate::{db, Error, Result};
 
 const BATCH: usize = 1000;
 
+/// A SACD `.iso`'s `((mtime_ns, size), row_count)`, keyed by iso path.
+type IsoState = ((i64, i64), u64);
+
 #[derive(Clone, Copy)]
 struct FileState {
     id: i64,
@@ -69,9 +72,11 @@ pub fn scan(
     let existing = Arc::new(load_existing(db_path)?);
 
     // Cheap directory walk to collect candidate files; the heavy per-file work
-    // is parallelized below. `.cue` sheets are collected separately.
+    // is parallelized below. `.cue` sheets and SACD `.iso`s are container files,
+    // each expanded into per-track rows separately.
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cue_paths: Vec<PathBuf> = Vec::new();
+    let mut iso_paths: Vec<PathBuf> = Vec::new();
     for dent in WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(false)
@@ -87,6 +92,8 @@ pub fn scan(
             paths.push(d.path().to_path_buf());
         } else if has_ext(d.path(), "cue") {
             cue_paths.push(d.path().to_path_buf());
+        } else if extract::is_sacd_iso(d.path()) {
+            iso_paths.push(d.path().to_path_buf());
         }
     }
 
@@ -129,6 +136,8 @@ pub fn scan(
     // Per-track rows for `.cue` sheets (incremental: a sheet whose file mtime+size
     // is unchanged is skipped; removed sheets have their rows deleted).
     scan_cues(db_path, art_dir, &cues, &mut stats)?;
+    // Per-track rows for SACD `.iso` images (same incremental contract).
+    scan_iso(db_path, art_dir, &iso_paths, &mut stats)?;
 
     stats.elapsed_ms = start.elapsed().as_millis();
     Ok(stats)
@@ -156,11 +165,13 @@ fn cue_referenced_files(cues: &[(PathBuf, crate::cue::CueSheet)]) -> HashSet<Pat
 
 fn load_existing(db_path: &Path) -> Result<HashMap<String, FileState>> {
     let conn = db::open(db_path)?;
-    // Whole-file tracks only — `.cue` rows (start_ms NOT NULL) are diffed
-    // separately in `scan_cues`, so the normal delete reconciliation must not
-    // see them.
-    let mut stmt =
-        conn.prepare("SELECT id, path, mtime_ns, size FROM track WHERE start_ms IS NULL")?;
+    // Whole-file tracks only. Container-derived rows are diffed separately:
+    // `.cue` rows have `start_ms NOT NULL`; SACD `.iso` rows have `start_ms NULL`
+    // but `source_path NOT NULL`. Whole-file rows alone have `source_path NULL`.
+    let mut stmt = conn.prepare(
+        "SELECT id, path, mtime_ns, size FROM track \
+         WHERE start_ms IS NULL AND source_path IS NULL",
+    )?;
     let mut map = HashMap::new();
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -522,6 +533,137 @@ fn insert_cue_tracks(
             )?;
             added += 1;
         }
+    }
+    Ok(added)
+}
+
+// --- SACD .iso ------------------------------------------------------------
+
+/// Diff SACD `.iso` images against existing iso-derived rows and (re)insert their
+/// per-track rows. Mirrors [`scan_cues`]: an iso whose `(mtime, size)` is
+/// unchanged is skipped, a changed one is rebuilt, a vanished one's rows dropped.
+/// SACD rows are identified by `start_ms IS NULL AND source_path IS NOT NULL`.
+fn scan_iso(
+    db_path: &Path,
+    art_dir: &Path,
+    iso_paths: &[PathBuf],
+    stats: &mut ScanStats,
+) -> Result<()> {
+    if iso_paths.is_empty() {
+        return Ok(());
+    }
+    let mut conn = db::open(db_path)?;
+    let existing = load_existing_iso(&conn)?;
+    let mut current: HashSet<String> = HashSet::new();
+
+    let txn = conn.transaction()?;
+    for iso in iso_paths {
+        let key = iso.to_string_lossy().into_owned();
+        current.insert(key.clone());
+        let Ok(meta) = std::fs::metadata(iso) else {
+            continue;
+        };
+        let sig = (mtime_ns(&meta), meta.len() as i64);
+        if let Some((old_sig, count)) = existing.get(&key) {
+            if *old_sig == sig {
+                stats.unchanged += count;
+                continue;
+            }
+        }
+        delete_cue_rows(&txn, &key)?; // generic: deletes `<key>#%`
+        match extract::extract_sacd(iso) {
+            Ok(album) => stats.added += insert_iso_tracks(&txn, art_dir, iso, &album, sig)?,
+            Err(_) => stats.errors += 1,
+        }
+    }
+    for old in existing.keys() {
+        if !current.contains(old) {
+            stats.removed += delete_cue_rows(&txn, old)?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Map each existing SACD `.iso` path to its `(mtime, size)` signature and row
+/// count, recovered from the synthetic `<iso>#<seq>` track paths.
+fn load_existing_iso(conn: &rusqlite::Connection) -> Result<HashMap<String, IsoState>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, mtime_ns, size FROM track \
+         WHERE start_ms IS NULL AND source_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    let mut map: HashMap<String, IsoState> = HashMap::new();
+    for row in rows {
+        let (path, mtime, size) = row?;
+        if let Some(key) = strip_cue_suffix(&path) {
+            let e = map.entry(key).or_insert(((mtime, size), 0));
+            e.0 = (mtime, size);
+            e.1 += 1;
+        }
+    }
+    Ok(map)
+}
+
+/// Insert one synthetic row per SACD track (`<iso>#NN`, `source_path` = the iso,
+/// `start_ms` NULL). The album cover, if a sidecar sits beside the iso, is
+/// cached like embedded art.
+fn insert_iso_tracks(
+    txn: &Transaction,
+    art_dir: &Path,
+    iso_path: &Path,
+    album: &extract::SacdAlbum,
+    sig: (i64, i64),
+) -> Result<u64> {
+    let key = iso_path.to_string_lossy().into_owned();
+    let folder = iso_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mtime_ns, size) = sig;
+    let art_hash = extract::folder_cover(iso_path).map(|(hash, _mime, bytes)| {
+        let _ = write_art(art_dir, &hash, &bytes);
+        hash
+    });
+
+    let mut added = 0u64;
+    for (i, t) in album.tracks.iter().enumerate() {
+        let seq = (i + 1) as u32;
+        let path = format!("{key}#{seq:03}");
+        let title = t
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("Track {seq:02}"));
+        let artist = t.artist.clone().or_else(|| album.album_artist.clone());
+        txn.execute(
+            "INSERT INTO track(path,folder,title,artist,album_artist,album,track_no,\
+                duration_ms,codec,channels,art_hash,source_path,mtime_ns,size)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)\
+             ON CONFLICT(path) DO UPDATE SET folder=excluded.folder,title=excluded.title,\
+                artist=excluded.artist,album_artist=excluded.album_artist,album=excluded.album,\
+                track_no=excluded.track_no,duration_ms=excluded.duration_ms,codec=excluded.codec,\
+                channels=excluded.channels,art_hash=excluded.art_hash,\
+                source_path=excluded.source_path,mtime_ns=excluded.mtime_ns,size=excluded.size",
+            params![
+                path,
+                folder,
+                title,
+                artist,
+                album.album_artist,
+                album.album,
+                seq,
+                t.duration_ms as i64,
+                "DSD64",
+                album.channels,
+                art_hash,
+                key,
+                mtime_ns,
+                size,
+            ],
+        )?;
+        added += 1;
     }
     Ok(added)
 }

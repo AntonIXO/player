@@ -11,7 +11,11 @@
 *.mp3
 *.dsf
 *.dff
+*.iso
 /testfiles/
+
+# C++ SACD reference (sacd-ripper fork) — vendored reference, has its own repo.
+/sacd/
 
 # Bit-perfect verification artifacts (decoded PCM dumps)
 *.s32le

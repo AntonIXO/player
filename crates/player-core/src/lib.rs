@@ -4,6 +4,8 @@
 pub mod convert;
 pub mod decode;
 pub mod devices;
+pub mod dop;
+pub mod dsd;
 pub mod engine;
 pub mod error;
 pub mod format;
@@ -13,6 +15,8 @@ pub mod sink;
 pub use convert::{append_bytes, OutFrames, Packer};
 pub use decode::Decoder;
 pub use devices::{auto_pick, list_devices, DeviceInfo, DeviceKind};
+pub use dop::DopPacker;
+pub use dsd::{is_dsd_path, open_dsd, DsdSource, DsdSpec};
 pub use engine::{
     play_queue_blocking, run_playback, Cmd, Event, Flow, Player, Stats, DEFAULT_PERIOD,
     DEFAULT_PERIODS,

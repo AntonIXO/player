@@ -50,6 +50,13 @@ impl DsdSpec {
 pub trait DsdSource {
     fn next(&mut self, out: &mut Vec<u8>) -> Result<bool>;
     fn spec(&self) -> DsdSpec;
+    /// Seek so the next `next()` yields the block at `dop_frame` (a DoP PCM frame
+    /// = 16 DSD samples, the engine's position unit = `dsd_rate / 16`). Returns
+    /// the landed frame, or `None` if this source can't seek. Repositioning lands
+    /// on a real frame/block boundary, so the DSD it then yields is bit-exact.
+    fn seek(&mut self, _dop_frame: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Open a DSD file as a [`DsdSource`]. Dispatches on extension: `.dsf`/`.dff`
@@ -87,8 +94,15 @@ pub fn is_dsd_path(path: &Path) -> bool {
 /// the [`crate::dop::DopPacker`] expects (and normalizes DSF's native LSB-first
 /// bit order for us).
 struct DsfDffSource {
+    /// Kept so a backward seek can re-`interl_iter` from the top (the iterator is
+    /// forward-only).
+    reader: dsd_reader::DsdReader,
     iter: dsd_reader::DsdIter,
     spec: DsdSpec,
+    /// DSD bytes yielded so far — the seek anchor.
+    pos_bytes: u64,
+    /// A block read past the seek target and stashed to be yielded next.
+    pending: Option<Vec<u8>>,
 }
 
 impl DsfDffSource {
@@ -105,27 +119,43 @@ impl DsfDffSource {
             .interl_iter(false, None)
             .map_err(|e| Error::Dsd(e.to_string()))?;
         Ok(DsfDffSource {
+            reader,
             iter,
             spec: DsdSpec {
                 dsd_rate,
                 channels,
                 n_frames,
             },
+            pos_bytes: 0,
+            pending: None,
         })
+    }
+
+    /// Pull the next interleaved block (pending first, else the iterator), or
+    /// `None` at end of stream. Does not advance `pos_bytes`.
+    fn next_block(&mut self) -> Option<Vec<u8>> {
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
+        match self.iter.next() {
+            // Interleaved output is a single buffer; `read_size` is its valid
+            // length (the whole clustered frame for all channels).
+            Some((read_size, bufs)) => bufs.first().map(|buf| {
+                let n = read_size.min(buf.len());
+                buf[..n].to_vec()
+            }),
+            None => None,
+        }
     }
 }
 
 impl DsdSource for DsfDffSource {
     fn next(&mut self, out: &mut Vec<u8>) -> Result<bool> {
-        match self.iter.next() {
-            Some((read_size, bufs)) => {
-                out.clear();
-                // Interleaved output is a single buffer; `read_size` is its valid
-                // length (the whole clustered frame for all channels).
-                if let Some(buf) = bufs.first() {
-                    let n = read_size.min(buf.len());
-                    out.extend_from_slice(&buf[..n]);
-                }
+        out.clear();
+        match self.next_block() {
+            Some(block) => {
+                self.pos_bytes += block.len() as u64;
+                out.extend_from_slice(&block);
                 Ok(true)
             }
             None => Ok(false),
@@ -134,6 +164,33 @@ impl DsdSource for DsfDffSource {
 
     fn spec(&self) -> DsdSpec {
         self.spec
+    }
+
+    fn seek(&mut self, dop_frame: u64) -> Result<Option<u64>> {
+        // 2 DSD bytes per channel make one DoP frame.
+        let bpf = 2 * self.spec.channels.max(1) as u64;
+        let target = dop_frame.saturating_mul(bpf);
+        // The iterator only moves forward; rewind by recreating it from the top.
+        if target < self.pos_bytes {
+            self.iter = self
+                .reader
+                .interl_iter(false, None)
+                .map_err(|e| Error::Dsd(e.to_string()))?;
+            self.pos_bytes = 0;
+            self.pending = None;
+        }
+        // Discard whole blocks until one would straddle the target; stash it so
+        // playback resumes from that block's (frame-aligned) start.
+        loop {
+            let Some(block) = self.next_block() else {
+                return Ok(Some(self.pos_bytes / bpf)); // sought past end
+            };
+            if self.pos_bytes + block.len() as u64 > target {
+                self.pending = Some(block);
+                return Ok(Some(self.pos_bytes / bpf));
+            }
+            self.pos_bytes += block.len() as u64;
+        }
     }
 }
 
@@ -160,10 +217,14 @@ impl SacdSource {
             .iter()
             .find(|a| a.area == area)
             .ok_or_else(|| Error::Dsd("SACD area vanished".into()))?;
+        // DoP frames = track seconds × (dsd_rate / 16), from the TOC duration.
+        let n_frames = info.tracks.get(track).map(|t| {
+            (t.duration.as_secs_f64() * (info.dsd_rate as f64 / 16.0)).round() as u64
+        });
         let spec = DsdSpec {
             dsd_rate: info.dsd_rate,
             channels: info.channels,
-            n_frames: None,
+            n_frames,
         };
         let reader = img
             .reader(area, track)
@@ -180,6 +241,18 @@ impl DsdSource for SacdSource {
 
     fn spec(&self) -> DsdSpec {
         self.spec
+    }
+
+    fn seek(&mut self, dop_frame: u64) -> Result<Option<u64>> {
+        // Each SACD frame is a fixed 1/75 s, i.e. `dsd_rate / 1200` DoP frames
+        // (2352 at DSD64). Seek by counting whole frames.
+        let dpf = (self.spec.dsd_rate as u64 / 1200).max(1);
+        let target_frame = dop_frame / dpf;
+        let landed = self
+            .reader
+            .seek_frame(target_frame)
+            .map_err(|e| Error::Dsd(e.to_string()))?;
+        Ok(Some(landed * dpf))
     }
 }
 

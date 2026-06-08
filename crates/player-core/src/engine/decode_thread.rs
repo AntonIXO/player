@@ -332,28 +332,48 @@ fn apply_cmd(
             // rebase the per-track position so it stays 0-based at the track start.
             if let Some(track) = cur.as_mut() {
                 let range = track.range;
-                // Seek is PCM-only; DSD (DoP) is not seekable yet, so ignore it.
-                if let TrackProducer::Pcm { dec, .. } = &mut track.producer {
-                    writer.flush();
-                    let target = match range {
-                        Some((start, end)) => start + d.min(end.saturating_sub(start)),
-                        None => d,
-                    };
-                    match dec.seek(target) {
-                        Ok(landed) => match range {
-                            Some((start, end)) => {
-                                let rate = dec.spec.rate as u64;
-                                let start_fr = (start.as_millis() as u64) * rate / 1000;
-                                let end_fr = (end.as_millis() as u64) * rate / 1000;
-                                dec.set_limit(end_fr.saturating_sub(landed));
-                                writer.set_next_pos_base(landed.saturating_sub(start_fr));
-                            }
-                            None => writer.set_next_pos_base(landed),
-                        },
-                        Err(e) => emit(Event::Error(e.to_string())),
+                match &mut track.producer {
+                    TrackProducer::Pcm { dec, .. } => {
+                        writer.flush();
+                        let target = match range {
+                            Some((start, end)) => start + d.min(end.saturating_sub(start)),
+                            None => d,
+                        };
+                        match dec.seek(target) {
+                            Ok(landed) => match range {
+                                Some((start, end)) => {
+                                    let rate = dec.spec.rate as u64;
+                                    let start_fr = (start.as_millis() as u64) * rate / 1000;
+                                    let end_fr = (end.as_millis() as u64) * rate / 1000;
+                                    dec.set_limit(end_fr.saturating_sub(landed));
+                                    writer.set_next_pos_base(landed.saturating_sub(start_fr));
+                                }
+                                None => writer.set_next_pos_base(landed),
+                            },
+                            Err(e) => emit(Event::Error(e.to_string())),
+                        }
+                        *paused = false;
+                        interrupt.store(false, Ordering::SeqCst);
                     }
-                    *paused = false;
-                    interrupt.store(false, Ordering::SeqCst);
+                    // DSD seeks in DoP PCM frames (= the wire rate, dsd_rate / 16).
+                    // Range is always `None` for DSD, so no cue rebasing.
+                    TrackProducer::Dsd { reader, dop, .. } => {
+                        let dpf = (reader.spec().dsd_rate as u64 / 16).max(1);
+                        let target = (d.as_millis() as u64) * dpf / 1000;
+                        match reader.seek(target) {
+                            Ok(Some(landed)) => {
+                                writer.flush();
+                                // Fresh DoP marker phase + drop any partial-frame carry.
+                                dop.reset();
+                                writer.set_next_pos_base(landed);
+                                *paused = false;
+                                interrupt.store(false, Ordering::SeqCst);
+                            }
+                            // Source can't seek: leave playback untouched.
+                            Ok(None) => {}
+                            Err(e) => emit(Event::Error(e.to_string())),
+                        }
+                    }
                 }
             }
         }

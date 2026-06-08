@@ -175,6 +175,7 @@ impl SacdImage {
             channels: a.channel_count,
             dst: dst::Decoder::new(a.channel_count as usize),
             is_dst_area: a.frame_format == 0,
+            frame_idx: 0,
         })
     }
 }
@@ -186,6 +187,9 @@ pub struct SacdTrackReader {
     channels: u32,
     dst: dst::Decoder,
     is_dst_area: bool,
+    /// Number of frames yielded so far — the seek anchor. Each frame is a fixed
+    /// 1/75 s of audio (588·64/8 = 4704 DSD bytes/channel).
+    frame_idx: u64,
 }
 
 impl SacdTrackReader {
@@ -195,14 +199,36 @@ impl SacdTrackReader {
         match self.frames.read_frame()? {
             Some(FrameKind::Dsd) => {
                 out.extend_from_slice(self.frames.frame());
+                self.frame_idx += 1;
                 Ok(true)
             }
             Some(FrameKind::Dst) => {
                 self.dst.decode(self.frames.frame(), out)?;
+                self.frame_idx += 1;
                 Ok(true)
             }
             None => Ok(false),
         }
+    }
+
+    /// Seek so the next `next()` yields frame `target` (a frame = 1/75 s). DST
+    /// frames are self-contained, so skipped frames need no decode; a backward
+    /// seek rewinds to the track start and re-skips. Returns the landed frame
+    /// (clamped to end of track). Bit-exact: it lands on a real frame boundary.
+    pub fn seek_frame(&mut self, target: u64) -> Result<u64> {
+        if target < self.frame_idx {
+            self.frames.reset()?;
+            self.frame_idx = 0;
+            // DST frames are independent; a fresh decoder guarantees clean state.
+            self.dst = dst::Decoder::new(self.channels as usize);
+        }
+        while self.frame_idx < target {
+            match self.frames.read_frame()? {
+                Some(_) => self.frame_idx += 1,
+                None => break,
+            }
+        }
+        Ok(self.frame_idx)
     }
 
     pub fn dsd_rate(&self) -> u32 {

@@ -58,6 +58,8 @@ pub(crate) struct FrameReader {
     /// Byte offset of the logical-sector payload within a raw sector (0 for LSN,
     /// 12 for PSN).
     base: usize,
+    /// First logical sector of the track — the reset/seek anchor.
+    start_lsn: u32,
     current_lsn: u32,
     end_lsn: u32,
 
@@ -80,6 +82,7 @@ impl FrameReader {
         FrameReader {
             file,
             base,
+            start_lsn,
             current_lsn: start_lsn,
             end_lsn: start_lsn.saturating_add(length_lsn),
             sector: vec![0u8; sector_size],
@@ -124,6 +127,25 @@ impl FrameReader {
         self.packet_count = packet_info_count;
         self.packet_idx = 0;
         self.offset = off;
+    }
+
+    /// Rewind to the track's first sector and clear all streaming state, so the
+    /// next `read_frame` re-reads from the top. Used to seek backward (the caller
+    /// then skips forward frame-by-frame to the target).
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        let sector_size = self.sector.len();
+        self.file
+            .seek(SeekFrom::Start(self.start_lsn as u64 * sector_size as u64))?;
+        self.current_lsn = self.start_lsn;
+        self.packet_count = 0;
+        self.packet_idx = 0;
+        self.offset = 0;
+        self.dst_encoded = false;
+        self.frame.clear();
+        self.frame_started = false;
+        self.frame_dst = false;
+        self.done = false;
+        Ok(())
     }
 
     /// Read the next complete frame, or `None` at end of track.

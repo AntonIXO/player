@@ -35,6 +35,7 @@ source="
 	hifi-player.svg
 	99-mojo2-nopulse.rules
 	99-cpu-dma-latency.rules
+	99-volume-keys.rules
 	99-audio.conf
 	audio.conf
 	99-audio-sysctl.conf
@@ -86,6 +87,8 @@ package() {
 		"$pkgdir"/etc/udev/rules.d/99-mojo2-nopulse.rules
 	install -Dm644 "$srcdir"/99-cpu-dma-latency.rules \
 		"$pkgdir"/etc/udev/rules.d/99-cpu-dma-latency.rules
+	install -Dm644 "$srcdir"/99-volume-keys.rules \
+		"$pkgdir"/etc/udev/rules.d/99-volume-keys.rules
 
 	# RT limits, snd-usb-audio module options, swap/dirty tuning.
 	install -Dm644 "$srcdir"/99-audio.conf \
@@ -110,6 +113,7 @@ faff1c8006f71863df0f2efc0ad2a7392e4bf045f531a9a17cdfcb8f1997f23f460b6f62d24fc7e0
 07e2281d300d92ef337eca966b7c20f55174c21f100f877c1b74ac9fe2ac9f0f0f2be51c2694716c4258311b0a8e742751b12f21bae802b309ec0073f605560a  hifi-player.svg
 4818d2539c8af4246e4672d2ab93fa13a8bc9548870fa06bcc30a38ded52232c36aff08ba01a55bf21692137f730a230f673d8579533e5cc02548cf3955d3cc3  99-mojo2-nopulse.rules
 3928ceae0a348105d6595d624284f6e3e4acff589a49c65cfb2fe33cba00253d39805b84192bb40def6d6219abe114514eece9c228d5dd0efcfc50aeea1669b4  99-cpu-dma-latency.rules
+c1b4bb607f324b34004a36df2cc3a3cfd8e2509767dcb08f0393bd4977986943e73c95fa606572d3863f72c63272bfe0f97abf58a26c3ec5adadbeca0142e4b7  99-volume-keys.rules
 8f0eeeae79ed4d6ed8e5b7c203802fa53b56e3668ffb0795762fd6540ae4c9bc9d0d15b16690e6b8b10465bcfeb865b8aa1ed5932e38db5786fd2ff075cfa47d  99-audio.conf
 d86361ce2248ac499d19217bee179f17d6fe51c979148e2c647edd9d4ee777d6327406c8607d2d4753fc2d367c560408fa1ab4e8fc922e01bacfcd52a9dcd8ea  audio.conf
 25cd112f526c6ddaf8b48b0e5786e643b7b1ae66b4425b7db97db8b501245bdf1f769e913aa22bdd7718f2742ec2eedf81e9be24fd30b8d1a7645eb07c0e4af0  99-audio-sysctl.conf

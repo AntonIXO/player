@@ -35,6 +35,7 @@ use player_library::Library;
 
 mod art;
 mod events;
+mod hw_keys;
 mod list;
 mod playback;
 mod state;
@@ -435,6 +436,22 @@ fn build_ui(app: &adw::Application) {
             while let Ok(hits) = search_rx.recv().await {
                 if hits.seq == ui.search_seq.get() {
                     render_search_results(&state, &ui, hits.results);
+                }
+            }
+        });
+    }
+
+    // evdev volume-key transport: works with screen off / app unfocused.
+    // vol-down → pause/resume, vol-up → next track.
+    {
+        let (hw_tx, hw_rx) = async_channel::unbounded::<hw_keys::HwKey>();
+        std::thread::spawn(move || hw_keys::run(hw_tx));
+        let (state, ui) = (state.clone(), ui.clone());
+        glib::spawn_future_local(async move {
+            while let Ok(key) = hw_rx.recv().await {
+                match key {
+                    hw_keys::HwKey::VolumeDown => toggle_play(&state, &ui),
+                    hw_keys::HwKey::VolumeUp => advance(&state, &ui, true),
                 }
             }
         });

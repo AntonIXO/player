@@ -1,0 +1,6 @@
+# Grant the 'audio' group read access to the gpio-keys input device so the
+# bit-perfect player can respond to hardware volume buttons without root.
+# gpio-keys is the kernel driver for hardware buttons (volume, power) on the
+# Poco F1 / SDM845. The player reads key events via evdev in a background
+# thread so pause/next work even with the screen off.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="gpio-keys", GROUP="audio", MODE="0660"

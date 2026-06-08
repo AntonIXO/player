@@ -14,3 +14,4 @@ player-library = { path = "../player-library" }
 gtk4.workspace = true
 libadwaita.workspace = true
 async-channel.workspace = true
+evdev = "0.13"

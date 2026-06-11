@@ -35,11 +35,22 @@ impl AlsaSink {
         let can_pause = {
             let hwc = pcm.hw_params_current()?;
             let actual_period = hwc.get_period_size()?;
+            let actual_buffer = hwc.get_buffer_size().unwrap_or(0);
             let can_pause = hwc.can_pause();
             let swp = pcm.sw_params_current()?;
             swp.set_start_threshold(actual_period)?;
             swp.set_avail_min(actual_period)?;
             pcm.sw_params(&swp)?;
+            // Diagnostics: `can_pause` decides the pause strategy (hardware pause
+            // vs. the silence keep-alive in the audio thread). Logged so a real
+            // Mojo 2 confirms which branch it takes — see audio_thread::pause.
+            eprintln!(
+                "[alsa] open device={device} fmt={} rate={} ch={} dop={} period={actual_period} buffer={actual_buffer} can_pause={can_pause}",
+                spec.fmt.label(),
+                spec.rate,
+                spec.channels,
+                spec.is_dop,
+            );
             can_pause
         };
 
@@ -64,7 +75,12 @@ impl AlsaSink {
     /// Recover from a write error, counting underruns (EPIPE) for diagnostics.
     fn recover(&self, e: alsa::Error) -> Result<()> {
         if e.errno() == libc::EPIPE {
-            self.xruns.set(self.xruns.get() + 1);
+            let n = self.xruns.get() + 1;
+            self.xruns.set(n);
+            // An underrun forces ALSA to re-prepare the stream — the same USB
+            // re-init that can surface as a noise burst. Flag it so a field log
+            // correlates any audible glitch with a real xrun.
+            eprintln!("[alsa] xrun #{n} recovered (EPIPE)");
         }
         self.pcm.try_recover(e, true)?;
         Ok(())
@@ -89,11 +105,17 @@ impl AlsaSink {
         Ok(())
     }
 
-    /// Pause or resume output. Bit-perfect: samples are never touched. When the
-    /// device supports hardware pause the DAC clock simply halts (ALSA's buffer
-    /// is preserved, so resume continues seamlessly); otherwise we fall back to
-    /// drop+prepare, which discards only ALSA's already-buffered audio (a brief
-    /// gap on resume) and never alters samples.
+    /// Pause or resume output via the device's hardware pause (the DAC clock
+    /// halts, ALSA's buffer is preserved, resume is seamless). Bit-perfect:
+    /// samples are never touched.
+    ///
+    /// Only meaningful when [`AlsaSink::can_pause`] is true. For devices that do
+    /// **not** support hardware pause (e.g. the Mojo 2), the audio thread does
+    /// **not** call this — it keeps the stream open and writes silence instead
+    /// (see `audio_thread::pause_until_resumed`), because `drop()`+`prepare()`
+    /// tears down and re-initializes the USB substream, which the Mojo 2 can turn
+    /// into a loud burst on resume. The `drop`/`prepare` fallback below is kept
+    /// only as a safety net for any other caller.
     pub fn pause(&self, enable: bool) -> Result<()> {
         if self.can_pause {
             self.pcm.pause(enable)?;

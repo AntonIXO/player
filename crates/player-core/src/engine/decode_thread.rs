@@ -29,6 +29,13 @@ use super::{Cmd, Ctl, Event};
 /// the DAC locks the marker pattern before real audio (avoids a start click).
 const DOP_PREROLL_MS: usize = 16;
 
+/// Milliseconds of PCM leading silence written when a PCM device opens on the
+/// interactive path, giving the USB DAC a moment to settle its clock before real
+/// audio (the PCM analogue of the DoP pre-roll; guards against a start/seek
+/// burst). Off for the blocking verifier so its golden bytes stay byte-identical
+/// to the v1 oracle — see [`SegmentWriter::enable_pcm_preroll`].
+const PCM_PREROLL_MS: usize = 20;
+
 /// Owns the current ring producer and emits segment-lifecycle control events.
 /// Shared by the blocking queue player and the interactive [`super::Player`].
 pub(crate) struct SegmentWriter {
@@ -38,6 +45,9 @@ pub(crate) struct SegmentWriter {
     /// Per-track frame the *next* opened segment starts at (0 normally, the
     /// landed frame after a seek). Consumed (reset to 0) on the next `Open`.
     next_pos_base: u64,
+    /// Whether to lead a freshly opened PCM segment with [`PCM_PREROLL_MS`] of
+    /// silence (interactive player only). DoP always gets its own pre-roll.
+    preroll_pcm: bool,
 }
 
 impl SegmentWriter {
@@ -47,7 +57,16 @@ impl SegmentWriter {
             prod: None,
             cur: None,
             next_pos_base: 0,
+            preroll_pcm: false,
         }
+    }
+
+    /// Enable a brief PCM leading-silence pre-roll at each device (re)open. Used
+    /// only by the interactive player; left off for the blocking verifier so its
+    /// output stays byte-identical to the v1 oracle the loopback tests compare
+    /// against.
+    pub(crate) fn enable_pcm_preroll(&mut self) {
+        self.preroll_pcm = true;
     }
 
     /// The producer to push `spec`'s bytes into. A new segment (a new ring and
@@ -73,12 +92,18 @@ impl SegmentWriter {
                 return None;
             }
             self.next_pos_base = 0;
-            // DoP: lead the segment with a few ms of DSD silence so the DAC locks
-            // the DoP marker pattern before real audio (prevents a start click).
-            // Leading silence only — the music samples are untouched.
+            // Lead the segment with a few ms of silence so the DAC settles before
+            // real audio. DoP: DSD-silence so the DAC locks the marker pattern
+            // (prevents a start click / PCM mis-read). PCM (interactive only):
+            // zeros so the USB clock settles after the device (re)open (guards a
+            // start/seek burst). Leading silence only — the music is untouched.
             if spec.is_dop {
                 let frames = (spec.rate as usize / 1000 * DOP_PREROLL_MS) & !1;
                 let silence = dop_silence(spec.fmt, spec.channels, frames);
+                let _ = push_block(&mut prod, &silence, spec.bytes_per_frame(), &mut || false);
+            } else if self.preroll_pcm {
+                let frames = spec.rate as usize / 1000 * PCM_PREROLL_MS;
+                let silence = vec![0u8; frames * spec.bytes_per_frame()];
                 let _ = push_block(&mut prod, &silence, spec.bytes_per_frame(), &mut || false);
             }
             self.prod = Some(prod); // dropping the old producer abandons its consumer
@@ -407,6 +432,7 @@ pub(crate) fn run_interactive(
     // Probe the output device once (it is free until the audio thread opens it).
     let formats = probe_formats(&device).unwrap_or_else(|_| DeviceFormats::all());
     let mut writer = SegmentWriter::new(ctl_tx);
+    writer.enable_pcm_preroll();
     let mut queue: VecDeque<Source> = VecDeque::new();
     let mut cur: Option<Track> = None;
     let mut paused = false;

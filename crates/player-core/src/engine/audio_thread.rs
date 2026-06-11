@@ -8,9 +8,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, TryRecvError};
 use rtrb::Consumer;
 
+use crate::dop::dop_silence;
 use crate::format::StreamSpec;
 use crate::rt::{self, CpuLatencyGuard};
 use crate::sink::AlsaSink;
@@ -176,7 +177,7 @@ fn play_segment(
         match ctl_rx.try_recv() {
             Ok(Ctl::Flush) => return Outcome::Flushed,
             Ok(Ctl::Quit) => return Outcome::Quit,
-            Ok(Ctl::Pause) => match pause_until_resumed(sink, ctl_rx, emit, pending) {
+            Ok(Ctl::Pause) => match pause_until_resumed(sink, spec, period, ctl_rx, emit, pending) {
                 Outcome::Drained => {} // resumed: fall through and keep playing
                 other => return other,
             },
@@ -225,37 +226,100 @@ fn play_segment(
     }
 }
 
-/// Hold the device paused (samples preserved on a hardware-pause-capable card;
-/// the drop+prepare fallback discards only ALSA's buffered audio). Blocks on the
-/// control channel until resumed, buffering any segment directives that arrive
-/// so the queue is not disturbed. Returns [`Outcome::Drained`] to mean *resumed,
-/// keep playing*; `Flushed`/`Quit` propagate.
+/// Hold the device paused until resumed, buffering any segment directives that
+/// arrive so the queue is not disturbed. Returns [`Outcome::Drained`] to mean
+/// *resumed, keep playing*; `Flushed`/`Quit` propagate.
+///
+/// Two strategies, chosen by the device's capability:
+///
+/// * **Hardware pause** (`can_pause`): the DAC clock halts, ALSA's buffer is
+///   preserved, resume is seamless. We block on the control channel.
+/// * **Silence keep-alive** (no hardware pause — e.g. the Mojo 2): we deliberately
+///   do **not** `drop()` the stream. `drop()`+`prepare()` tears down and
+///   re-initializes the USB substream, and on the Mojo 2 the re-init can emit a
+///   full-scale burst on resume (and, for DoP, the DAC loses its DSD lock and
+///   mis-reads the resumed words as ~0 dBFS PCM). Instead we keep the device open
+///   and the clock running by writing idle silence every period until resumed.
+///   The DAC never re-inits, so resume is seamless and burst-free.
+///
+/// **Bit-perfect:** only idle silence is written while paused; the music bytes
+/// still buffered in the ring are played back unaltered on resume.
 fn pause_until_resumed(
     sink: &AlsaSink,
+    spec: StreamSpec,
+    period: i64,
     ctl_rx: &Receiver<Ctl>,
     emit: &Arc<dyn Fn(Event) + Send + Sync>,
     pending: &mut VecDeque<Next>,
 ) -> Outcome {
-    if let Err(e) = sink.pause(true) {
-        emit(Event::Error(e.to_string()));
-    }
-    loop {
-        match ctl_rx.recv() {
-            Ok(Ctl::Resume) => {
-                if let Err(e) = sink.pause(false) {
-                    emit(Event::Error(e.to_string()));
+    if sink.can_pause() {
+        // Hardware pause: block until commanded.
+        if let Err(e) = sink.pause(true) {
+            emit(Event::Error(e.to_string()));
+        }
+        loop {
+            match ctl_rx.recv() {
+                Ok(Ctl::Resume) => {
+                    if let Err(e) = sink.pause(false) {
+                        emit(Event::Error(e.to_string()));
+                    }
+                    return Outcome::Drained;
                 }
+                Ok(Ctl::Flush) => return Outcome::Flushed,
+                Ok(Ctl::Quit) | Err(_) => return Outcome::Quit,
+                Ok(Ctl::Open {
+                    spec,
+                    consumer,
+                    pos_base,
+                }) => pending.push_back(Next::Open(spec, consumer, pos_base)),
+                Ok(Ctl::Finish { quit }) => pending.push_back(Next::Finish { quit }),
+                Ok(Ctl::Pause) => {} // already paused
+            }
+        }
+    }
+
+    // Silence keep-alive: hold the stream open by writing one period of silence
+    // per iteration. The blocking `writei` paces this loop to real time, so it
+    // does not busy-spin while waiting for the resume command.
+    eprintln!("[audio] pause: silence keep-alive (no hardware pause)");
+    let silence = pause_silence(spec, period);
+    loop {
+        match ctl_rx.try_recv() {
+            Ok(Ctl::Resume) => {
+                eprintln!("[audio] resume from silence keep-alive");
                 return Outcome::Drained;
             }
             Ok(Ctl::Flush) => return Outcome::Flushed,
-            Ok(Ctl::Quit) | Err(_) => return Outcome::Quit,
+            Ok(Ctl::Quit) => return Outcome::Quit,
             Ok(Ctl::Open {
                 spec,
                 consumer,
                 pos_base,
             }) => pending.push_back(Next::Open(spec, consumer, pos_base)),
             Ok(Ctl::Finish { quit }) => pending.push_back(Next::Finish { quit }),
-            Ok(Ctl::Pause) => {} // already paused
+            Ok(Ctl::Pause) => {}             // already paused
+            Err(TryRecvError::Empty) => {}   // nothing yet: write a period of silence
+            Err(TryRecvError::Disconnected) => return Outcome::Quit,
         }
+        if let Err(e) = sink.write_all_bytes(&silence) {
+            // A write error here means the device is unhappy; surface it and let
+            // the caller drain rather than spinning on silence forever.
+            emit(Event::Error(e.to_string()));
+            return Outcome::Drained;
+        }
+    }
+}
+
+/// One period of bit-perfect idle silence for `spec`, written repeatedly to hold
+/// a non-hardware-pause stream open. PCM → zeroed samples; DoP → valid
+/// DoP-silence (alternating `0x05`/`0xFA` markers, `0x69` payload) so the DAC
+/// keeps its DSD lock (all-zero words would have an invalid marker and break it).
+fn pause_silence(spec: StreamSpec, period: i64) -> Vec<u8> {
+    if spec.is_dop {
+        // Even frame count keeps the marker alternation continuous across periods.
+        let frames = (period.max(2) as usize) & !1;
+        dop_silence(spec.fmt, spec.channels, frames)
+    } else {
+        vec![0u8; period.max(1) as usize * spec.bytes_per_frame()]
     }
 }

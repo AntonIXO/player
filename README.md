@@ -52,6 +52,54 @@ current glib-rs (we use `async-channel` + `glib::spawn_future_local`); ALSA dire
 MMAP is fragile and unnecessary for bit-perfect (blocking `writei` is correct and
 robust) — both are noted as Phase-2 options.
 
+## Safety: pause/resume and the no-software-volume rule
+
+Bit-perfect means there is **deliberately no software volume** to clamp the output
+— volume is the DAC's hardware knob. That makes any path that could put a
+full-scale signal on the wire a genuine hazard, so the engine treats pause/resume
+defensively:
+
+- **Pause never tears the stream down.** The Mojo 2 (like most USB DACs) does not
+  support hardware pause, so the old code paused with `snd_pcm_drop()` and resumed
+  with `snd_pcm_prepare()`. That re-initializes the USB substream, and on the Mojo
+  2 the re-init can surface as a **loud burst on resume** (for DoP it is worse —
+  the DAC loses DSD lock and mis-reads the resumed words as near-full-scale PCM).
+  Instead, when a device lacks hardware pause the audio thread **keeps the device
+  open and writes idle silence** until resumed (`audio_thread::pause_until_resumed`)
+  — the clock never stops, the DAC never re-inits, resume is seamless and
+  burst-free. This stays bit-perfect: only silence is written while paused; the
+  buffered music is replayed unaltered. (PCM = zeros; DoP = valid `0x05`/`0xFA`
+  marker silence so the DAC keeps DSD lock.)
+- **Leading silence at every device open.** A freshly opened segment (track start,
+  seek, rate change) leads with a few ms of silence — DoP-silence so the DAC locks
+  the marker pattern, or PCM zeros (interactive player) so the USB clock settles —
+  before any real audio. Leading silence only; the music is untouched.
+- **USB-stack hardening (backstop).** Endpoint power-down/wake-up is a known source
+  of pops, so `snd_usb_audio.power_save=0` is set (kernel cmdline on-device,
+  `/etc/modprobe.d/audio.conf` otherwise), alongside the existing
+  `usbcore.autosuspend=-1`. On a **desktop** dev box, apply the same with:
+
+  ```sh
+  echo 0 | sudo tee /sys/module/snd_usb_audio/parameters/power_save     # now
+  printf 'options snd_usb_audio power_save=0\n' | \
+    sudo tee /etc/modprobe.d/hifi-mojo2.conf                            # persist
+  ```
+
+  `implicit_fb=1` and `autoclock=0` are **not** forced — the Mojo 2 is an async DAC
+  with its own feedback endpoint, so forcing implicit feedback can hurt rather than
+  help. Treat them as **test-only** toggles to try *only if* a burst still occurs
+  (`sudo modprobe -r snd_usb_audio; sudo modprobe snd_usb_audio implicit_fb=1`).
+- **Mojo 2 habits.** Engage **Lock Mode** while carrying the DAP (prevents stray
+  physical button presses), and make zero-volume-before-play a ritual: hold the
+  Mojo 2 `–` button until both `+`/`–` lights are unlit before starting playback.
+- **Diagnostics.** Each device open logs `[alsa] open … can_pause=…` (confirms which
+  pause strategy a DAC takes); entering/leaving the silence keep-alive logs
+  `[audio] pause: silence keep-alive` / `[audio] resume …`; and every recovered
+  underrun logs `[alsa] xrun #N recovered (EPIPE)` so an audible glitch can be
+  correlated with a real xrun.
+
+> **When testing pause/resume on real hardware, turn the Mojo 2 volume down first.**
+
 ## Build
 
 Needs `gtk4`, `libadwaita`, and `alsa-lib` dev packages.

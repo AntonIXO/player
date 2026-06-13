@@ -140,6 +140,9 @@ pub(crate) fn row_inner(
         ml.add_css_class("dim-label");
         ml.add_css_class("mono");
         ml.add_css_class("caption");
+        // Ellipsize so a long spec ("3:46 · FLAC · 44.1 kHz · 24-bit") can't pin a
+        // row (and thus the page) wider than a phone screen.
+        ml.set_ellipsize(gtk::pango::EllipsizeMode::End);
         row.append(&ml);
     }
 
@@ -266,6 +269,11 @@ pub(crate) fn format_chip(spec: &str) -> gtk::Box {
     let label = gtk::Label::new(Some("Bit-perfect"));
     let specl = gtk::Label::new(Some(spec));
     specl.add_css_class("spec");
+    // Let the spec ellipsize so the chip can shrink: a fixed-width chip would
+    // otherwise pin the whole Now Playing page wider than a phone screen, and
+    // AdwViewStack (sizes to its widest page) would then overflow every page.
+    // Shows the full spec when it fits; trims the tail only when truly narrow.
+    specl.set_ellipsize(gtk::pango::EllipsizeMode::End);
     chip.append(&check);
     chip.append(&label);
     chip.append(&specl);

@@ -235,9 +235,20 @@ pin a large minimum width:
 - **Pages with a text entry use `AdwToolbarView`** (Search does): entry + filters in
   `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
   the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks
-  — the entry stays put. An `AdwBreakpoint(max-height: 500px)` sets the bottom
-  `AdwViewSwitcherBar` `reveal=false` so the switcher steps aside for the keyboard instead
-  of double-stacking, and restores on close.
+  — the entry stays put.
+- **Do NOT add a height-keyed `AdwBreakpoint` to hide the switcher for the OSK.** It seems
+  tidy ("steps the switcher aside for the keyboard") but on Phosh it *flickers the keyboard
+  open/closed*: the OSK resizes the window, the `max-height` breakpoint crosses its
+  threshold and toggles a bottom bar's `reveal`, that changes content height, which
+  re-triggers phoc's `text-input-v3` resize — an oscillation that retracts the OSK. The
+  switcher just stays above the OSK (harmless "double chrome"). Keyboard-safety comes from
+  the `AdwToolbarView` structure, not from moving chrome while the OSK animates.
+- **No label that shows a variable-length spec may be un-ellipsized.** The bit-perfect
+  format chip (`widgets::format_chip`) and list-row meta (`row_inner`) ellipsize their spec
+  — otherwise the full `signal_spec`/`format_spec` ("24-bit · 96 kHz · FLAC") pins a min
+  width wider than the phone and (via the homogeneous `ViewStack`) shifts/clips every page.
+- The 3-up Albums grid floor is tuned (`album_cover_px`, cover floor 80) so the page min
+  width lands ~326 px — comfortably under 360 even on a slightly narrower/scaled device.
 - Touch targets ≥ ~44 px; secondary controls may be smaller (toggles ~36).
 
 **Debugging over-wide layout:** after `window.present()`, a temporary

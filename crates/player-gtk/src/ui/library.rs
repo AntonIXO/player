@@ -259,7 +259,7 @@ fn sort_label_text(s: Sort) -> &'static str {
 /// rebuilds the grid only every few steps. Clamped so covers never get unusably
 /// small on a phone or huge on a wide monitor.
 pub(crate) fn album_cover_px(window_w: i32) -> i32 {
-    let raw = ((window_w - 96).max(120) / 3).clamp(88, 240);
+    let raw = ((window_w - 104).max(120) / 3).clamp(80, 240);
     (raw / 8) * 8
 }
 

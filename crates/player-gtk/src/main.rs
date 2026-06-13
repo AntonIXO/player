@@ -38,6 +38,7 @@ mod events;
 mod hw_keys;
 mod list;
 mod playback;
+mod standby;
 mod state;
 mod ui;
 mod widgets;
@@ -441,20 +442,44 @@ fn build_ui(app: &adw::Application) {
         });
     }
 
+    // Standby battery saver (Poco F1): suspend after an idle timeout when no USB
+    // DAC is connected. Off unless PLAYER_STANDBY_TIMEOUT_SECS is set, so the
+    // desktop dev box is never affected.
+    let standby = standby::Standby::from_env();
+
     // evdev volume-key transport: works with screen off / app unfocused.
-    // vol-down → pause/resume, vol-up → next track.
+    // vol-down → pause/resume, vol-up → next track. Also counts as activity.
     {
         let (hw_tx, hw_rx) = async_channel::unbounded::<hw_keys::HwKey>();
         std::thread::spawn(move || hw_keys::run(hw_tx));
         let (state, ui) = (state.clone(), ui.clone());
+        let standby = standby.clone();
         glib::spawn_future_local(async move {
             while let Ok(key) = hw_rx.recv().await {
+                if let Some(sb) = &standby {
+                    sb.note_activity();
+                }
                 match key {
                     hw_keys::HwKey::VolumeDown => toggle_play(&state, &ui),
                     hw_keys::HwKey::VolumeUp => advance(&state, &ui, true),
                 }
             }
         });
+    }
+
+    // Any window input (touch/key/motion) is activity; then start the
+    // idle→suspend evaluator on the main loop.
+    if let Some(sb) = standby {
+        let legacy = gtk::EventControllerLegacy::new();
+        {
+            let sb = sb.clone();
+            legacy.connect_event(move |_, _| {
+                sb.note_activity();
+                glib::Propagation::Proceed
+            });
+        }
+        ui.window.add_controller(legacy);
+        sb.start(state.clone());
     }
 
     refresh_library(&state, &ui);

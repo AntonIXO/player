@@ -14,7 +14,7 @@ pub mod sink;
 
 pub use convert::{append_bytes, OutFrames, Packer};
 pub use decode::Decoder;
-pub use devices::{auto_pick, list_devices, DeviceInfo, DeviceKind};
+pub use devices::{auto_pick, has_usb_dac, list_devices, DeviceInfo, DeviceKind};
 pub use dop::DopPacker;
 pub use dsd::{is_dsd_path, open_dsd, DsdSource, DsdSpec};
 pub use engine::{

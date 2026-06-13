@@ -134,3 +134,11 @@ pub fn auto_pick() -> Option<DeviceInfo> {
         .cloned()
         .or_else(|| devices.into_iter().next())
 }
+
+/// Whether a USB DAC is currently connected — any enumerated bit-perfect output
+/// classified as [`DeviceKind::Usb`]. Used by the GTK shell's standby logic to
+/// decide when the player is truly idle (no external DAC, so nobody can be
+/// listening). Best-effort, reusing the same classification as [`list_devices`].
+pub fn has_usb_dac() -> bool {
+    list_devices().iter().any(DeviceInfo::is_usb)
+}

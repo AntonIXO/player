@@ -42,8 +42,8 @@ crossbeam-channel = "0.5.15"
 thiserror = "2"
 libc = "0.2.186"
 clap = { version = "4.6.1", features = ["derive"] }
-gtk4 = { version = "0.11.3", features = ["v4_16"] }
-libadwaita = { version = "0.9.1", features = ["v1_6"] }
+gtk4 = { version = "0.11.3", features = ["v4_14"] }
+libadwaita = { version = "0.9.1", features = ["v1_5"] }
 async-channel = "2.5.0"
 # DSD: .dsf/.dff frame reader (interleaved, MSB-first); the SACD .iso path is
 # the in-tree `sacd` crate.

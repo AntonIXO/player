@@ -10,7 +10,7 @@ use player_library::{fmt_dur_ms, Track};
 
 use crate::state::{SharedState, SharedUi};
 use crate::widgets::{
-    art_widget, circle, clamp, fill, format_chip, status_page, wrap_scroller, ART_HERO, ART_MINI,
+    art_widget, circle, clamp, fill, format_chip, status_page, ART_HERO, ART_MINI,
 };
 
 pub(crate) struct Np {
@@ -68,20 +68,20 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     // secondary toggle row — shuffle / repeat as pills, above the seek bar
     // (Poweramp-Adwaita design: the transport row is reserved for playback).
-    let shuffle = circle("media-playlist-shuffle-symbolic", 40, "Shuffle");
+    let shuffle = circle("media-playlist-shuffle-symbolic", 36, "Shuffle");
     shuffle.add_css_class("pill-toggle");
-    let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
+    let repeat = circle("media-playlist-repeat-symbolic", 36, "Repeat");
     repeat.add_css_class("pill-toggle");
     // Heart the current track (filled/accented when loved). Disabled until a
     // library-indexed track is playing.
-    let love = circle("emblem-favorite-symbolic", 40, "Love this track");
+    let love = circle("emblem-favorite-symbolic", 36, "Love this track");
     love.add_css_class("pill-toggle");
     love.set_sensitive(false);
     // Jump to the current track's artist / album detail page.
-    let goto_artist = circle("avatar-default-symbolic", 40, "Go to artist");
+    let goto_artist = circle("avatar-default-symbolic", 36, "Go to artist");
     goto_artist.add_css_class("pill-toggle");
     goto_artist.set_sensitive(false);
-    let goto_album = circle("media-optical-symbolic", 40, "Go to album");
+    let goto_album = circle("media-optical-symbolic", 36, "Go to album");
     goto_album.add_css_class("pill-toggle");
     goto_album.set_sensitive(false);
     let toggles = gtk::Box::new(Orientation::Horizontal, 9);
@@ -93,13 +93,13 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     toggles.append(&goto_album);
 
     // transport: prev · −10s · play · +10s · next
-    let prev = circle("media-skip-backward-symbolic", 48, "Previous");
-    let rewind = circle("media-seek-backward-symbolic", 48, "Back 10 seconds");
-    let play = circle("media-playback-start-symbolic", 72, "Play");
+    let prev = circle("media-skip-backward-symbolic", 44, "Previous");
+    let rewind = circle("media-seek-backward-symbolic", 44, "Back 10 seconds");
+    let play = circle("media-playback-start-symbolic", 64, "Play");
     play.add_css_class("play-hero");
     play.remove_css_class("flat");
-    let fwd = circle("media-seek-forward-symbolic", 48, "Forward 10 seconds");
-    let next = circle("media-skip-forward-symbolic", 48, "Next");
+    let fwd = circle("media-seek-forward-symbolic", 44, "Forward 10 seconds");
+    let next = circle("media-skip-forward-symbolic", 44, "Next");
     let transport = gtk::Box::new(Orientation::Horizontal, 4);
     transport.set_halign(gtk::Align::Center);
     for b in [&prev, &rewind, &play, &fwd, &next] {
@@ -111,12 +111,17 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     // Tight vertical rhythm so the whole Playing page fits a phone screen without
     // scrolling (the volume-is-hardware note was dropped for the same reason).
+    // `valign: Fill` + a vexpand spacer let the content distribute over the page
+    // height: the upper cluster sits at the top, the format chip docks to the
+    // bottom (the design's `justify-content: space-between`) — no fixed scroll
+    // height, so the page never scrolls at the Poco F1 budget.
     let content = gtk::Box::new(Orientation::Vertical, 10);
-    content.set_valign(gtk::Align::Center);
+    content.set_valign(gtk::Align::Fill);
+    content.set_vexpand(true);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
-    content.set_margin_start(28);
-    content.set_margin_end(28);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
     content.append(&art);
     let titles = gtk::Box::new(Orientation::Vertical, 3);
     titles.append(&title);
@@ -128,6 +133,9 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     seekbox.append(&times);
     content.append(&seekbox);
     content.append(&transport);
+    let footer_spacer = gtk::Box::new(Orientation::Vertical, 0);
+    footer_spacer.set_vexpand(true);
+    content.append(&footer_spacer);
     content.append(&format);
 
     // empty state — a standard Adwaita status page.
@@ -139,9 +147,13 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
-    // Clamp keeps the hero readable on wide windows; no effect at phone width.
-    let content_scroller = wrap_scroller(&clamp(&content));
-    stack.add_named(&content_scroller, Some("content"));
+    // No scroller: the page is budgeted to fit the phone viewport and must never
+    // scroll. `clamp` is kept (a no-op at phone width) so the seek bar/hero stay a
+    // readable width on a wide desktop window; AdwClampLayout fills the height it's
+    // given, so `content`'s vexpand spacer still docks the format chip to the bottom.
+    let content_page = clamp(&content);
+    content_page.set_vexpand(true);
+    stack.add_named(&content_page, Some("content"));
     stack.set_visible_child_name("empty");
 
     (

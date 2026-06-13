@@ -66,10 +66,14 @@ pub(crate) fn build_search(
         buttons.push((f, b));
     }
 
-    let top = gtk::Box::new(Orientation::Vertical, 0);
-    top.set_margin_top(10);
-    top.set_margin_start(16);
-    top.set_margin_end(16);
+    // Entry + filter bar pinned in a top bar, the results as the scrolling
+    // content: an AdwToolbarView tracks the bottom safe-area inset, so when phoc
+    // (Phosh) resizes the window for the on-screen keyboard, only the results
+    // scroller shrinks — the entry stays put and tappable (no reflow jump).
+    let top = gtk::Box::new(Orientation::Vertical, 6);
+    top.set_margin_top(8);
+    top.set_margin_start(12);
+    top.set_margin_end(12);
     top.append(&entry);
     top.append(&segbar);
 
@@ -80,9 +84,10 @@ pub(crate) fn build_search(
     results.set_margin_bottom(20);
     let results_scroller = wrap_scroller(&clamp(&results));
 
-    let page = gtk::Box::new(Orientation::Vertical, 0);
-    page.append(&top);
-    page.append(&results_scroller);
+    let page = adw::ToolbarView::new();
+    page.set_top_bar_style(adw::ToolbarStyle::Flat);
+    page.add_top_bar(&top);
+    page.set_content(Some(&results_scroller));
 
     (page.upcast(), entry, results, buttons)
 }

@@ -30,8 +30,8 @@ pub(crate) fn build_mini(
     let play = circle("media-playback-start-symbolic", 40, "Play");
 
     let row = gtk::Box::new(Orientation::Horizontal, 11);
-    row.set_margin_top(8);
-    row.set_margin_bottom(8);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
     row.set_margin_start(12);
     row.set_margin_end(12);
     row.append(&art);

@@ -43,8 +43,8 @@ button.play-hero:active { transform: scale(0.96); }
 /* Virtualised browse views (GtkGridView / GtkListView factories). The class is
    on the view; `> child` / `> row` style the per-item slots GTK wraps around our
    widgets, restoring the grid gaps + tappable hover the FlowBox/ListBox had. */
-.album-grid { padding: 12px; }
-.album-grid > child { padding: 4px; border-radius: 12px; }
+.album-grid { padding: 8px; }
+.album-grid > child { padding: 3px; border-radius: 12px; }
 .browse-list { padding: 8px 16px 20px; }
 .browse-list > row { border-radius: 10px; }
 .browse-list > row:hover { background: alpha(@window_fg_color, 0.06); }
@@ -80,6 +80,7 @@ button.loved image { color: @error_color; }
   font-size: 9.5px;
   min-height: 0;
   min-width: 14px;
+  max-width: 18px;
   padding: 1px 0;
   background: none;
   box-shadow: none;

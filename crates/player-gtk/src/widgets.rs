@@ -17,7 +17,7 @@ use crate::art::ArtCache;
 /// Album-art sizes used across the shell (list row · mini-player · hero).
 pub(crate) const ART_ROW: i32 = 46;
 pub(crate) const ART_MINI: i32 = 40;
-pub(crate) const ART_HERO: i32 = 264;
+pub(crate) const ART_HERO: i32 = 168;
 
 pub(crate) fn add_page(
     stack: &adw::ViewStack,

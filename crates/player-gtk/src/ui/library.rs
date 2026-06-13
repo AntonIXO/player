@@ -132,21 +132,27 @@ pub(crate) fn build_library() -> LibUi {
         sort_btn.set_popover(Some(&pop));
     }
 
-    let header = gtk::Box::new(Orientation::Horizontal, 12);
+    let header = gtk::Box::new(Orientation::Horizontal, 8);
     header.set_margin_top(12);
     header.set_margin_start(16);
     header.set_margin_end(16);
     header.set_margin_bottom(8);
-    // Keep the segmented control centred, with the sort menu pinned to the right.
-    let lead = gtk::Box::new(Orientation::Horizontal, 0);
-    lead.set_hexpand(true);
-    let trail = gtk::Box::new(Orientation::Horizontal, 0);
-    trail.set_hexpand(true);
-    trail.append(&sort_btn);
+    // The five browse tabs are wider than a ~360 px phone screen. Make the
+    // segmented control horizontally scrollable so it never pins a minimum width
+    // wider than the screen: AdwViewStack sizes to its widest page, so a too-wide
+    // Library page would otherwise force *every* page wide and overflow the whole
+    // app on the Poco F1. The scroller hexpands, so the bar still centres when
+    // there's room (desktop) and only scrolls (swipe) when there isn't (phone);
+    // the sort menu stays pinned to the right. (Earlier a *centred, non-scrolling*
+    // bar with hexpand spacers was used — that's exactly what pinned the 521 px
+    // minimum.)
+    let segscroll = gtk::ScrolledWindow::new();
+    segscroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    segscroll.set_hexpand(true);
+    segscroll.set_child(Some(&segbar));
     sort_btn.set_halign(gtk::Align::End);
-    header.append(&lead);
-    header.append(&segbar);
-    header.append(&trail);
+    header.append(&segscroll);
+    header.append(&sort_btn);
 
     let browse = gtk::Box::new(Orientation::Vertical, 0);
     browse.append(&header);

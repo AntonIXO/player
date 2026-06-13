@@ -203,6 +203,49 @@ cross the thread boundary via `async-channel` + `glib::spawn_future_local` (note
 the queue track-by-track in the UI (advancing on `Ended`); a fully engine-owned queue
 with gapless-through-UI is the next deferred step (`FURTHER.md` 3.7 / Phase 4).
 
+## GTK shell: mobile / adaptive layout (Phosh / Poco F1)
+
+**The UI is mobile-first.** Phosh renders the Poco F1's 1080×2246 panel at 3× →
+**~360×749 logical px**, and maximises app windows, so every screen must *fit* ~360 px
+wide. The fix is always to **budget to that viewport** — never `scale-to-fit`, `GDK_SCALE`,
+or per-app phoc hacks (they blur the whole app and mask the real bug). Default window is
+phone-portrait `360×720`; it stays resizable on desktop (the primary dev box).
+
+**The trap: `AdwViewStack` sizes to its *widest* page.** It is effectively homogeneous, so
+a *single* page whose minimum width exceeds ~360 forces **every** page that wide and the
+whole app overflows — you'll see `Adwaita-WARNING: AdwToastOverlay exceeds
+AdwApplicationWindow width: requested NNN px, 360 px available` and the content visibly
+shifts/clips. So **every page must be able to shrink to ≤360**, and nothing in a page may
+pin a large minimum width:
+- A fixed **N-up grid of fixed-size cells** pins `N × cell + padding`. The Albums grid is
+  3-up with covers sized to the window width (`ui::library::album_cover_px`, clamped/
+  quantised) and rebuilt on resize — keep `3 × cover + padding ≤ 360` at the phone floor.
+- A **non-shrinking control row** (e.g. a `.linked` segmented bar of text tabs) pins its
+  natural width. Make such chrome **horizontally scrollable**: the Library browse tabs live
+  in a `ScrolledWindow` with `PolicyType::External` (hexpand, scrollbar hidden) so the bar
+  centres when there's room and swipes when narrow — it never pins a min wider than the
+  screen.
+
+**Per-screen patterns already in place — follow them for new screens:**
+- **Now Playing is budgeted to never scroll.** No `ScrolledWindow`; the content box is
+  `valign: Fill` + `vexpand` with a `vexpand` spacer that **docks the footer (format chip)
+  to the bottom** (an `AdwClamp` is kept as the direct stack child — it caps width on
+  desktop and `AdwClampLayout` fills height, so the spacer still works). The hero art
+  (`ART_HERO`) is kept small enough that the stack fits the vertical budget.
+- **Pages with a text entry use `AdwToolbarView`** (Search does): entry + filters in
+  `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
+  the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks
+  — the entry stays put. An `AdwBreakpoint(max-height: 500px)` sets the bottom
+  `AdwViewSwitcherBar` `reveal=false` so the switcher steps aside for the keyboard instead
+  of double-stacking, and restores on close.
+- Touch targets ≥ ~44 px; secondary controls may be smaller (toggles ~36).
+
+**Debugging over-wide layout:** after `window.present()`, a temporary
+`glib::timeout_add_local_once` that calls `widget.measure(Orientation::Horizontal, -1)` on
+each `ViewStack` page (and suspect sub-widgets) and `eprintln!`s min/nat pinpoints the
+offending widget instantly — far faster than eyeballing screenshots. Remove it before
+committing.
+
 ## Cross-compiling for the Poco F1 (aarch64)
 
 Headless crates cross-compile; **player-gtk is built on-device** (postmarketOS ships

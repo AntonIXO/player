@@ -242,6 +242,19 @@ fn build_ui(app: &adw::Application) {
     toasts.set_child(Some(&toolbar));
     window.set_content(Some(&toasts));
 
+    // Collapse the bottom view switcher when the window gets short — chiefly when
+    // the on-screen keyboard opens on Search and phoc shrinks the window, which
+    // would otherwise stack the switcher *and* the keyboard at the bottom. The
+    // breakpoint sets `reveal=false` while short and restores the default
+    // `reveal(true)` when the keyboard closes. No `scale-to-fit` hack needed.
+    let switcher_bp = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxHeight,
+        500.0,
+        adw::LengthUnit::Px,
+    ));
+    switcher_bp.add_setter(&switcher, "reveal", Some(&false.to_value()));
+    window.add_breakpoint(switcher_bp);
+
     let ui: SharedUi = Rc::new(Ui {
         window: window.clone(),
         toasts,

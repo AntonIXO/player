@@ -37,20 +37,19 @@ impl Packer {
         match self.fmt {
             AlsaFmt::S16 => {
                 self.s16.clear();
-                self.s16.reserve(full.len());
-                for &s in full {
-                    self.s16.push((s >> 16) as i16);
-                }
+                // Optimization: extend from an iterator eliminates bounds checks on every push,
+                // letting LLVM auto-vectorize the downshift loop cleanly.
+                self.s16.extend(full.iter().map(|&s| (s >> 16) as i16));
                 OutFrames::S16(&self.s16)
             }
             AlsaFmt::S24_3 => {
                 self.s24.clear();
+                // Optimization: extend_from_slice locally in a loop over pre-allocated Vec
+                // avoids the 3x per-sample bounds checks of Vec::push.
                 self.s24.reserve(full.len() * 3);
                 for &s in full {
                     let v = s >> 8; // full-scale i32 -> native 24-bit value
-                    self.s24.push(v as u8);
-                    self.s24.push((v >> 8) as u8);
-                    self.s24.push((v >> 16) as u8);
+                    self.s24.extend_from_slice(&[v as u8, (v >> 8) as u8, (v >> 16) as u8]);
                 }
                 OutFrames::S24(&self.s24)
             }

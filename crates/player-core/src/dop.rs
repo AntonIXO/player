@@ -108,11 +108,19 @@ impl DopPacker {
 
         // 2) Emit every whole frame in the remaining input.
         let whole = (input.len() / frame_in) * frame_in;
-        let mut i = 0;
-        while i < whole {
-            self.emit_frame(&input[i..i + frame_in]);
-            i += frame_in;
+
+        let out_bytes_per_frame = match self.fmt {
+            AlsaFmt::S24_3 => 3 * self.channels,
+            AlsaFmt::S32 => 4 * self.channels,
+            AlsaFmt::S16 => unreachable!(),
+        };
+        // Optimization: Pre-allocate capacity to avoid bounds checks
+        self.out.reserve((whole / frame_in) * out_bytes_per_frame);
+
+        for frame in input[..whole].chunks_exact(frame_in) {
+            self.emit_frame(frame);
         }
+        let i = whole;
 
         // 3) Stash the remainder for next time.
         if i < input.len() {

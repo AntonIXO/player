@@ -44,13 +44,13 @@ impl Packer {
             }
             AlsaFmt::S24_3 => {
                 self.s24.clear();
-                // Optimization: extend_from_slice locally in a loop over pre-allocated Vec
-                // avoids the 3x per-sample bounds checks of Vec::push.
+                // Optimization: extend from an iterator eliminates bounds checks on every push
+                // and helps LLVM optimize better.
                 self.s24.reserve(full.len() * 3);
-                for &s in full {
+                self.s24.extend(full.iter().flat_map(|&s| {
                     let v = s >> 8; // full-scale i32 -> native 24-bit value
-                    self.s24.extend_from_slice(&[v as u8, (v >> 8) as u8, (v >> 16) as u8]);
-                }
+                    [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+                }));
                 OutFrames::S24(&self.s24)
             }
             // S32: the input already is the wire format; no copy needed.

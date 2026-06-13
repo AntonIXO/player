@@ -220,6 +220,14 @@ pin a large minimum width:
 - A fixed **N-up grid of fixed-size cells** pins `N × cell + padding`. The Albums grid is
   3-up with covers sized to the window width (`ui::library::album_cover_px`, clamped/
   quantised) and rebuilt on resize — keep `3 × cover + padding ≤ 360` at the phone floor.
+  **Gotcha:** `window.width()` is the *default* (360) during `build_ui` and only becomes
+  the real value after the compositor configures the surface — and Phosh often maximises to
+  a logical width *wider* than 360 (depends on the device scale). So anything sized from the
+  width must recompute *after the surface settles*: `main.rs` runs a deferred
+  `timeout_add_local_once` recompute (300 ms / 1200 ms) on top of the `default-width` /
+  `maximized` notifies, else covers stay small until the first resize/re-sort. Always budget
+  the *minimum* width to ≤360 (so it never overflows a true-360 device) but derive actual
+  sizes from the real allocated width.
 - A **non-shrinking control row** (e.g. a `.linked` segmented bar of text tabs) pins its
   natural width. Make such chrome **horizontally scrollable**: the Library browse tabs live
   in a `ScrolledWindow` with `PolicyType::External` (hexpand, scrollbar hidden) so the bar
@@ -227,11 +235,13 @@ pin a large minimum width:
   screen.
 
 **Per-screen patterns already in place — follow them for new screens:**
-- **Now Playing is budgeted to never scroll.** No `ScrolledWindow`; the content box is
-  `valign: Fill` + `vexpand` with a `vexpand` spacer that **docks the footer (format chip)
-  to the bottom** (an `AdwClamp` is kept as the direct stack child — it caps width on
-  desktop and `AdwClampLayout` fills height, so the spacer still works). The hero art
-  (`ART_HERO`) is kept small enough that the stack fits the vertical budget.
+- **Now Playing is a single centred column** (matching the design's `NowPlayingView`):
+  hero art (`ART_HERO` = 208) → titles → toggles → seek → transport → format chip, wrapped
+  in `clamp(content)` with `valign: Center` as the stack child (the clamp caps width on a
+  wide desktop; centring balances the cluster on a tall phone). **No `ScrolledWindow` and no
+  `vexpand` dock-to-bottom spacer** — the device screen is *tall*, so a spacer just left a
+  big empty gap with a lonely chip at the bottom (looked broken). The cluster measures
+  ~553 px tall, well under the budget; don't add tall extras and re-check the height fits.
 - **Pages with a text entry use `AdwToolbarView`** (Search does): entry + filters in
   `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
   the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks

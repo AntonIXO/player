@@ -109,19 +109,16 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     let format = gtk::Box::new(Orientation::Horizontal, 8);
     format.set_halign(gtk::Align::Center);
 
-    // Tight vertical rhythm so the whole Playing page fits a phone screen without
-    // scrolling (the volume-is-hardware note was dropped for the same reason).
-    // `valign: Fill` + a vexpand spacer let the content distribute over the page
-    // height: the upper cluster sits at the top, the format chip docks to the
-    // bottom (the design's `justify-content: space-between`) — no fixed scroll
-    // height, so the page never scrolls at the Poco F1 budget.
-    let content = gtk::Box::new(Orientation::Vertical, 10);
-    content.set_valign(gtk::Align::Fill);
-    content.set_vexpand(true);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(24);
-    content.set_margin_end(24);
+    // A single centred column (matching the design's NowPlayingView): hero art,
+    // titles, toggles, seek, transport, format chip — stacked with an airy rhythm
+    // and centred vertically in the page (see the `clamp` valign below). No
+    // dock-to-bottom spacer: the device screen is tall, so a spacer just left a
+    // big empty gap with a lonely chip at the bottom.
+    let content = gtk::Box::new(Orientation::Vertical, 14);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
     content.append(&art);
     let titles = gtk::Box::new(Orientation::Vertical, 3);
     titles.append(&title);
@@ -133,9 +130,6 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     seekbox.append(&times);
     content.append(&seekbox);
     content.append(&transport);
-    let footer_spacer = gtk::Box::new(Orientation::Vertical, 0);
-    footer_spacer.set_vexpand(true);
-    content.append(&footer_spacer);
     content.append(&format);
 
     // empty state — a standard Adwaita status page.
@@ -147,12 +141,12 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
-    // No scroller: the page is budgeted to fit the phone viewport and must never
-    // scroll. `clamp` is kept (a no-op at phone width) so the seek bar/hero stay a
-    // readable width on a wide desktop window; AdwClampLayout fills the height it's
-    // given, so `content`'s vexpand spacer still docks the format chip to the bottom.
+    // Centre the cluster vertically in the page (`valign: Center`, no vexpand) so
+    // it sits balanced on a tall phone screen rather than docked to the top. The
+    // `clamp` also caps the width so the seek bar/hero stay readable on a wide
+    // desktop window. No scroller — the cluster fits the vertical budget.
     let content_page = clamp(&content);
-    content_page.set_vexpand(true);
+    content_page.set_valign(gtk::Align::Center);
     stack.add_named(&content_page, Some("content"));
     stack.set_visible_child_name("empty");
 

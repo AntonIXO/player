@@ -320,7 +320,18 @@ fn build_ui(app: &adw::Application) {
         let rescale = Rc::new(rescale);
         let r1 = rescale.clone();
         ui.window.connect_default_width_notify(move |_| r1());
-        ui.window.connect_maximized_notify(move |_| rescale());
+        let r2 = rescale.clone();
+        ui.window.connect_maximized_notify(move |_| r2());
+        // The initial refresh_library sizes the 3-up covers from the *default*
+        // width (360), because the compositor hasn't configured the real surface
+        // size yet — and on Phosh neither default-width nor maximized notify
+        // reliably fires with the final (maximised, often wider) width. Recompute
+        // once the allocation has settled so the covers use the true width on
+        // first paint, instead of only correcting after the user re-sorts.
+        for delay in [300u32, 1200] {
+            let r = rescale.clone();
+            glib::timeout_add_local_once(Duration::from_millis(delay as u64), move || r());
+        }
     }
 
     // header search toggle → Search page + focus the entry

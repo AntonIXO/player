@@ -1,0 +1,96 @@
+#!/bin/sh
+# systemd system-sleep hook for the bit-perfect player (Poco F1 / beryllium).
+# Runs as root around suspend/resume: systemd calls it as `$1=pre|post  $2=<op>`.
+#
+# Why this exists — the standby battery fix
+# -----------------------------------------
+# beryllium forces the USB controller into host mode (dr_mode=host, kernel patch
+# 0002) with an always-on VBUS boost (patch 0005), because the device is a
+# dedicated USB-DAC player and the OTG role-switch is broken. Side effect: the
+# dwc3 controller's power domain (usb30_prim_gdsc) permanently votes on the SoC
+# CX rail, so RPMh never collapses CX during suspend-to-idle and the phone burns
+# ~150 mA screen-off (~30%/night) even with no DAC attached. (A stock SDM845 such
+# as the OnePlus 6 reaches a far lower s2idle; the forced-host patch is the delta.)
+#
+# The player only ever suspends when NO DAC is connected and nothing is playing
+# (standby.rs holds a logind sleep-inhibitor otherwise), so around that window we
+# can safely release the USB host controller and let CX collapse:
+#
+#   pre  <suspend>:  if no USB-audio device is attached, unbind the dwc3-qcom glue
+#                    (drops the GDSC vote + clocks + PHY before the kernel's own
+#                    device-suspend phase, which on its own does NOT release the
+#                    vote in host mode), then quiesce the radios.
+#   post <suspend>:  rebind the controller (comes back as host: dr_mode=host lives
+#                    in the DT), re-assert the audio environment (host mode, gold-
+#                    core governors, threaded-IRQ RT pinning) BEFORE any DAC reopen,
+#                    then bring the radios back.
+#
+# The audio sample path is never touched. Teardown only ever runs with the port
+# empty; on resume the DAC re-enumerates in ~1-2 s. Every step degrades quietly if
+# a node is absent, so this is safe across kernel revisions. VBUS shedding (the
+# smaller, separate boost-into-empty-port waste) is a follow-up that makes the
+# regulator consumer-driven so it drops together with the controller.
+set -u
+
+GLUE_DRV=/sys/bus/platform/drivers/dwc3-qcom
+STATE=/run/hifi-player-usb-unbound      # tmpfs: survives s2idle, cleared on reboot
+
+log() { logger -t hifi-sleep "$@" 2>/dev/null || true; }
+
+# True if a USB Audio Class device is currently enumerated (a DAC is plugged in).
+# Independent root-side mirror of player-core has_usb_dac(): if a DAC is somehow
+# attached when a suspend is requested (e.g. a manual `systemctl suspend` that
+# bypassed the app's inhibitor), never tear USB down under it.
+usb_audio_present() {
+	for f in /sys/bus/usb/devices/*/bInterfaceClass; do
+		[ -r "$f" ] || continue
+		[ "$(cat "$f" 2>/dev/null)" = "01" ] && return 0   # 01h = Audio
+	done
+	return 1
+}
+
+release_usb_host() {
+	if usb_audio_present; then
+		log "DAC present — leaving USB host powered"
+		return
+	fi
+	: > "$STATE"
+	for link in "$GLUE_DRV"/*; do
+		dev=${link##*/}
+		case "$dev" in bind|unbind|uevent|module) continue ;; esac
+		[ -L "$link" ] || continue              # bound devices appear as symlinks
+		if echo "$dev" > "$GLUE_DRV/unbind" 2>/dev/null; then
+			echo "$dev" >> "$STATE"
+			log "released USB host glue $dev (CX-rail vote dropped)"
+		fi
+	done
+}
+
+restore_usb_host() {
+	[ -f "$STATE" ] || return
+	while read -r dev; do
+		[ -n "$dev" ] || continue
+		echo "$dev" > "$GLUE_DRV/bind" 2>/dev/null && \
+			log "rebound USB host glue $dev"
+	done < "$STATE"
+	rm -f "$STATE"
+}
+
+case "${1:-}" in
+	pre)
+		release_usb_host
+		rfkill block wifi 2>/dev/null
+		rfkill block bluetooth 2>/dev/null
+		log "pre-suspend complete"
+		;;
+	post)
+		restore_usb_host
+		# Re-assert host mode + governors + IRQ RT pinning BEFORE any DAC reopen.
+		[ -x /usr/bin/hifi-player-audio-setup ] && \
+			/usr/bin/hifi-player-audio-setup start 2>/dev/null
+		rfkill unblock wifi 2>/dev/null
+		rfkill unblock bluetooth 2>/dev/null
+		log "post-resume complete"
+		;;
+esac
+exit 0

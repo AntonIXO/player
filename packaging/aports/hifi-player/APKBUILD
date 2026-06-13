@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=5
+pkgrel=7
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -30,6 +30,7 @@ options="net !check"
 source="
 	hifi-player-audio-setup
 	hifi-player-audio-setup.service
+	hifi-player-sleep-hook
 	hifi-player.preset
 	hifi-player.desktop
 	hifi-player.svg
@@ -82,6 +83,12 @@ package() {
 	install -Dm644 "$srcdir"/hifi-player.preset \
 		"$pkgdir"/usr/lib/systemd/system-preset/80-hifi-player.preset
 
+	# system-sleep hook: re-assert the audio environment on resume (before any
+	# DAC reopen) and quiesce WiFi during sleep so s2idle is effective. Pairs
+	# with the player's standby battery saver (PLAYER_STANDBY_TIMEOUT_SECS).
+	install -Dm755 "$srcdir"/hifi-player-sleep-hook \
+		"$pkgdir"/usr/lib/systemd/system-sleep/hifi-player
+
 	# udev: keep the sound server off the DAC; let the audio group hold cpu_dma_latency.
 	install -Dm644 "$srcdir"/99-mojo2-nopulse.rules \
 		"$pkgdir"/etc/udev/rules.d/99-mojo2-nopulse.rules
@@ -108,6 +115,7 @@ package() {
 sha512sums="
 ec9d3b95ff0338601729ac8a305ae80a32dc40042cc5d316f2fea4a3379f29c9e9f3bba1bc11ea59fd69fd0591451cab42ab8f61cbebe7935e4bb36cd2d57bbc  hifi-player-audio-setup
 faff1c8006f71863df0f2efc0ad2a7392e4bf045f531a9a17cdfcb8f1997f23f460b6f62d24fc7e0efa6a621a7e2e9031924549448550d0eb41ac6cf71504f03  hifi-player-audio-setup.service
+1c1a6eff0162ddbf21ef9db450307b81086867197e7b613075d92dbe59112c0a530827334dc0cd798c8c173c6509bbb6ae15fb746c51920ae70ee1203b834a0b  hifi-player-sleep-hook
 640b1c10c767e9972250338743eeb49164edcdde0b11d19fc299d39daa262df4de5922d7e31a20b2c25e4d62a45973d07a49e4e95990b0cca9887da5600a4d91  hifi-player.preset
 021da27d848da5d7405ed03d0ba711448ff04f6b4c2847ca8e7bd819b2195bd0372bc946e1dd98a43f3bbfc4d279783fb60033d239a92288d6311b4ec769bfff  hifi-player.desktop
 07e2281d300d92ef337eca966b7c20f55174c21f100f877c1b74ac9fe2ac9f0f0f2be51c2694716c4258311b0a8e742751b12f21bae802b309ec0073f605560a  hifi-player.svg

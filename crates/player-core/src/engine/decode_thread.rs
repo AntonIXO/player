@@ -25,16 +25,18 @@ use crate::sink::probe_formats;
 use super::ring::{push_block, ring_for_spec};
 use super::{Cmd, Ctl, Event};
 
-/// Milliseconds of DSD-silence DoP pre-roll written when a DoP device opens, so
-/// the DAC locks the marker pattern before real audio (avoids a start click).
-const DOP_PREROLL_MS: usize = 16;
-
-/// Milliseconds of PCM leading silence written when a PCM device opens on the
-/// interactive path, giving the USB DAC a moment to settle its clock before real
-/// audio (the PCM analogue of the DoP pre-roll; guards against a start/seek
-/// burst). Off for the blocking verifier so its golden bytes stay byte-identical
-/// to the v1 oracle — see [`SegmentWriter::enable_pcm_preroll`].
-const PCM_PREROLL_MS: usize = 20;
+/// Milliseconds of silence led into a freshly opened segment — the device-open
+/// half of the full-scale-burst guard (see CLAUDE.md "Output safety"). Long
+/// enough to cover the DAC's unmuted-but-unattenuated reinit window with margin;
+/// kept in step with `sink::REINIT_GUARD_MS` (the xrun/suspend half).
+///
+/// DoP additionally needs this to lock the `0x05`/`0xFA` marker pattern before
+/// real audio (otherwise the first frames are mis-read as full-scale PCM). PCM
+/// pre-roll is interactive-only (off for the blocking verifier so its golden
+/// bytes stay byte-identical to the v1 oracle — see
+/// [`SegmentWriter::enable_pcm_preroll`]).
+const DOP_PREROLL_MS: usize = 48;
+const PCM_PREROLL_MS: usize = 48;
 
 /// Owns the current ring producer and emits segment-lifecycle control events.
 /// Shared by the blocking queue player and the interactive [`super::Player`].

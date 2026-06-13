@@ -7,20 +7,33 @@ use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 
 use crate::convert::OutFrames;
+use crate::dop::dop_silence;
 use crate::error::{Error, Result};
 use crate::format::{DeviceFormats, StreamSpec};
+
+/// Silence guard band (ms) clocked out after any stream re-initialization (xrun
+/// or suspend recovery) before real audio resumes. The Mojo 2 has no hardware
+/// mute during digital transitions, so a full-scale sample emitted in that
+/// window is the "burst" hazard (see CLAUDE.md "Output safety"); leading silence
+/// makes it impossible. Engine-only — see [`AlsaSink::enable_reinit_guard`].
+const REINIT_GUARD_MS: usize = 48;
 
 pub struct AlsaSink {
     pcm: PCM,
     channels: usize,
     spec: StreamSpec,
     /// Whether the device reports hardware pause support (`snd_pcm_hw_params_can_pause`).
-    /// When false, [`AlsaSink::pause`] falls back to drop+prepare.
+    /// When false, the engine holds pause with a silence keep-alive (never drop()).
     can_pause: bool,
     /// Count of recovered underruns (EPIPE) seen while writing — diagnostics for
     /// the RT path (Phase 2). Not shared across threads; the sink lives on the
     /// audio thread only.
     xruns: Cell<u64>,
+    /// When set, lead every post-reinit resume (xrun/suspend recovery) with a
+    /// silence guard band ([`REINIT_GUARD_MS`]) so the Mojo 2 cannot emit a
+    /// full-scale burst. Enabled by the engine; off for the `run_playback` oracle
+    /// and the loopback verifier so their bytes stay exact.
+    guard_reinit: Cell<bool>,
 }
 
 impl AlsaSink {
@@ -60,6 +73,7 @@ impl AlsaSink {
             spec,
             can_pause,
             xruns: Cell::new(0),
+            guard_reinit: Cell::new(false),
         })
     }
 
@@ -72,18 +86,56 @@ impl AlsaSink {
         self.xruns.get()
     }
 
-    /// Recover from a write error, counting underruns (EPIPE) for diagnostics.
+    /// Enable the post-reinit silence guard ([`REINIT_GUARD_MS`]). Used by the
+    /// real-time engine; left off for the v1 `run_playback` oracle and the
+    /// loopback verifier so their captured bytes stay exact.
+    pub fn enable_reinit_guard(&self) {
+        self.guard_reinit.set(true);
+    }
+
+    /// Recover from a write error. Underruns (EPIPE) and suspend (ESTRPIPE) both
+    /// **re-prepare** the PCM, which on the Mojo 2 opens the full-scale-burst
+    /// window; when the guard is enabled we clock out a silence band before the
+    /// caller resumes writing real samples.
     fn recover(&self, e: alsa::Error) -> Result<()> {
-        if e.errno() == libc::EPIPE {
+        let errno = e.errno();
+        let reinit = errno == libc::EPIPE || errno == libc::ESTRPIPE;
+        if errno == libc::EPIPE {
             let n = self.xruns.get() + 1;
             self.xruns.set(n);
-            // An underrun forces ALSA to re-prepare the stream — the same USB
-            // re-init that can surface as a noise burst. Flag it so a field log
-            // correlates any audible glitch with a real xrun.
             eprintln!("[alsa] xrun #{n} recovered (EPIPE)");
+        } else if errno == libc::ESTRPIPE {
+            eprintln!("[alsa] stream suspended (ESTRPIPE) — recovering");
         }
         self.pcm.try_recover(e, true)?;
+        if reinit && self.guard_reinit.get() {
+            self.prime_reinit_silence();
+        }
         Ok(())
+    }
+
+    /// Clock out [`REINIT_GUARD_MS`] of digital silence into a freshly
+    /// (re)prepared stream so no full-scale sample is emitted during the DAC's
+    /// unmuted-but-unattenuated reinit window (the Mojo 2 burst hazard). PCM →
+    /// zeros; DoP → valid-marker DSD silence (also re-locks DoP). Best-effort: a
+    /// write error is swallowed (the caller's next write recovers again if
+    /// needed). Leading silence only — never part of the bit-perfect music.
+    fn prime_reinit_silence(&self) {
+        let frames = (self.spec.rate as usize / 1000) * REINIT_GUARD_MS;
+        let fb = self.spec.bytes_per_frame();
+        let silence = if self.spec.is_dop {
+            dop_silence(self.spec.fmt, self.spec.channels, frames & !1)
+        } else {
+            vec![0u8; frames * fb]
+        };
+        let io = self.pcm.io_bytes();
+        let mut off = 0;
+        while off < silence.len() {
+            match io.writei(&silence[off..]) {
+                Ok(n) => off += n * fb,
+                Err(_) => break,
+            }
+        }
     }
 
     /// Write one packed block via the typed interface (the engine hot path).
@@ -105,41 +157,29 @@ impl AlsaSink {
         Ok(())
     }
 
-    /// Pause or resume output via the device's hardware pause (the DAC clock
-    /// halts, ALSA's buffer is preserved, resume is seamless). Bit-perfect:
-    /// samples are never touched.
+    /// Hardware pause/resume (the DAC clock halts, ALSA's buffer is preserved,
+    /// resume is seamless). Bit-perfect: samples are never touched.
     ///
-    /// Only meaningful when [`AlsaSink::can_pause`] is true. For devices that do
-    /// **not** support hardware pause (e.g. the Mojo 2), the audio thread does
-    /// **not** call this — it keeps the stream open and writes silence instead
-    /// (see `audio_thread::pause_until_resumed`), because `drop()`+`prepare()`
-    /// tears down and re-initializes the USB substream, which the Mojo 2 can turn
-    /// into a loud burst on resume. The `drop`/`prepare` fallback below is kept
-    /// only as a safety net for any other caller.
+    /// **Only valid when [`AlsaSink::can_pause`] is true** — the audio thread
+    /// calls this only on that branch. Devices WITHOUT hardware pause (e.g. the
+    /// Mojo 2) are deliberately **never** `drop()`/`prepare()`'d to pause: that
+    /// re-inits the USB substream and can make the DAC emit a full-scale burst on
+    /// resume. They are held open with a silence keep-alive instead (see
+    /// `audio_thread::pause_until_resumed`).
     pub fn pause(&self, enable: bool) -> Result<()> {
-        if self.can_pause {
-            self.pcm.pause(enable)?;
-        } else if enable {
-            self.pcm.drop()?;
-        } else {
-            self.pcm.prepare()?;
-        }
+        debug_assert!(
+            self.can_pause,
+            "pause() is only for hardware-pause devices; others use the silence keep-alive"
+        );
+        self.pcm.pause(enable)?;
         Ok(())
     }
 
-    /// Whether this device supports true hardware pause (vs. the drop+prepare
-    /// fallback). The audio thread uses this to decide if it must re-prime the
-    /// ALSA buffer on resume.
+    /// Whether this device supports true hardware pause. The audio thread uses
+    /// this to choose the pause strategy: hardware pause when true, else the
+    /// silence keep-alive that never drops the stream.
     pub fn can_pause(&self) -> bool {
         self.can_pause
-    }
-
-    /// Stop the stream and discard ALSA's buffered audio, then re-prepare so the
-    /// next `write` restarts playback from a clean state. Used for seek/flush.
-    pub fn reset(&self) -> Result<()> {
-        self.pcm.drop()?;
-        self.pcm.prepare()?;
-        Ok(())
     }
 
     fn write_i16(&self, buf: &[i16]) -> Result<()> {

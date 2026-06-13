@@ -118,6 +118,9 @@ pub(crate) fn run(
                 continue;
             }
         };
+        // Engine path: guard every stream re-init (xrun/suspend recovery) with a
+        // silence band so the Mojo 2 can never emit a full-scale burst.
+        sink.enable_reinit_guard();
 
         let outcome = play_segment(
             &mut sink,

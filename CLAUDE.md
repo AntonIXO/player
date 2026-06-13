@@ -54,6 +54,64 @@ thread are **unchanged**. DoP only (the Mojo 2 won't take native ALSA DSD); `als
 does expose `DSD_U32_*` if ever wanted. Add DSD playback features here, *not* by
 touching the threads. Verify with the same loopback harness (DoP is just PCM bytes).
 
+## Output safety: the full-scale-burst hazard (NON-NEGOTIABLE)
+
+A real incident: the Mojo 2 emitted a **full-scale (0 dBFS) burst on resume from
+pause**, nearly injuring the user. This is **Bug B** in
+`Chord Mojo 2  Два отдельных бага — полный разбор.md` (read it): the Mojo 2 applies
+volume **digitally in its FPGA and has no hardware mute relay during digital
+transitions**, so for a few ms after any PCM **re-initialization** the analog output
+is live while attenuation isn't applied — full-scale input → full-scale output, and
+**its volume buttons do not help** (potentially 130+ dB). Because we are bit-perfect
+there is **no software volume to clamp it**. Triggers we control: `snd_pcm_drop()`+
+`prepare()` (pause/seek/flush), xrun recovery, suspend/wake, rate change, device
+reopen. (Bug A — white noise from a USB stream interruption feeding the FPGA garbage —
+is separate, plays at the *current* volume, and shares the same "minimize
+interruptions" mitigations.)
+
+**The only bit-perfect defence is silence** (the music is never altered). Two rules,
+both already implemented — do not regress them, and apply them to any new audio path:
+
+1. **Never tear the stream down to pause.** A device without hardware pause
+   (`can_pause()==false`, the Mojo 2) is held open with a **silence keep-alive**
+   (`engine/audio_thread.rs::pause_until_resumed` writes idle silence until resumed),
+   **never** `drop()`/`prepare()`. Hardware pause only when `can_pause()==true`.
+2. **Lead every unavoidable re-init with a silence guard band**, so only zeros (or
+   valid-marker DoP silence — markerless zeros would break DoP lock) are clocked out
+   during the unmuted window:
+   - device (re)open → `DOP_PREROLL_MS`/`PCM_PREROLL_MS` pushed into the new segment
+     (`engine/decode_thread.rs::producer_for`);
+   - xrun/suspend recovery → `REINIT_GUARD_MS` in `sink/alsa.rs::recover` (gated by
+     `enable_reinit_guard()`, which the audio thread sets). Keep these constants in
+     step.
+
+**Hard rules for future changes:**
+- Adding **any** new `prepare()`/`drop()`/device-open path means adding a silence
+  guard in front of it. No exceptions. (The dead `AlsaSink::reset()` and the
+  drop-on-pause fallback were **removed** precisely so they can't be reused unguarded.)
+- The guard is **engine-only**. `run_playback` (the bit-perfect oracle) and the
+  `loopback-verify` playback stay byte-pure for the proof — so **CLI `play`/`dump` are
+  unguarded and are *not* the safe daily path for the Mojo 2; the interactive `Player`
+  / GTK app is.** Don't "fix" this by adding silence to the oracle.
+- Prefer **gapless within a segment** (no reopen) over per-track reopen; minimize rate
+  switches (each is a guarded but real transition).
+- Silence guards are **leading silence, not a sample ramp** — never apply gain/fade to
+  the music itself (that breaks bit-perfect). Verify any change to these paths still
+  passes the loopback harness unchanged.
+- System backstop (defence-in-depth, not the fix): `snd_usb_audio.power_save=0` +
+  `usbcore.autosuspend=-1` (packaging). `implicit_fb`/`autoclock` are **test-only** —
+  the Mojo 2 is async with its own feedback endpoint; don't force them by default.
+
+**Does a realtime (PREEMPT_RT) kernel help?** It **cannot** touch the burst hazard or
+the DAC's clock: the Mojo 2 is an **asynchronous** USB DAC (it is clock master; the
+host adapts via the feedback endpoint), so host scheduling only affects *USB packet
+delivery timing*, i.e. how often we underrun. RT can modestly **reduce xruns** (fewer
+reinit triggers), so it is **complementary** to — never a substitute for — the silence
+guard. We already run `SCHED_FIFO` on an isolated core with RT-prioritised USB IRQs and
+bounded C-states/DMA latency (~0 xruns), so a full RT kernel is **marginal** here and
+can even *raise* risk if misconfigured (too-small buffers, priority inversion with the
+xHCI threads). Net: optional, low priority; keep the silence-guard discipline regardless.
+
 ## Build / test / run
 
 ```sh

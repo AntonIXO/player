@@ -13,9 +13,11 @@ use player_library::{fmt_dur_ms, Album, Artist, Folder, Sort, Track};
 
 use crate::list::{grid_view, list_view};
 use crate::playback::{
-    enqueue_track, enqueue_tracks, play_artist, play_folder, play_list, shuffle_vec, toggle_loved,
+    enqueue_track, enqueue_tracks, play_album, play_artist, play_folder, play_list, shuffle_vec,
+    toggle_loved,
 };
 use crate::state::{SharedState, SharedUi};
+use crate::ui::libworker::{spinner_after, submit_action, submit_render, LibPayload};
 use crate::widgets::{
     album_cell, art_widget, boxed_list, clamp, row_inner, row_widget, status_page, wrap_scroller,
 };
@@ -304,15 +306,26 @@ pub(crate) fn rebuild_albums(state: &SharedState, ui: &SharedUi) {
     build_az_index(ui, &albums, &grid, ui.sort.get());
 }
 
-pub(crate) fn refresh_library(state: &SharedState, ui: &SharedUi) {
-    let albums = state.borrow().library.albums(ui.sort.get()).unwrap_or_default();
-    let n_tracks = state
-        .borrow()
-        .library
-        .stats()
-        .map(|s| s.tracks)
-        .unwrap_or(0);
+pub(crate) fn refresh_library(_state: &SharedState, ui: &SharedUi) {
+    let sort = ui.sort.get();
+    submit_render(
+        ui,
+        move |lib| LibPayload::Albums {
+            albums: lib.albums(sort).unwrap_or_default(),
+            n_tracks: lib.stats().map(|s| s.tracks).unwrap_or(0),
+        },
+        |state, ui, p| {
+            if let LibPayload::Albums { albums, n_tracks } = p {
+                render_albums(state, ui, albums, n_tracks);
+            }
+        },
+    );
+}
 
+/// Apply a fetched album list: toggle the empty/browse state, cache the albums,
+/// size the covers to the current width, (re)build the 3-up grid, and repopulate
+/// any non-album tab currently showing.
+fn render_albums(state: &SharedState, ui: &SharedUi, albums: Vec<Album>, n_tracks: u64) {
     while let Some(c) = ui.az_box.first_child() {
         ui.az_box.remove(&c);
     }
@@ -346,99 +359,145 @@ pub(crate) fn refresh_library(state: &SharedState, ui: &SharedUi) {
     }
 }
 
-/// Populate and reveal a browse tab. Albums are filled by [`refresh_library`];
-/// Artists/Folders/Tracks are built here on demand as virtualised `ListView`s.
-pub(crate) fn show_browse_tab(state: &SharedState, ui: &SharedUi, name: &str) {
+/// Reveal a browse tab and fill it. Albums are filled by [`refresh_library`];
+/// Artists/Folders/Tracks/Loved fetch their rows on the library worker (so the
+/// tab switch never blocks) and render the virtualised `ListView` when the result
+/// arrives — latest-wins, so spamming tabs only renders the last one.
+pub(crate) fn show_browse_tab(_state: &SharedState, ui: &SharedUi, name: &str) {
     ui.browse_stack.set_visible_child_name(name);
     match name {
         "artists" => {
-            let artists = state.borrow().library.artists().unwrap_or_default();
-            let lv = list_view(
-                artists,
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |a: &Artist| {
-                        let meta = format!(
-                            "{} album{} · {} track{}",
-                            a.album_count,
-                            if a.album_count == 1 { "" } else { "s" },
-                            a.track_count,
-                            if a.track_count == 1 { "" } else { "s" },
-                        );
-                        let cache = ui.art.clone();
-                        let (state, ui, name) = (state.clone(), ui.clone(), a.name.clone());
-                        row_inner(
-                            &cache,
-                            None,
-                            &name.clone(),
-                            &meta,
-                            None,
-                            None,
-                            Some(("media-playback-start-symbolic", "Play all")),
-                            move || play_artist(&state, &ui, &name),
-                        )
-                        .upcast()
+            let seq = submit_render(
+                ui,
+                |lib| LibPayload::Artists(lib.artists().unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Artists(v) = p {
+                        render_artists(state, ui, v);
                     }
                 },
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |items: &[Artist], pos| open_artist_detail(&state, &ui, &items[pos].name)
-                },
             );
-            ui.artists_scroller.set_child(Some(&lv));
+            spinner_after(ui, &ui.artists_scroller, seq);
         }
         "folders" => {
-            let folders = state.borrow().library.folders().unwrap_or_default();
-            let lv = list_view(
-                folders,
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |f: &Folder| {
-                        let cache = ui.art.clone();
-                        let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
-                        row_inner(
-                            &cache,
-                            None,
-                            f.name(),
-                            &f.path,
-                            Some(&f.meta()),
-                            None,
-                            Some(("media-playback-start-symbolic", "Play folder")),
-                            move || play_folder(&state, &ui, &path),
-                        )
-                        .upcast()
+            let seq = submit_render(
+                ui,
+                |lib| LibPayload::Folders(lib.folders().unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Folders(v) = p {
+                        render_folders(state, ui, v);
                     }
                 },
-                {
-                    let (state, ui) = (state.clone(), ui.clone());
-                    move |items: &[Folder], pos| play_folder(&state, &ui, &items[pos].path)
-                },
             );
-            ui.folders_scroller.set_child(Some(&lv));
+            spinner_after(ui, &ui.folders_scroller, seq);
         }
         "tracks" => {
-            let tracks = state
-                .borrow()
-                .library
-                .tracks(ui.sort.get())
-                .unwrap_or_default();
-            ui.tracks_scroller
-                .set_child(Some(&track_list_view(state, ui, tracks)));
+            let sort = ui.sort.get();
+            let seq = submit_render(
+                ui,
+                move |lib| LibPayload::Tracks(lib.tracks(sort).unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Tracks(v) = p {
+                        ui.tracks_scroller
+                            .set_child(Some(&track_list_view(state, ui, v)));
+                    }
+                },
+            );
+            spinner_after(ui, &ui.tracks_scroller, seq);
         }
         "loved" => {
-            let tracks = state.borrow().library.loved_tracks().unwrap_or_default();
-            if tracks.is_empty() {
-                ui.loved_scroller.set_child(Some(&status_page(
-                    "emblem-favorite-symbolic",
-                    "No Loved Tracks Yet",
-                    "Tap the heart on any track to add it here.",
-                )));
-            } else {
-                ui.loved_scroller
-                    .set_child(Some(&track_list_view(state, ui, tracks)));
-            }
+            let seq = submit_render(
+                ui,
+                |lib| LibPayload::Tracks(lib.loved_tracks().unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Tracks(v) = p {
+                        render_loved(state, ui, v);
+                    }
+                },
+            );
+            spinner_after(ui, &ui.loved_scroller, seq);
         }
         _ => {}
+    }
+}
+
+/// Build and install the Artists virtualised list from a fetched artist list.
+fn render_artists(state: &SharedState, ui: &SharedUi, artists: Vec<Artist>) {
+    let lv = list_view(
+        artists,
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |a: &Artist| {
+                let meta = format!(
+                    "{} album{} · {} track{}",
+                    a.album_count,
+                    if a.album_count == 1 { "" } else { "s" },
+                    a.track_count,
+                    if a.track_count == 1 { "" } else { "s" },
+                );
+                let cache = ui.art.clone();
+                let (state, ui, name) = (state.clone(), ui.clone(), a.name.clone());
+                row_inner(
+                    &cache,
+                    None,
+                    &name.clone(),
+                    &meta,
+                    None,
+                    None,
+                    Some(("media-playback-start-symbolic", "Play all")),
+                    move || play_artist(&state, &ui, &name),
+                )
+                .upcast()
+            }
+        },
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |items: &[Artist], pos| open_artist_detail(&state, &ui, &items[pos].name)
+        },
+    );
+    ui.artists_scroller.set_child(Some(&lv));
+}
+
+/// Build and install the Folders virtualised list from a fetched folder list.
+fn render_folders(state: &SharedState, ui: &SharedUi, folders: Vec<Folder>) {
+    let lv = list_view(
+        folders,
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |f: &Folder| {
+                let cache = ui.art.clone();
+                let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
+                row_inner(
+                    &cache,
+                    None,
+                    f.name(),
+                    &f.path,
+                    Some(&f.meta()),
+                    None,
+                    Some(("media-playback-start-symbolic", "Play folder")),
+                    move || play_folder(&state, &ui, &path),
+                )
+                .upcast()
+            }
+        },
+        {
+            let (state, ui) = (state.clone(), ui.clone());
+            move |items: &[Folder], pos| play_folder(&state, &ui, &items[pos].path)
+        },
+    );
+    ui.folders_scroller.set_child(Some(&lv));
+}
+
+/// Install the Loved tab from a fetched loved-track list (empty state or list).
+fn render_loved(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) {
+    if tracks.is_empty() {
+        ui.loved_scroller.set_child(Some(&status_page(
+            "emblem-favorite-symbolic",
+            "No Loved Tracks Yet",
+            "Tap the heart on any track to add it here.",
+        )));
+    } else {
+        ui.loved_scroller
+            .set_child(Some(&track_list_view(state, ui, tracks)));
     }
 }
 
@@ -505,19 +564,27 @@ fn build_az_index(ui: &SharedUi, albums: &[Album], grid: &gtk::GridView, sort: S
     }
 }
 
-/// Open the detail page for the album at `index` in the cached album list.
+/// Open the detail page for the album at `index` in the cached album list. The
+/// track query runs on the worker; the page is pushed when it returns (latest-
+/// wins, so a second tap supersedes the first).
 fn open_album_detail(state: &SharedState, ui: &SharedUi, index: usize) {
-    let (album, tracks) = {
-        let s = state.borrow();
-        let Some(al) = s.albums.get(index).cloned() else { return };
-        let tracks = s
-            .library
-            .album_tracks(&al.album, al.album_artist.as_deref())
-            .unwrap_or_default();
-        (al, tracks)
+    let Some(album) = state.borrow().albums.get(index).cloned() else {
+        return;
     };
-    let page = build_album_detail(state, ui, &album, tracks);
-    ui.nav.push(&page);
+    let (a, aa) = (album.album.clone(), album.album_artist.clone());
+    submit_render(
+        ui,
+        move |lib| LibPayload::Album {
+            tracks: lib.album_tracks(&a, aa.as_deref()).unwrap_or_default(),
+            album,
+        },
+        |state, ui, p| {
+            if let LibPayload::Album { album, tracks } = p {
+                let page = build_album_detail(state, ui, &album, tracks);
+                ui.nav.push(&page);
+            }
+        },
+    );
 }
 
 /// Build an album-detail navigation page: a hero header (art + titles), the
@@ -636,11 +703,20 @@ pub(crate) fn build_album_detail(
 
 /// Push the detail page for `artist` and reveal the Library tab (works from the
 /// browse list, search results, or the now-playing nav buttons).
-pub(crate) fn open_artist_detail(state: &SharedState, ui: &SharedUi, artist: &str) {
-    let albums = state.borrow().library.artist_albums(artist).unwrap_or_default();
-    let page = build_artist_detail(state, ui, artist, albums);
-    ui.nav.push(&page);
-    ui.stack.set_visible_child_name("library");
+pub(crate) fn open_artist_detail(_state: &SharedState, ui: &SharedUi, artist: &str) {
+    let name = artist.to_string();
+    let name2 = name.clone();
+    submit_render(
+        ui,
+        move |lib| LibPayload::ArtistAlbums(lib.artist_albums(&name).unwrap_or_default()),
+        move |state, ui, p| {
+            if let LibPayload::ArtistAlbums(albums) = p {
+                let page = build_artist_detail(state, ui, &name2, albums);
+                ui.nav.push(&page);
+                ui.stack.set_visible_child_name("library");
+            }
+        },
+    );
 }
 
 /// Push the album detail page for `(album, album_artist)`, looking the `Album` up
@@ -658,26 +734,35 @@ pub(crate) fn open_album_for(
             .find(|a| a.album == album && a.album_artist.as_deref() == album_artist)
             .cloned()
     };
-    let tracks = state
-        .borrow()
-        .library
-        .album_tracks(album, album_artist)
-        .unwrap_or_default();
-    if tracks.is_empty() {
-        ui.toast("No tracks for this album");
-        return;
-    }
-    let al = found.unwrap_or_else(|| Album {
-        album: album.to_string(),
-        album_artist: album_artist.map(|s| s.to_string()),
-        year: tracks.iter().find_map(|t| t.year),
-        track_count: tracks.len() as u32,
-        total_ms: tracks.iter().filter_map(|t| t.duration_ms).sum(),
-        art_hash: tracks.iter().find_map(|t| t.art_hash.clone()),
-    });
-    let page = build_album_detail(state, ui, &al, tracks);
-    ui.nav.push(&page);
-    ui.stack.set_visible_child_name("library");
+    let (a, aa) = (album.to_string(), album_artist.map(|s| s.to_string()));
+    submit_render(
+        ui,
+        move |lib| {
+            let tracks = lib.album_tracks(&a, aa.as_deref()).unwrap_or_default();
+            // Synthesise the Album from the tracks when it isn't in the cached
+            // browse list (e.g. opened from search or an artist page).
+            let album = found.unwrap_or_else(|| Album {
+                album: a.clone(),
+                album_artist: aa.clone(),
+                year: tracks.iter().find_map(|t| t.year),
+                track_count: tracks.len() as u32,
+                total_ms: tracks.iter().filter_map(|t| t.duration_ms).sum(),
+                art_hash: tracks.iter().find_map(|t| t.art_hash.clone()),
+            });
+            LibPayload::Album { album, tracks }
+        },
+        |state, ui, p| {
+            if let LibPayload::Album { album, tracks } = p {
+                if tracks.is_empty() {
+                    ui.toast("No tracks for this album");
+                    return;
+                }
+                let page = build_album_detail(state, ui, &album, tracks);
+                ui.nav.push(&page);
+                ui.stack.set_visible_child_name("library");
+            }
+        },
+    );
 }
 
 /// Build an artist-detail navigation page: an avatar hero, Play / Shuffle / Add
@@ -741,18 +826,34 @@ fn build_artist_detail(
         play_btn.connect_clicked(move |_| play_artist(&state, &ui, &name));
     }
     {
-        let (state, ui, name) = (state.clone(), ui.clone(), artist.to_string());
+        let (ui, name) = (ui.clone(), artist.to_string());
         shuffle_btn.connect_clicked(move |_| {
-            let mut v = state.borrow().library.artist_tracks(&name).unwrap_or_default();
-            shuffle_vec(&mut v);
-            play_list(&state, &ui, v, 0);
+            let name = name.clone();
+            submit_action(
+                &ui,
+                move |lib| LibPayload::Tracks(lib.artist_tracks(&name).unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Tracks(mut v) = p {
+                        shuffle_vec(&mut v);
+                        play_list(state, ui, v, 0);
+                    }
+                },
+            );
         });
     }
     {
-        let (state, ui, name) = (state.clone(), ui.clone(), artist.to_string());
+        let (ui, name) = (ui.clone(), artist.to_string());
         add_btn.connect_clicked(move |_| {
-            let v = state.borrow().library.artist_tracks(&name).unwrap_or_default();
-            enqueue_tracks(&state, &ui, v);
+            let name = name.clone();
+            submit_action(
+                &ui,
+                move |lib| LibPayload::Tracks(lib.artist_tracks(&name).unwrap_or_default()),
+                |state, ui, p| {
+                    if let LibPayload::Tracks(v) = p {
+                        enqueue_tracks(state, ui, v);
+                    }
+                },
+            );
         });
     }
 
@@ -770,14 +871,7 @@ fn build_artist_detail(
             None,
             Some(("media-playback-start-symbolic", "Play album")),
             move || open_album_for(&s1, &u1, &a1.album, a1.album_artist.as_deref()),
-            move || {
-                let tracks = s2
-                    .borrow()
-                    .library
-                    .album_tracks(&a2.album, a2.album_artist.as_deref())
-                    .unwrap_or_default();
-                play_list(&s2, &u2, tracks, 0);
-            },
+            move || play_album(&s2, &u2, &a2.album, a2.album_artist.as_deref()),
         );
         lb.append(&row);
     }

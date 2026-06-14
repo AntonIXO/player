@@ -58,6 +58,7 @@ use ui::library::{
 use ui::mini::build_mini;
 use ui::now_playing::{build_now_playing, resize_hero, update_mini, update_now_playing_empty};
 use ui::queue::refresh_queue;
+use ui::libworker::spawn_library_worker;
 use ui::search::{build_search, kick_search, render_search_results, spawn_search_worker};
 use ui::settings::open_settings;
 use widgets::{add_page, flat_menu_item, mmss, section_label, toggle_accent, wrap_scroller};
@@ -129,6 +130,11 @@ fn build_ui(app: &adw::Application) {
     // fuzzy index, so per-keystroke search never blocks the main thread. It is
     // told to Reindex after a scan.
     let (search_tx, search_rx) = spawn_search_worker(db_path.clone(), art_dir.clone());
+
+    // Background library-query worker: owns its own read connection and answers
+    // browse/detail/play queries off the main thread (results applied via the
+    // pump below), so tab switches and album/artist opens never block the UI.
+    let (lib_tx, lib_rx) = spawn_library_worker(db_path.clone(), art_dir.clone());
 
     // engine events → main loop
     let (ev_tx, ev_rx) = async_channel::unbounded::<Event>();
@@ -295,6 +301,10 @@ fn build_ui(app: &adw::Application) {
         filter_buttons,
         search_tx: search_tx.clone(),
         search_seq: Cell::new(0),
+        lib_tx: lib_tx.clone(),
+        lib_seq: Cell::new(0),
+        lib_render_seq: Cell::new(0),
+        lib_pending: RefCell::new(Default::default()),
         queue_box,
         queue_title,
         art: ArtCache::new(state.borrow().art_dir.clone()),
@@ -485,6 +495,10 @@ fn build_ui(app: &adw::Application) {
         });
     }
 
+    // library-query results pump: apply each finished browse/detail/play job's
+    // continuation (latest-wins for navigation; actions always run).
+    ui::libworker::spawn_pump(state.clone(), ui.clone(), lib_rx);
+
     // Standby battery saver (Poco F1): suspend after an idle timeout when no USB
     // DAC is connected. Off unless PLAYER_STANDBY_TIMEOUT_SECS is set, so the
     // desktop dev box is never affected.
@@ -525,11 +539,21 @@ fn build_ui(app: &adw::Application) {
         sb.start(state.clone());
     }
 
-    refresh_library(&state, &ui);
+    // Paint first: the empty Now-Playing state is pure widget setup (no DB), so
+    // show it and present the window immediately, then fill the library / restore
+    // the session / load the queue on the first idle — none of those blocking DB
+    // queries delay the first frame. (The width poll above only scales already-
+    // built art, so it tolerates the albums arriving an idle tick later.)
     update_now_playing_empty(&ui, true);
-    restore_session(&state, &ui);
-    refresh_queue(&state, &ui);
     window.present();
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        glib::idle_add_local_once(move || {
+            refresh_library(&state, &ui);
+            restore_session(&state, &ui);
+            refresh_queue(&state, &ui);
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

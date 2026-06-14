@@ -13,9 +13,9 @@ use adw::prelude::*;
 use gtk::{glib, Orientation};
 use player_library::{Filter, Library, SearchIndex, SearchResults};
 
-use crate::playback::{enqueue_track, play_artist, play_list, toggle_loved};
+use crate::playback::{enqueue_track, play_album, play_artist, play_list, toggle_loved};
 use crate::state::{SharedState, SharedUi};
-use crate::ui::library::{build_album_detail, open_artist_detail};
+use crate::ui::library::{open_album_for, open_artist_detail};
 use crate::widgets::{boxed_list, clamp, row_widget, section_label, wrap_scroller};
 
 /// A request to / result from the background search worker.
@@ -204,30 +204,14 @@ pub(crate) fn render_search_results(state: &SharedState, ui: &SharedUi, results:
                 None,
                 Some(("media-playback-start-symbolic", "Play album")),
                 {
-                    // Activate → album detail (drill-down).
+                    // Activate → album detail (drill-down); tracks fetched on the worker.
                     let (state, ui, alc) = (state.clone(), ui.clone(), al.clone());
-                    move || {
-                        let tracks = state
-                            .borrow()
-                            .library
-                            .album_tracks(&alc.album, alc.album_artist.as_deref())
-                            .unwrap_or_default();
-                        let page = build_album_detail(&state, &ui, &alc, tracks);
-                        ui.nav.push(&page);
-                        ui.stack.set_visible_child_name("library");
-                    }
+                    move || open_album_for(&state, &ui, &alc.album, alc.album_artist.as_deref())
                 },
                 {
-                    // Trailing ▶ → play the album immediately.
+                    // Trailing ▶ → play the album immediately (fetched on the worker).
                     let (state, ui, alc) = (state.clone(), ui.clone(), al.clone());
-                    move || {
-                        let tracks = state
-                            .borrow()
-                            .library
-                            .album_tracks(&alc.album, alc.album_artist.as_deref())
-                            .unwrap_or_default();
-                        play_list(&state, &ui, tracks, 0);
-                    }
+                    move || play_album(&state, &ui, &alc.album, alc.album_artist.as_deref())
                 },
             );
             lb.append(&row);

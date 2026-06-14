@@ -11,6 +11,7 @@ use adw::prelude::*;
 use player_library::Track;
 
 use crate::state::{SharedState, SharedUi};
+use crate::ui::libworker::{submit_action, LibPayload};
 use crate::ui::now_playing::{set_play_icon, show_track, update_mini, update_now_playing_empty};
 use crate::ui::queue::refresh_queue;
 use crate::widgets::mmss;
@@ -311,22 +312,60 @@ pub(crate) fn remove_from_queue(state: &SharedState, ui: &SharedUi, i: usize) {
     refresh_queue(state, ui);
 }
 
-pub(crate) fn play_artist(state: &SharedState, ui: &SharedUi, artist: &str) {
-    let tracks = state.borrow().library.artist_tracks(artist).unwrap_or_default();
-    if tracks.is_empty() {
-        ui.toast("No tracks for that artist");
-        return;
-    }
-    play_list(state, ui, tracks, 0);
+/// Play every track of `artist`. The query runs on the library worker (it can be
+/// large), so playback starts as soon as the tracks are fetched without blocking
+/// the UI. `_state` is unused — the worker continuation receives it from the pump.
+pub(crate) fn play_artist(_state: &SharedState, ui: &SharedUi, artist: &str) {
+    let name = artist.to_string();
+    submit_action(
+        ui,
+        move |lib| LibPayload::Tracks(lib.artist_tracks(&name).unwrap_or_default()),
+        |state, ui, p| {
+            if let LibPayload::Tracks(v) = p {
+                if v.is_empty() {
+                    ui.toast("No tracks for that artist");
+                    return;
+                }
+                play_list(state, ui, v, 0);
+            }
+        },
+    );
 }
 
-pub(crate) fn play_folder(state: &SharedState, ui: &SharedUi, folder: &str) {
-    let tracks = state.borrow().library.folder_tracks(folder).unwrap_or_default();
-    if tracks.is_empty() {
-        ui.toast("No tracks in that folder");
-        return;
-    }
-    play_list(state, ui, tracks, 0);
+/// Play every track directly inside `folder` (fetched on the library worker).
+pub(crate) fn play_folder(_state: &SharedState, ui: &SharedUi, folder: &str) {
+    let folder = folder.to_string();
+    submit_action(
+        ui,
+        move |lib| LibPayload::Tracks(lib.folder_tracks(&folder).unwrap_or_default()),
+        |state, ui, p| {
+            if let LibPayload::Tracks(v) = p {
+                if v.is_empty() {
+                    ui.toast("No tracks in that folder");
+                    return;
+                }
+                play_list(state, ui, v, 0);
+            }
+        },
+    );
+}
+
+/// Play a whole album by `(album, album_artist)` (tracks fetched on the worker).
+pub(crate) fn play_album(_state: &SharedState, ui: &SharedUi, album: &str, album_artist: Option<&str>) {
+    let (a, aa) = (album.to_string(), album_artist.map(|s| s.to_string()));
+    submit_action(
+        ui,
+        move |lib| LibPayload::Tracks(lib.album_tracks(&a, aa.as_deref()).unwrap_or_default()),
+        |state, ui, p| {
+            if let LibPayload::Tracks(v) = p {
+                if v.is_empty() {
+                    ui.toast("No tracks for this album");
+                    return;
+                }
+                play_list(state, ui, v, 0);
+            }
+        },
+    );
 }
 
 pub(crate) fn pseudo_random(len: usize) -> usize {
@@ -350,22 +389,28 @@ pub(crate) fn quick_track(path: &Path) -> Track {
 // ---------------------------------------------------------------------------
 
 /// Persist the current queue, selected index, and position for next launch.
+/// Written as one transaction (single WAL commit) so it does not stall the
+/// closing window with a commit per key.
 pub(crate) fn save_session(state: &SharedState) {
     let s = state.borrow();
-    let paths: Vec<String> = s
+    let queue = s
         .queue
         .iter()
         .map(|t| t.path.to_string_lossy().into_owned())
-        .collect();
-    let _ = s.library.set_meta("queue", &paths.join("\n"));
-    let _ = s.library.set_meta(
-        "current",
-        &s.current.map(|i| i.to_string()).unwrap_or_default(),
-    );
-    let _ = s.library.set_meta("pos_ms", &s.last_pos_ms.to_string());
-    if let Some(d) = &s.music_dir {
-        let _ = s.library.set_meta("music_dir", &d.to_string_lossy());
+        .collect::<Vec<_>>()
+        .join("\n");
+    let current = s.current.map(|i| i.to_string()).unwrap_or_default();
+    let pos = s.last_pos_ms.to_string();
+    let music_dir = s.music_dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+    let mut kv: Vec<(&str, &str)> = vec![
+        ("queue", queue.as_str()),
+        ("current", current.as_str()),
+        ("pos_ms", pos.as_str()),
+    ];
+    if let Some(d) = &music_dir {
+        kv.push(("music_dir", d.as_str()));
     }
+    let _ = s.library.set_meta_many(&kv);
 }
 
 /// Restore the last session's queue/position. Loads the queue but does not
@@ -384,17 +429,17 @@ pub(crate) fn restore_session(state: &SharedState, ui: &SharedUi) {
     }
     let tracks: Vec<Track> = {
         let s = state.borrow();
-        queue_raw
+        let paths: Vec<PathBuf> = queue_raw
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|p| {
-                let pb = PathBuf::from(p);
-                s.library
-                    .track_by_path(&pb)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| quick_track(&pb))
-            })
+            .map(PathBuf::from)
+            .collect();
+        // One query resolves the whole queue; map the ordered paths through it,
+        // falling back to a metadata-less stub for any path no longer indexed.
+        let by_path = s.library.tracks_by_paths(&paths).unwrap_or_default();
+        paths
+            .iter()
+            .map(|pb| by_path.get(pb).cloned().unwrap_or_else(|| quick_track(pb)))
             .collect()
     };
     if tracks.is_empty() {

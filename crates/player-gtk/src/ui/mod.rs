@@ -2,6 +2,7 @@
 //! behaviour that belongs to it; `main.rs` assembles them into the window.
 
 pub(crate) mod library;
+pub(crate) mod libworker;
 pub(crate) mod mini;
 pub(crate) mod now_playing;
 pub(crate) mod queue;

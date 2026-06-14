@@ -107,6 +107,16 @@ pub(crate) struct Ui {
     /// Monotonic search generation: each keystroke/filter change bumps it; a
     /// result is rendered only if its seq still matches (latest-wins).
     pub(crate) search_seq: Cell<u64>,
+    /// Sender into the background library-query worker (own read connection), used
+    /// for browse/detail/play queries so they never block the GTK main loop.
+    pub(crate) lib_tx: async_channel::Sender<crate::ui::libworker::LibJob>,
+    /// Monotonic library-job generation (every submitted job gets a unique seq).
+    pub(crate) lib_seq: Cell<u64>,
+    /// The latest *render* (navigation) job's seq — a render result is applied
+    /// only if it still matches, dropping superseded tab/detail switches.
+    pub(crate) lib_render_seq: Cell<u64>,
+    /// Continuations awaiting their worker result, keyed by job seq.
+    pub(crate) lib_pending: RefCell<crate::ui::libworker::Pending>,
     // queue
     pub(crate) queue_box: gtk::Box,
     pub(crate) queue_title: gtk::Label,

@@ -55,4 +55,27 @@ opt-level = 3
 lto = "thin"
 strip = "symbols"
 codegen-units = 1
-panic = "abort"       
+panic = "abort"
+
+# Faster iteration with a smooth UI in debug builds: optimize all third-party
+# deps (gtk4, libadwaita, symphonia, rusqlite, sacd, ...) even under `cargo run`,
+# while keeping our own crates lightly optimized for quick rebuilds. Bit-perfect
+# verification must still use --release (see CLAUDE.md): debug `overflow-checks`
+# panic on overflow but never change the wrapped integer result, so non-overflowing
+# packing math is byte-identical to release.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+# PGO/BOLT pipeline profile (driven by scripts/pgo-bolt-build.sh). Inherits the
+# bit-perfect release settings but DISABLES strip: LLVM BOLT needs symbols +
+# relocations in its input binary, and a stripped binary cannot be BOLTed. The
+# script strips the final artifact itself after BOLT. opt-level/lto/codegen-units
+# are inherited from [profile.release]; PGO/BOLT only change code LAYOUT (block/
+# function ordering, inlining heuristics) — never numeric results — so the
+# bit-perfect invariant is preserved (and re-verified by the script's loopback gate).
+[profile.release-pgo]
+inherits = "release"
+strip = false       

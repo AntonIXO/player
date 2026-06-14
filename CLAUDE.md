@@ -129,6 +129,18 @@ Needs dev packages: `gtk4`, `libadwaita`, `alsa-lib` (and a C toolchain for rusq
 bundled SQLite). Tests live as unit tests in `player-core` (`convert.rs`, `decode.rs`),
 `player-library` (`cue.rs` + `tests/scan_search.rs`) — all run without audio hardware.
 
+**Optimized release (PGO/BOLT).** `scripts/pgo-bolt-build.sh` automates a Profile-Guided
+Optimization (and optional LLVM BOLT) build: instrument → auto-run a representative
+headless workload → merge profiles → rebuild optimized → **bit-perfect gate** (decode every
+testfile, byte-compare vs ffmpeg; aborts if any differ) → strip. It builds the `release-pgo`
+profile (inherits `release` but `strip=false`, since BOLT needs symbols+relocations). PGO/BOLT
+only change code *layout* (block/function ordering, inlining/branch heuristics), never integer
+results, so bit-perfect holds — and the gate re-proves it. `--bolt` needs `llvm-bolt`+`merge-fdata`
+(Arch: `pacman -S llvm`); plain run is PGO-only (`rustup component add llvm-tools-preview`, auto-
+installed). Caveat (measured): simple PCM/WAV decode is memcpy/SIMD-bound and shows ~0 PGO gain;
+the wins are in branch-heavy code (FLAC, DSD/DST, library scan+extract, fuzzy search), which the
+workload leans on. PGO/BOLT touch only the Rust we compile, not system gtk4/cairo/pango.
+
 ## Verifying bit-perfect output (do this for any change touching the audio path)
 
 The proof is byte-for-byte equality, and the CLI is the harness. Two independent checks:

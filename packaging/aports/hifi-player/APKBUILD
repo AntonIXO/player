@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=8
+pkgrel=9
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -16,12 +16,24 @@ license="MIT"
 # looks up Adwaita symbolic names at runtime (e.g. emblem-favorite-symbolic for the
 # "love" pill); without the theme GTK falls back to hicolor and the icon is blank.
 depends="alsa-utils adwaita-icon-theme"
+# llvm:   provides /usr/bin/llvm-profdata to merge PGO profiles. The UNVERSIONED
+#         `llvm` package tracks Alpine's default LLVM — the same one `rust` is built
+#         against — so it always matches rustc's raw-profile format (LLVM 22 here).
+#         If it's ever still missing, build() falls back to a plain release build.
+# ffmpeg: build()'s bit-perfect gate decodes each testfile and byte-compares the
+#         output against ffmpeg's, refusing to package a binary whose samples differ
+#         (the PGO/BOLT safety net).
+# NOTE:   BOLT (_bolt=1) needs `llvm-bolt` + `merge-fdata`, which Alpine does NOT
+#         package — so BOLT auto-skips in the chroot (PGO still applies). Run BOLT on
+#         the host/on-device instead: scripts/pgo-bolt-build.sh --bolt
 makedepends="
 	cargo
 	rust
+	llvm
 	gtk4.0-dev
 	libadwaita-dev
 	alsa-lib-dev
+	ffmpeg
 "
 install="$pkgname.post-install"
 # net:    cargo fetches crate sources in prepare() (build() then runs offline).
@@ -55,21 +67,136 @@ prepare() {
 	cargo fetch --locked
 }
 
+# --- PGO/BOLT toggles --------------------------------------------------------
+# _pgo=1: Profile-Guided Optimization (default). Auto-collected here: instrument
+#         player-cli, run a branch-heavy headless workload (FLAC decode + forced
+#         rescan + fuzzy search — NOT flat PCM, which shows ~0 gain), merge, then
+#         rebuild BOTH binaries with the profile (player-gtk benefits on the shared
+#         decode/library code via function matching). Falls back to a plain build
+#         if testfiles or llvm-profdata are missing, or rustc lacks the profiler
+#         runtime — pmbootstrap build never breaks because of PGO.
+# _bolt=1: also BOLT player-cli (opt-in, off by default). Needs llvm-bolt +
+#         merge-fdata in the chroot; player-gtk isn't BOLTed (no display to train).
+# Both only change code LAYOUT, never numeric results — the bit-perfect gate below
+# re-proves byte-equality vs ffmpeg before the binary is allowed to be packaged.
+_pgo=1
+_bolt=0
+
+# The whole pipeline builds the `release-pgo` cargo profile (= release but
+# strip=false, since BOLT needs symbols/relocations); abuild strips the installed
+# binaries afterwards anyway, so the shipped size is unchanged.
+_cargo_profile="release-pgo"
+_outdir="target/$_cargo_profile"
+
+# Branch-heavy, headless, audio-HW-free training workload. $1 = player-cli binary.
+_workload() {
+	_cli="$1"
+	_db="$builddir/target/.pgo-lib.db"; rm -f "$_db"
+	_n=0; while [ "$_n" -lt 5 ]; do
+		for _f in s16_44k.flac flac_48k.flac flac_96k.flac s16_44k.wav s32_44k.wav; do
+			[ -f "testfiles/$_f" ] && "$_cli" dump "testfiles/$_f" -o /dev/null >/dev/null 2>&1 || true
+		done
+		_n=$((_n + 1))
+	done
+	for _f in testfiles/*; do "$_cli" probe "$_f" >/dev/null 2>&1 || true; done
+	"$_cli" scan testfiles --db "$_db" --force >/dev/null 2>&1 || true
+	for _q in flac wav test album the love piano jazz remix live 2024; do
+		for _filt in all tracks albums artists; do
+			"$_cli" search "$_q" --db "$_db" --filter "$_filt" >/dev/null 2>&1 || true
+		done
+	done
+	"$_cli" library-stats --db "$_db" >/dev/null 2>&1 || true
+	rm -f "$_db"
+}
+
+# Optional BOLT of player-cli. Returns non-zero (caller warns) if tools missing.
+_bolt_cli() {
+	command -v llvm-bolt >/dev/null || return 1
+	command -v merge-fdata >/dev/null || return 1
+	_bin="$_outdir/player-cli"
+	_bd="$builddir/target/.bolt"; rm -rf "$_bd"; mkdir -p "$_bd" || return 1
+	llvm-bolt "$_bin" -instrument --instrumentation-file="$_bd/cli.fdata" \
+		--instrumentation-file-append-pid -o "$_bin.inst" || return 1
+	_workload "$_bin.inst" || true
+	[ -n "$(find "$_bd" -name 'cli.fdata*' 2>/dev/null)" ] || return 1
+	merge-fdata "$_bd"/cli.fdata* > "$_bd/merged.fdata" || return 1
+	llvm-bolt "$_bin" -o "$_bin.bolt" -data="$_bd/merged.fdata" \
+		-reorder-blocks=ext-tsp -reorder-functions=hfsort \
+		-split-functions -split-all-cold -icf=1 || return 1
+	mv "$_bin.bolt" "$_bin"; rm -f "$_bin.inst"
+}
+
+# Full PGO build. Runs inside an `if` so its failures are caught (errexit off in
+# a condition) and we can fall back. Returns non-zero on any miss.
+_pgo_build() {
+	[ -d testfiles ] || return 1
+	_profdata="$(command -v llvm-profdata 2>/dev/null || true)"
+	[ -z "$_profdata" ] && _profdata="$(ls /usr/lib/llvm*/bin/llvm-profdata 2>/dev/null | head -n1)"
+	[ -n "$_profdata" ] || return 1
+	_prof="$builddir/target/.pgo"; rm -rf "$_prof"; mkdir -p "$_prof" || return 1
+	msg "PGO: instrumenting player-cli (llvm-profdata: $_profdata)"
+	RUSTFLAGS="$_base_rustflags -C profile-generate=$_prof" \
+		cargo build --profile "$_cargo_profile" --frozen -p player-cli || return 1
+	msg "PGO: collecting profiles (branch-heavy headless workload)"
+	export LLVM_PROFILE_FILE="$_prof/cli-%p-%m.profraw"
+	_workload "$_outdir/player-cli" || true
+	unset LLVM_PROFILE_FILE
+	[ -n "$(find "$_prof" -name '*.profraw' 2>/dev/null)" ] || return 1
+	"$_profdata" merge -o "$_prof/merged.profdata" "$_prof" || return 1
+	_use="-C profile-use=$_prof/merged.profdata"
+	[ "$_bolt" = 1 ] && _use="$_use -C link-args=-Wl,-q"
+	msg "PGO: building optimized player-gtk + player-cli"
+	RUSTFLAGS="$_base_rustflags $_use" \
+		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli || return 1
+	[ "$_bolt" = 1 ] && { _bolt_cli && msg "BOLT: player-cli optimized" || warning "BOLT skipped (llvm-bolt/merge-fdata missing or failed)"; }
+	return 0
+}
+
+# Bit-perfect safety net: decode every testfile and byte-compare vs ffmpeg. A
+# difference means PGO/BOLT (or anything) altered samples — refuse to package.
+_bitperfect_gate() {
+	command -v ffmpeg >/dev/null || { warning "bit-perfect gate skipped (no ffmpeg)"; return 0; }
+	[ -d testfiles ] || { warning "bit-perfect gate skipped (no testfiles)"; return 0; }
+	_cli="$_outdir/player-cli"; _t="$builddir/target/.gate"; rm -rf "$_t"; mkdir -p "$_t"
+	_rc=0
+	for _f in s16_44k.flac flac_48k.flac flac_96k.flac s16_44k.wav s32_44k.wav; do
+		[ -f "testfiles/$_f" ] || continue
+		"$_cli" dump "testfiles/$_f" -o "$_t/mine" || { _rc=1; continue; }
+		ffmpeg -v error -y -i "testfiles/$_f" -f s32le -ac 2 "$_t/ff" || { _rc=1; continue; }
+		if cmp -s "$_t/mine" "$_t/ff"; then msg "bit-perfect OK: $_f"; else error "bit-perfect FAIL: $_f"; _rc=1; fi
+	done
+	rm -rf "$_t"
+	[ "$_rc" = 0 ] || { error "bit-perfect gate failed — refusing to package this build"; return 1; }
+}
+
 build() {
 	cd "$builddir"
-	# Native musl/aarch64 build inside the chroot: no --target, no linker flags.
-	# Tune codegen for the SDM845 (Kryo 385 = Cortex-A75 big + A55 LITTLE, which
-	# share the ARMv8.2-A ISA, so a75-tuned code runs safely on both clusters).
-	# Set via RUSTFLAGS here — not only in .cargo/config.toml — so it applies
-	# regardless of the chroot rustc's exact musl host triple.
+	# Native musl/aarch64 build inside the chroot (under qemu for foreign arch):
+	# no --target, no linker flags. Tune codegen for the SDM845 (Kryo 385 =
+	# Cortex-A75 big + A55 LITTLE, which share the ARMv8.2-A ISA, so a75-tuned code
+	# runs safely on both clusters). Set via RUSTFLAGS here — not only in
+	# .cargo/config.toml — so it applies regardless of the chroot rustc's exact
+	# musl host triple. An env RUSTFLAGS replaces config rustflags (no merge), so
+	# everything codegen-related must live here.
 	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort"
-	cargo build --release --frozen -p player-gtk -p player-cli
+	_base_rustflags="$RUSTFLAGS"
+
+	if [ "$_pgo" = 1 ] && _pgo_build; then
+		msg "PGO build complete"
+	else
+		[ "$_pgo" = 1 ] && msg "PGO unavailable — plain release build (add the llvm package providing llvm-profdata to makedepends, LLVM major = $(rustc -vV | sed -n 's/^LLVM version: //p'))"
+		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli
+	fi
+
+	_bitperfect_gate || return 1
 }
 
 package() {
 	cd "$builddir"
-	install -Dm755 target/release/player-gtk "$pkgdir"/usr/bin/player-gtk
-	install -Dm755 target/release/player-cli "$pkgdir"/usr/bin/player-cli
+	# Built by build() as the `release-pgo` profile (PGO/BOLT or plain fallback);
+	# abuild strips these during packaging.
+	install -Dm755 target/release-pgo/player-gtk "$pkgdir"/usr/bin/player-gtk
+	install -Dm755 target/release-pgo/player-cli "$pkgdir"/usr/bin/player-cli
 
 	# Phosh app-grid launcher + icon.
 	install -Dm644 "$srcdir"/hifi-player.desktop \

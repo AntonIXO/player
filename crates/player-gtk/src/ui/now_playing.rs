@@ -10,7 +10,7 @@ use player_library::{fmt_dur_ms, Track};
 
 use crate::state::{SharedState, SharedUi};
 use crate::widgets::{
-    art_widget, circle, clamp, fill, format_chip, status_page, wrap_scroller, ART_HERO, ART_MINI,
+    art_widget, circle, clamp, fill, format_chip, status_page, ART_HERO, ART_MINI,
 };
 
 pub(crate) struct Np {
@@ -141,12 +141,13 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
-    // Wrap the clamped column in a vertical scroller (design's `overflow:auto`).
-    // The hero art is now sized from the window width and can be large (up to
-    // `hero_art_px`'s 380 cap), so on a shorter window the cluster may exceed the
-    // viewport — the scroller absorbs that instead of clipping. The `clamp` caps
-    // the width so the seek bar/hero stay readable on a wide desktop window.
-    let content_page = wrap_scroller(&clamp(&content));
+    // Centre the cluster vertically in the page (`valign: Center`, no vexpand) so it
+    // sits balanced on the tall phone screen. The `clamp` caps the width so the seek
+    // bar/hero stay readable on a wide desktop window. **No scroller** — the device
+    // screen is tall enough for the cluster (hero ≤300 + transport ≈ 645 px, well
+    // under the height budget), and the page must never scroll.
+    let content_page = clamp(&content);
+    content_page.set_valign(gtk::Align::Center);
     stack.add_named(&content_page, Some("content"));
     stack.set_visible_child_name("empty");
 
@@ -220,11 +221,11 @@ pub(crate) fn update_mini(state: &SharedState, ui: &SharedUi) {
     ui.mini.set_reveal_child(has && !on_playing);
 }
 
-/// Hero-art edge length for a given window width. Fills the screen (minus the
-/// column's side margins) but is clamped so it never overflows a true-360 device
-/// and never grows absurdly large on a wide desktop window.
+/// Hero-art edge length for a given window width. Scales with the screen (minus
+/// the column's side margins plus extra breathing room) but is clamped so it never
+/// overflows a true-360 device and never grows too large on a wide desktop window.
 pub(crate) fn hero_art_px(window_w: i32) -> i32 {
-    (window_w - 48).clamp(180, 380)
+    (window_w - 72).clamp(160, 300)
 }
 
 /// Recompute the Now-Playing hero size from the current window width and, if it

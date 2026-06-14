@@ -240,19 +240,21 @@ pin a large minimum width:
   screen.
 
 **Per-screen patterns already in place — follow them for new screens:**
-- **Now Playing is a single top-down column** (matching the design's `NowPlayingView`):
-  hero art → titles → toggles → seek → transport → format chip, wrapped in
-  `wrap_scroller(clamp(content))` as the stack child (clamp caps width on a wide desktop;
-  the scroller is the design's `overflow:auto` so a tall cluster never clips). The **hero is
-  sized from the window width**, not a fixed constant: `now_playing::hero_art_px(window_w) =
-  (window_w − 48).clamp(180, 380)` (fills the often-wider-than-360 device, +8 px slack so
-  hero+margins never overflow, capped 380 so it stays sane on desktop). `ART_HERO` (240) is
-  only the build-time/Cell fallback until the startup poll runs `resize_hero`, which resizes
-  the art box and rebuilds the texture at the new size (no-op when unchanged). **Do not
-  dock the format chip to the bottom with a `vexpand` spacer** — the device screen is *tall*
-  and a spacer left a big empty gap with a lonely chip (looked broken). Transport buttons:
-  play 72, secondary (prev/rewind/fwd/next) 48, toggle pills 40 — the device is large enough
-  for generous targets; re-check the height still fits if you add tall extras.
+- **Now Playing is a single centred column** (matching the design's `NowPlayingView`):
+  hero art → titles → toggles → seek → transport → format chip, wrapped in `clamp(content)`
+  with `valign: Center` as the stack child (clamp caps width on a wide desktop; centring
+  balances the cluster on the tall phone). **No `ScrolledWindow`** — the page must never
+  scroll, and the device screen is tall enough for the cluster (hero ≤300 + transport ≈ 645 px,
+  well under the height budget); don't re-add a scroller. The **hero is sized from the window
+  width**, not a fixed constant: `now_playing::hero_art_px(window_w) = (window_w − 72).clamp(160,
+  300)` (scales with the often-wider-than-360 device with side breathing room so hero+margins
+  never overflow, capped 300 so it stays sane on desktop). `ART_HERO` (240) is only the build-time/Cell fallback
+  until the startup poll runs `resize_hero`, which resizes the art box and rebuilds the texture
+  at the new size (no-op when unchanged). **Do not dock the format chip to the bottom with a
+  `vexpand` spacer** — the device screen is *tall* and a spacer left a big empty gap with a lonely
+  chip (looked broken). Transport buttons: play 72, secondary (prev/rewind/fwd/next) 48, toggle
+  pills 40 — the device is large enough for generous targets; re-check the height fits if you add
+  tall extras.
 - **Pages with a text entry use `AdwToolbarView`** (Search does): entry + filters in
   `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
   the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks

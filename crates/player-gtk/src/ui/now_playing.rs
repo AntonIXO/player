@@ -10,7 +10,7 @@ use player_library::{fmt_dur_ms, Track};
 
 use crate::state::{SharedState, SharedUi};
 use crate::widgets::{
-    art_widget, circle, clamp, fill, format_chip, status_page, ART_HERO, ART_MINI,
+    art_widget, circle, clamp, fill, format_chip, status_page, wrap_scroller, ART_HERO, ART_MINI,
 };
 
 pub(crate) struct Np {
@@ -68,20 +68,20 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     // secondary toggle row — shuffle / repeat as pills, above the seek bar
     // (Poweramp-Adwaita design: the transport row is reserved for playback).
-    let shuffle = circle("media-playlist-shuffle-symbolic", 36, "Shuffle");
+    let shuffle = circle("media-playlist-shuffle-symbolic", 40, "Shuffle");
     shuffle.add_css_class("pill-toggle");
-    let repeat = circle("media-playlist-repeat-symbolic", 36, "Repeat");
+    let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
     repeat.add_css_class("pill-toggle");
     // Heart the current track (filled/accented when loved). Disabled until a
     // library-indexed track is playing.
-    let love = circle("emblem-favorite-symbolic", 36, "Love this track");
+    let love = circle("emblem-favorite-symbolic", 40, "Love this track");
     love.add_css_class("pill-toggle");
     love.set_sensitive(false);
     // Jump to the current track's artist / album detail page.
-    let goto_artist = circle("avatar-default-symbolic", 36, "Go to artist");
+    let goto_artist = circle("avatar-default-symbolic", 40, "Go to artist");
     goto_artist.add_css_class("pill-toggle");
     goto_artist.set_sensitive(false);
-    let goto_album = circle("media-optical-symbolic", 36, "Go to album");
+    let goto_album = circle("media-optical-symbolic", 40, "Go to album");
     goto_album.add_css_class("pill-toggle");
     goto_album.set_sensitive(false);
     let toggles = gtk::Box::new(Orientation::Horizontal, 9);
@@ -93,13 +93,13 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     toggles.append(&goto_album);
 
     // transport: prev · −10s · play · +10s · next
-    let prev = circle("media-skip-backward-symbolic", 44, "Previous");
-    let rewind = circle("media-seek-backward-symbolic", 44, "Back 10 seconds");
-    let play = circle("media-playback-start-symbolic", 64, "Play");
+    let prev = circle("media-skip-backward-symbolic", 48, "Previous");
+    let rewind = circle("media-seek-backward-symbolic", 48, "Back 10 seconds");
+    let play = circle("media-playback-start-symbolic", 72, "Play");
     play.add_css_class("play-hero");
     play.remove_css_class("flat");
-    let fwd = circle("media-seek-forward-symbolic", 44, "Forward 10 seconds");
-    let next = circle("media-skip-forward-symbolic", 44, "Next");
+    let fwd = circle("media-seek-forward-symbolic", 48, "Forward 10 seconds");
+    let next = circle("media-skip-forward-symbolic", 48, "Next");
     let transport = gtk::Box::new(Orientation::Horizontal, 4);
     transport.set_halign(gtk::Align::Center);
     for b in [&prev, &rewind, &play, &fwd, &next] {
@@ -141,12 +141,12 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
-    // Centre the cluster vertically in the page (`valign: Center`, no vexpand) so
-    // it sits balanced on a tall phone screen rather than docked to the top. The
-    // `clamp` also caps the width so the seek bar/hero stay readable on a wide
-    // desktop window. No scroller — the cluster fits the vertical budget.
-    let content_page = clamp(&content);
-    content_page.set_valign(gtk::Align::Center);
+    // Wrap the clamped column in a vertical scroller (design's `overflow:auto`).
+    // The hero art is now sized from the window width and can be large (up to
+    // `hero_art_px`'s 380 cap), so on a shorter window the cluster may exceed the
+    // viewport — the scroller absorbs that instead of clipping. The `clamp` caps
+    // the width so the seek bar/hero stay readable on a wide desktop window.
+    let content_page = wrap_scroller(&clamp(&content));
     stack.add_named(&content_page, Some("content"));
     stack.set_visible_child_name("empty");
 
@@ -184,7 +184,11 @@ pub(crate) fn show_track(_state: &SharedState, ui: &SharedUi, track: &Track) {
     ui.np_elapsed.set_label("0:00");
     ui.np_seek.set_value(0.0);
     ui.mp_progress.set_fraction(0.0);
-    fill(&ui.np_art, &art_widget(&ui.art, track.art_hash.as_deref(), ART_HERO, true));
+    // Size the hero from the (possibly wider-than-360) window; falls back to the
+    // build-time default until the surface settles and `resize_hero` runs.
+    let hero = ui.hero_px.get();
+    ui.np_art.set_size_request(hero, hero);
+    fill(&ui.np_art, &art_widget(&ui.art, track.art_hash.as_deref(), hero, true));
     fill(&ui.mp_art, &art_widget(&ui.art, track.art_hash.as_deref(), ART_MINI, false));
     ui.mp_title.set_label(&track.display_title());
     ui.mp_artist.set_label(&track.subtitle());
@@ -214,6 +218,33 @@ pub(crate) fn update_mini(state: &SharedState, ui: &SharedUi) {
     let has = state.borrow().current.is_some();
     let on_playing = ui.stack.visible_child_name().as_deref() == Some("playing");
     ui.mini.set_reveal_child(has && !on_playing);
+}
+
+/// Hero-art edge length for a given window width. Fills the screen (minus the
+/// column's side margins) but is clamped so it never overflows a true-360 device
+/// and never grows absurdly large on a wide desktop window.
+pub(crate) fn hero_art_px(window_w: i32) -> i32 {
+    (window_w - 48).clamp(180, 380)
+}
+
+/// Recompute the Now-Playing hero size from the current window width and, if it
+/// changed, resize the art box and (if a track is showing) rebuild its texture at
+/// the new size. Cheap no-op when the size is unchanged, so it's safe to call on
+/// every resize/poll tick.
+pub(crate) fn resize_hero(state: &SharedState, ui: &SharedUi, window_w: i32) {
+    let hero = hero_art_px(window_w);
+    if hero == ui.hero_px.get() {
+        return;
+    }
+    ui.hero_px.set(hero);
+    ui.np_art.set_size_request(hero, hero);
+    let track = {
+        let s = state.borrow();
+        s.current.and_then(|i| s.queue.get(i).cloned())
+    };
+    if let Some(t) = track {
+        fill(&ui.np_art, &art_widget(&ui.art, t.art_hash.as_deref(), hero, true));
+    }
 }
 
 pub(crate) fn set_play_icon(ui: &SharedUi, playing: bool) {

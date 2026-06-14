@@ -223,11 +223,16 @@ pin a large minimum width:
   **Gotcha:** `window.width()` is the *default* (360) during `build_ui` and only becomes
   the real value after the compositor configures the surface — and Phosh often maximises to
   a logical width *wider* than 360 (depends on the device scale). So anything sized from the
-  width must recompute *after the surface settles*: `main.rs` runs a deferred
-  `timeout_add_local_once` recompute (300 ms / 1200 ms) on top of the `default-width` /
-  `maximized` notifies, else covers stay small until the first resize/re-sort. Always budget
-  the *minimum* width to ≤360 (so it never overflows a true-360 device) but derive actual
-  sizes from the real allocated width.
+  width must recompute *after the surface settles*. A fixed `timeout_add_local_once`
+  (300/1200 ms) is **not** reliable: on Phosh the width settles *later* than that, the
+  `default-width` notify does **not** fire on maximise, and the `maximized` notify fires
+  *before* the width settles. So `main.rs` runs a **startup poll** (`timeout_add_local`,
+  250 ms ticks) that reads `window.width()` and recomputes the width-derived art on each
+  change, stopping once it holds steady ~2 s (or a ~15 s cap) — on top of the
+  `default-width`/`maximized` notifies for later resizes. The single `rescale` closure
+  recomputes **both** the album `cover_px` and the Now-Playing `hero_px`. Always budget the
+  *minimum* width to ≤360 (so it never overflows a true-360 device) but derive actual sizes
+  from the real allocated width.
 - A **non-shrinking control row** (e.g. a `.linked` segmented bar of text tabs) pins its
   natural width. Make such chrome **horizontally scrollable**: the Library browse tabs live
   in a `ScrolledWindow` with `PolicyType::External` (hexpand, scrollbar hidden) so the bar
@@ -235,13 +240,19 @@ pin a large minimum width:
   screen.
 
 **Per-screen patterns already in place — follow them for new screens:**
-- **Now Playing is a single centred column** (matching the design's `NowPlayingView`):
-  hero art (`ART_HERO` = 208) → titles → toggles → seek → transport → format chip, wrapped
-  in `clamp(content)` with `valign: Center` as the stack child (the clamp caps width on a
-  wide desktop; centring balances the cluster on a tall phone). **No `ScrolledWindow` and no
-  `vexpand` dock-to-bottom spacer** — the device screen is *tall*, so a spacer just left a
-  big empty gap with a lonely chip at the bottom (looked broken). The cluster measures
-  ~553 px tall, well under the budget; don't add tall extras and re-check the height fits.
+- **Now Playing is a single top-down column** (matching the design's `NowPlayingView`):
+  hero art → titles → toggles → seek → transport → format chip, wrapped in
+  `wrap_scroller(clamp(content))` as the stack child (clamp caps width on a wide desktop;
+  the scroller is the design's `overflow:auto` so a tall cluster never clips). The **hero is
+  sized from the window width**, not a fixed constant: `now_playing::hero_art_px(window_w) =
+  (window_w − 48).clamp(180, 380)` (fills the often-wider-than-360 device, +8 px slack so
+  hero+margins never overflow, capped 380 so it stays sane on desktop). `ART_HERO` (240) is
+  only the build-time/Cell fallback until the startup poll runs `resize_hero`, which resizes
+  the art box and rebuilds the texture at the new size (no-op when unchanged). **Do not
+  dock the format chip to the bottom with a `vexpand` spacer** — the device screen is *tall*
+  and a spacer left a big empty gap with a lonely chip (looked broken). Transport buttons:
+  play 72, secondary (prev/rewind/fwd/next) 48, toggle pills 40 — the device is large enough
+  for generous targets; re-check the height still fits if you add tall extras.
 - **Pages with a text entry use `AdwToolbarView`** (Search does): entry + filters in
   `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
   the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks
@@ -259,7 +270,8 @@ pin a large minimum width:
   width wider than the phone and (via the homogeneous `ViewStack`) shifts/clips every page.
 - The 3-up Albums grid floor is tuned (`album_cover_px`, cover floor 80) so the page min
   width lands ~326 px — comfortably under 360 even on a slightly narrower/scaled device.
-- Touch targets ≥ ~44 px; secondary controls may be smaller (toggles ~36).
+- Touch targets ≥ ~44 px (transport secondary 48, play 72); secondary toggles may be a
+  little smaller (the Now-Playing pill toggles are 40).
 
 **Debugging over-wide layout:** after `window.present()`, a temporary
 `glib::timeout_add_local_once` that calls `widget.measure(Orientation::Horizontal, -1)` on

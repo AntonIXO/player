@@ -93,6 +93,10 @@ pub(crate) struct Ui {
     /// Album-cover edge length (px) for the 3-up grid, recomputed from the window
     /// width on resize so the covers scale (see `ui::library::album_cover_px`).
     pub(crate) cover_px: Cell<i32>,
+    /// Now-Playing hero-art edge length (px), recomputed from the window width so
+    /// the cover fills the (often wider-than-360) device screen without
+    /// overflowing it (see `ui::now_playing::hero_art_px`).
+    pub(crate) hero_px: Cell<i32>,
     // search
     pub(crate) search_entry: gtk::SearchEntry,
     pub(crate) search_results: gtk::Box,

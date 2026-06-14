@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=7
+pkgrel=8
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -11,7 +11,11 @@ license="MIT"
 # abuild's shared-library tracing, so they are not listed here. alsa-utils is for
 # on-device verification (aplay / speaker-test). The RT / governor / IRQ tuning is
 # self-contained in the systemd service, so there is no rtirq/cpupower dependency.
-depends="alsa-utils"
+# adwaita-icon-theme is a *data* dependency (SVG symbolic icons), NOT a shared
+# library, so abuild's tracing won't pick it up — list it explicitly. The GTK shell
+# looks up Adwaita symbolic names at runtime (e.g. emblem-favorite-symbolic for the
+# "love" pill); without the theme GTK falls back to hicolor and the icon is blank.
+depends="alsa-utils adwaita-icon-theme"
 makedepends="
 	cargo
 	rust

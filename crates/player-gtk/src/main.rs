@@ -56,7 +56,7 @@ use ui::library::{
     refresh_library, window_width, wire_segmented, wire_sort,
 };
 use ui::mini::build_mini;
-use ui::now_playing::{build_now_playing, update_mini, update_now_playing_empty};
+use ui::now_playing::{build_now_playing, resize_hero, update_mini, update_now_playing_empty};
 use ui::queue::refresh_queue;
 use ui::search::{build_search, kick_search, render_search_results, spawn_search_worker};
 use ui::settings::open_settings;
@@ -288,6 +288,7 @@ fn build_ui(app: &adw::Application) {
         sort: Cell::new(player_library::Sort::Title),
         sort_label: lib.sort_label.clone(),
         cover_px: Cell::new(110),
+        hero_px: Cell::new(widgets::ART_HERO),
         search_entry: search_entry.clone(),
         search_results,
         filter: RefCell::new(player_library::Filter::Albums),
@@ -303,18 +304,21 @@ fn build_ui(app: &adw::Application) {
     wire_segmented(&state, &ui, &lib.seg);
     wire_sort(&state, &ui, &lib.sort_btn, &lib.sort_opts);
 
-    // Rescale the 3-up album covers as the window resizes / (un)maximises so the
-    // grid always fits the width. Rebuilds only when the quantised cover size
-    // actually changes (see album_cover_px).
+    // Rescale the width-derived art (the 3-up album covers and the Now-Playing
+    // hero) as the window resizes / (un)maximises so they always fit the width.
+    // Both rebuild only when their quantised/clamped size actually changes, so
+    // this is cheap to call on every resize and on each startup poll tick.
     {
         let rescale = {
             let (state, ui) = (state.clone(), ui.clone());
             move || {
-                let px = album_cover_px(window_width(&ui));
+                let w = window_width(&ui);
+                let px = album_cover_px(w);
                 if px != ui.cover_px.get() {
                     ui.cover_px.set(px);
                     rebuild_albums(&state, &ui);
                 }
+                resize_hero(&state, &ui, w);
             }
         };
         let rescale = Rc::new(rescale);
@@ -322,16 +326,35 @@ fn build_ui(app: &adw::Application) {
         ui.window.connect_default_width_notify(move |_| r1());
         let r2 = rescale.clone();
         ui.window.connect_maximized_notify(move |_| r2());
-        // The initial refresh_library sizes the 3-up covers from the *default*
-        // width (360), because the compositor hasn't configured the real surface
-        // size yet — and on Phosh neither default-width nor maximized notify
-        // reliably fires with the final (maximised, often wider) width. Recompute
-        // once the allocation has settled so the covers use the true width on
-        // first paint, instead of only correcting after the user re-sorts.
-        for delay in [300u32, 1200] {
-            let r = rescale.clone();
-            glib::timeout_add_local_once(Duration::from_millis(delay as u64), move || r());
-        }
+        // The initial sizing runs against the *default* width (360), because the
+        // compositor hasn't configured the real surface yet — and on Phosh neither
+        // default-width nor maximized notify reliably fires with the final
+        // (maximised, often wider) width, and it settles *later* than a fixed delay
+        // can assume. So poll the real width until it stabilises, recomputing on
+        // each change, then stop. Budget the *min* layout to ≤360 regardless; this
+        // only scales art *up* to the true allocated width.
+        let r3 = rescale.clone();
+        let uiw = ui.clone();
+        let mut last = -1i32;
+        let mut stable = 0u32;
+        let mut ticks = 0u32;
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            ticks += 1;
+            let w = uiw.window.width();
+            if w != last {
+                last = w;
+                stable = 0;
+                r3();
+            } else {
+                stable += 1;
+            }
+            // Stop once the width has held steady for ~2s, or after a ~15s cap.
+            if (w > 0 && stable >= 8) || ticks >= 60 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
     }
 
     // header search toggle → Search page + focus the entry

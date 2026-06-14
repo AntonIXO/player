@@ -775,15 +775,15 @@ fn build_artist_detail(
     albums: Vec<Album>,
 ) -> adw::NavigationPage {
     let header = gtk::Box::new(Orientation::Horizontal, 16);
-    let avatar = gtk::Box::new(Orientation::Vertical, 0);
-    avatar.set_size_request(132, 132);
-    avatar.add_css_class("art-lg");
-    let img = gtk::Image::from_icon_name("avatar-default-symbolic");
-    img.set_pixel_size(72);
-    img.set_hexpand(true);
-    img.set_vexpand(true);
-    img.add_css_class("dim-label");
-    avatar.append(&img);
+    // We never have an actual artist photo, so use a real AdwAvatar: it shows the
+    // artist's initials in a generated-colour circle — purpose-built for this and
+    // it looks intentional instead of a broken placeholder. Crucially it requests
+    // exactly `size`×`size` and never hexpand-propagates, unlike the old hand-rolled
+    // Box (whose inner Image had `hexpand:true`, which a GtkBox propagates → the
+    // avatar stretched horizontally and shoved the titles off to the side).
+    let avatar = adw::Avatar::new(132, Some(artist), true);
+    avatar.set_halign(gtk::Align::Center);
+    avatar.set_valign(gtk::Align::Center);
     header.append(&avatar);
 
     let titles = gtk::Box::new(Orientation::Vertical, 4);

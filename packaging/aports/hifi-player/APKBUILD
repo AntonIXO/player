@@ -88,19 +88,51 @@ _bolt=0
 _cargo_profile="release-pgo"
 _outdir="target/$_cargo_profile"
 
-# Branch-heavy, headless, audio-HW-free training workload. $1 = player-cli binary.
+# Directory of training/gate clips, set by _prep_testdata (global, sh-scoped).
+_TESTDIR=""
+
+# Synthesize one clip with ffmpeg: $1=outfile $2=rate $3=sample_fmt $4=codec.
+# Tones + pink noise so FLAC residuals are non-trivial (exercises the real decode
+# branches); flat PCM compresses to nothing and shows ~0 PGO gain (.jules/bolt.md).
+# $4 must be set explicitly — for WAV, -sample_fmt alone won't pick a 32-bit
+# encoder (ffmpeg defaults to pcm_s16le and the encode fails).
+_synth() {
+	ffmpeg -v error -y \
+		-f lavfi -i "sine=frequency=440:duration=15" \
+		-f lavfi -i "anoisesrc=duration=15:color=pink:amplitude=0.4" \
+		-filter_complex "amix=inputs=2:duration=shortest" \
+		-ac 2 -ar "$2" -sample_fmt "$3" -c:a "$4" "$1"
+}
+
+# Pick training/gate material. Prefer the repo's real fixtures — but testfiles/ is
+# gitignored, so `pmbootstrap --src` doesn't ship it; in that case synthesize a
+# small varied set with ffmpeg so PGO and the bit-perfect gate are self-contained.
+_prep_testdata() {
+	if [ -d testfiles ] && ls testfiles/*.flac >/dev/null 2>&1; then
+		_TESTDIR="testfiles"; return 0
+	fi
+	command -v ffmpeg >/dev/null || return 1
+	_TESTDIR="$builddir/target/.testdata"; rm -rf "$_TESTDIR"; mkdir -p "$_TESTDIR" || return 1
+	_synth "$_TESTDIR/train_s16_44k.flac" 44100 s16 flac      || return 1
+	_synth "$_TESTDIR/train_s16_96k.flac" 96000 s16 flac      || true
+	_synth "$_TESTDIR/train_s32_44k.wav"  44100 s32 pcm_s32le || true
+	_synth "$_TESTDIR/train_s16_44k.wav"  44100 s16 pcm_s16le || true
+	[ -f "$_TESTDIR/train_s16_44k.flac" ] || return 1
+}
+
+# Branch-heavy, headless, audio-HW-free workload over $_TESTDIR. $1 = player-cli.
 _workload() {
 	_cli="$1"
 	_db="$builddir/target/.pgo-lib.db"; rm -f "$_db"
 	_n=0; while [ "$_n" -lt 5 ]; do
-		for _f in s16_44k.flac flac_48k.flac flac_96k.flac s16_44k.wav s32_44k.wav; do
-			[ -f "testfiles/$_f" ] && "$_cli" dump "testfiles/$_f" -o /dev/null >/dev/null 2>&1 || true
+		for _f in "$_TESTDIR"/*.flac "$_TESTDIR"/*.wav; do
+			[ -f "$_f" ] && "$_cli" dump "$_f" -o /dev/null >/dev/null 2>&1 || true
 		done
 		_n=$((_n + 1))
 	done
-	for _f in testfiles/*; do "$_cli" probe "$_f" >/dev/null 2>&1 || true; done
-	"$_cli" scan testfiles --db "$_db" --force >/dev/null 2>&1 || true
-	for _q in flac wav test album the love piano jazz remix live 2024; do
+	for _f in "$_TESTDIR"/*; do [ -f "$_f" ] && "$_cli" probe "$_f" >/dev/null 2>&1 || true; done
+	"$_cli" scan "$_TESTDIR" --db "$_db" --force >/dev/null 2>&1 || true
+	for _q in flac wav train sine noise test album the love jazz remix 2024; do
 		for _filt in all tracks albums artists; do
 			"$_cli" search "$_q" --db "$_db" --filter "$_filt" >/dev/null 2>&1 || true
 		done
@@ -126,46 +158,59 @@ _bolt_cli() {
 	mv "$_bin.bolt" "$_bin"; rm -f "$_bin.inst"
 }
 
-# Full PGO build. Runs inside an `if` so its failures are caught (errexit off in
-# a condition) and we can fall back. Returns non-zero on any miss.
+# Full PGO build. Runs inside an `if` so errexit is off and we can fall back; each
+# bail prints a SPECIFIC reason so a skip never misattributes its cause.
 _pgo_build() {
-	[ -d testfiles ] || return 1
-	_profdata="$(command -v llvm-profdata 2>/dev/null || true)"
+	[ -n "$_TESTDIR" ] || { warning "PGO skipped: no training material"; return 1; }
+	# Match llvm-profdata to rustc's LLVM major (the raw-profile format is version
+	# specific); prefer the versioned tool/path over an unversioned default.
+	_major="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')"
+	_profdata=""
+	for _c in "/usr/lib/llvm$_major/bin/llvm-profdata" "llvm-profdata-$_major" llvm-profdata; do
+		if [ -x "$_c" ]; then _profdata="$_c"; break; fi
+		_p="$(command -v "$_c" 2>/dev/null || true)"; [ -n "$_p" ] && { _profdata="$_p"; break; }
+	done
 	[ -z "$_profdata" ] && _profdata="$(ls /usr/lib/llvm*/bin/llvm-profdata 2>/dev/null | head -n1)"
-	[ -n "$_profdata" ] || return 1
+	[ -n "$_profdata" ] || { warning "PGO skipped: llvm-profdata not found — add 'llvm$_major' (or 'llvm') to makedepends"; return 1; }
 	_prof="$builddir/target/.pgo"; rm -rf "$_prof"; mkdir -p "$_prof" || return 1
-	msg "PGO: instrumenting player-cli (llvm-profdata: $_profdata)"
+	msg "PGO: instrumenting player-cli (profdata=$_profdata; material=$_TESTDIR)"
 	RUSTFLAGS="$_base_rustflags -C profile-generate=$_prof" \
-		cargo build --profile "$_cargo_profile" --frozen -p player-cli || return 1
-	msg "PGO: collecting profiles (branch-heavy headless workload)"
+		cargo build --profile "$_cargo_profile" --frozen -p player-cli \
+		|| { warning "PGO skipped: instrumented build failed (rustc without profiler runtime?)"; return 1; }
+	msg "PGO: collecting profiles"
 	export LLVM_PROFILE_FILE="$_prof/cli-%p-%m.profraw"
 	_workload "$_outdir/player-cli" || true
 	unset LLVM_PROFILE_FILE
-	[ -n "$(find "$_prof" -name '*.profraw' 2>/dev/null)" ] || return 1
-	"$_profdata" merge -o "$_prof/merged.profdata" "$_prof" || return 1
+	[ -n "$(find "$_prof" -name '*.profraw' 2>/dev/null)" ] \
+		|| { warning "PGO skipped: no .profraw produced (could not run instrumented binary?)"; return 1; }
+	"$_profdata" merge -o "$_prof/merged.profdata" "$_prof" \
+		|| { warning "PGO skipped: profile merge failed (llvm-profdata vs rustc LLVM $_major mismatch?)"; return 1; }
 	_use="-C profile-use=$_prof/merged.profdata"
 	[ "$_bolt" = 1 ] && _use="$_use -C link-args=-Wl,-q"
 	msg "PGO: building optimized player-gtk + player-cli"
 	RUSTFLAGS="$_base_rustflags $_use" \
-		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli || return 1
-	[ "$_bolt" = 1 ] && { _bolt_cli && msg "BOLT: player-cli optimized" || warning "BOLT skipped (llvm-bolt/merge-fdata missing or failed)"; }
+		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli \
+		|| { warning "PGO skipped: optimized build failed"; return 1; }
+	[ "$_bolt" = 1 ] && { _bolt_cli && msg "BOLT: player-cli optimized" || warning "BOLT skipped (llvm-bolt/merge-fdata not packaged by Alpine)"; }
 	return 0
 }
 
-# Bit-perfect safety net: decode every testfile and byte-compare vs ffmpeg. A
+# Bit-perfect safety net: decode each clip and byte-compare vs ffmpeg. A
 # difference means PGO/BOLT (or anything) altered samples — refuse to package.
 _bitperfect_gate() {
 	command -v ffmpeg >/dev/null || { warning "bit-perfect gate skipped (no ffmpeg)"; return 0; }
-	[ -d testfiles ] || { warning "bit-perfect gate skipped (no testfiles)"; return 0; }
+	[ -n "$_TESTDIR" ] && [ -d "$_TESTDIR" ] || { warning "bit-perfect gate skipped (no test material)"; return 0; }
 	_cli="$_outdir/player-cli"; _t="$builddir/target/.gate"; rm -rf "$_t"; mkdir -p "$_t"
-	_rc=0
-	for _f in s16_44k.flac flac_48k.flac flac_96k.flac s16_44k.wav s32_44k.wav; do
-		[ -f "testfiles/$_f" ] || continue
-		"$_cli" dump "testfiles/$_f" -o "$_t/mine" || { _rc=1; continue; }
-		ffmpeg -v error -y -i "testfiles/$_f" -f s32le -ac 2 "$_t/ff" || { _rc=1; continue; }
-		if cmp -s "$_t/mine" "$_t/ff"; then msg "bit-perfect OK: $_f"; else error "bit-perfect FAIL: $_f"; _rc=1; fi
+	_rc=0; _checked=0
+	for _f in "$_TESTDIR"/*.flac "$_TESTDIR"/*.wav; do
+		[ -f "$_f" ] || continue
+		_checked=$((_checked + 1))
+		"$_cli" dump "$_f" -o "$_t/mine" || { _rc=1; continue; }
+		ffmpeg -v error -y -i "$_f" -f s32le -ac 2 "$_t/ff" || { _rc=1; continue; }
+		if cmp -s "$_t/mine" "$_t/ff"; then msg "bit-perfect OK: $(basename "$_f")"; else error "bit-perfect FAIL: $(basename "$_f")"; _rc=1; fi
 	done
 	rm -rf "$_t"
+	[ "$_checked" -gt 0 ] || { warning "bit-perfect gate: no files to check"; return 0; }
 	[ "$_rc" = 0 ] || { error "bit-perfect gate failed — refusing to package this build"; return 1; }
 }
 
@@ -180,11 +225,12 @@ build() {
 	# everything codegen-related must live here.
 	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort"
 	_base_rustflags="$RUSTFLAGS"
+	_prep_testdata || warning "no training/gate material (testfiles/ absent and ffmpeg synth failed)"
 
 	if [ "$_pgo" = 1 ] && _pgo_build; then
 		msg "PGO build complete"
 	else
-		[ "$_pgo" = 1 ] && msg "PGO unavailable — plain release build (add the llvm package providing llvm-profdata to makedepends, LLVM major = $(rustc -vV | sed -n 's/^LLVM version: //p'))"
+		msg "Plain release build (PGO off or unavailable — see warnings above)"
 		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli
 	fi
 

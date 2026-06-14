@@ -224,3 +224,45 @@ fn scan_incremental_and_search() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn tracks_by_paths_resolves_batch() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not found — skipping tracks_by_paths integration test");
+        return;
+    }
+
+    let root = unique_dir();
+    let music = root.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    let db = root.join("library.db");
+    let art = root.join("art");
+
+    let a = music.join("a.flac");
+    let b = music.join("b.flac");
+    gen(&a, "Spiegel im Spiegel", "Arvo Pärt", "Alina", 1.0);
+    gen(&b, "Für Alina", "Arvo Pärt", "Alina", 1.0);
+
+    let lib = Library::open(&db, &art).unwrap();
+    lib.scan(&music).unwrap();
+
+    let missing = music.join("gone.flac");
+    // One query resolves the indexed paths; the unindexed one is simply absent.
+    let map = lib.tracks_by_paths(&[a.clone(), b.clone(), missing.clone()]).unwrap();
+    assert_eq!(map.len(), 2, "both indexed paths resolved, missing one absent");
+    assert!(!map.contains_key(&missing));
+    assert_eq!(map.get(&a).and_then(|t| t.title.clone()).as_deref(), Some("Spiegel im Spiegel"));
+    assert_eq!(map.get(&b).and_then(|t| t.title.clone()).as_deref(), Some("Für Alina"));
+
+    // The map lets the caller preserve its own arbitrary order (b before a here).
+    let order = [b.clone(), a.clone()];
+    let titles: Vec<_> = order
+        .iter()
+        .filter_map(|p| map.get(p).and_then(|t| t.title.clone()))
+        .collect();
+    assert_eq!(titles, vec!["Für Alina".to_string(), "Spiegel im Spiegel".to_string()]);
+
+    assert!(lib.tracks_by_paths(&[]).unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}

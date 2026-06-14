@@ -266,6 +266,33 @@ impl Library {
         Ok(t)
     }
 
+    /// Resolve many tracks by exact path in one query (instead of N
+    /// [`track_by_path`](Self::track_by_path) round-trips when restoring a saved
+    /// queue). Missing (unindexed) paths are simply absent from the map; the
+    /// caller maps its own ordered path list through it. Chunked so a very long
+    /// queue never exceeds SQLite's bound-parameter limit.
+    pub fn tracks_by_paths(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, Track>> {
+        let mut by_path: HashMap<PathBuf, Track> = HashMap::new();
+        for chunk in paths.chunks(900) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {} FROM track WHERE track.path IN ({placeholders})",
+                db::TRACK_COLS
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let strs: Vec<String> = chunk.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let bind: Vec<&dyn ToSql> = strs.iter().map(|s| s as &dyn ToSql).collect();
+            let rows = stmt.query_map(bind.as_slice(), db::row_to_track)?;
+            for t in rows {
+                let t = t?;
+                by_path.insert(t.path.clone(), t);
+            }
+        }
+        Ok(by_path)
+    }
+
     // --- recently played ---------------------------------------------------
 
     /// Record that `track_id` was just played (upsert; newest play wins).
@@ -352,6 +379,24 @@ impl Library {
              ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// Upsert several `meta` values in a single transaction — one WAL commit
+    /// instead of N. Used by session save on window close so the write does not
+    /// stall the closing window with a commit per key.
+    pub fn set_meta_many(&self, kv: &[(&str, &str)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO meta(k, v) VALUES(?1, ?2) \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            )?;
+            for (k, v) in kv {
+                stmt.execute(params![k, v])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -639,4 +684,58 @@ fn load_track_hays(conn: &Connection) -> Result<Vec<Hay>> {
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp directory for an isolated on-disk database (no fixtures or
+    /// ffmpeg needed — these exercise pure key/value + path-resolution paths).
+    fn tmp() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "player-lib-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn set_meta_many_upserts_in_one_tx() {
+        let root = tmp();
+        let lib = Library::open(&root.join("library.db"), &root.join("art")).unwrap();
+
+        lib.set_meta_many(&[("queue", "a\nb"), ("current", "1"), ("pos_ms", "500")])
+            .unwrap();
+        assert_eq!(lib.get_meta("queue").unwrap().as_deref(), Some("a\nb"));
+        assert_eq!(lib.get_meta("current").unwrap().as_deref(), Some("1"));
+        assert_eq!(lib.get_meta("pos_ms").unwrap().as_deref(), Some("500"));
+
+        // Re-running upserts (overwrites) the existing keys, not duplicates them.
+        lib.set_meta_many(&[("current", "2"), ("pos_ms", "0")]).unwrap();
+        assert_eq!(lib.get_meta("queue").unwrap().as_deref(), Some("a\nb"));
+        assert_eq!(lib.get_meta("current").unwrap().as_deref(), Some("2"));
+        assert_eq!(lib.get_meta("pos_ms").unwrap().as_deref(), Some("0"));
+
+        // An empty batch is a no-op (and must not error).
+        lib.set_meta_many(&[]).unwrap();
+    }
+
+    #[test]
+    fn tracks_by_paths_empty_and_missing() {
+        let root = tmp();
+        let lib = Library::open(&root.join("library.db"), &root.join("art")).unwrap();
+
+        assert!(lib.tracks_by_paths(&[]).unwrap().is_empty());
+        // Unindexed paths are simply absent — never an error, never a panic.
+        let got = lib
+            .tracks_by_paths(&[PathBuf::from("/no/such/a.flac"), PathBuf::from("/no/such/b.flac")])
+            .unwrap();
+        assert!(got.is_empty());
+    }
 }

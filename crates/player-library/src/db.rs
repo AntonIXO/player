@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::Result;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Open (creating if needed) a connection with the library pragmas applied and
 /// the schema migrated to the current version.
@@ -60,6 +60,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if v < 5 {
         conn.execute_batch(SCHEMA_LOVED)?;
     }
+    // v6 adds an expression index on the artist key the artists list / artist
+    // detail / stats all group and filter on, turning their full-table scan into
+    // an index lookup (additive — `IF NOT EXISTS` so a fresh DB is unaffected).
+    if v < 6 {
+        conn.execute_batch(SCHEMA_ARTIST_IDX)?;
+    }
     if v < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -108,6 +114,7 @@ CREATE TABLE track (
 );
 CREATE INDEX track_folder_idx ON track(folder);
 CREATE INDEX track_album_idx  ON track(album, album_artist);
+CREATE INDEX track_artist_key_idx ON track(COALESCE(NULLIF(album_artist,''), artist));
 
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
 
@@ -129,6 +136,15 @@ CREATE TABLE IF NOT EXISTS loved_tracks (
   track_id  INTEGER PRIMARY KEY,
   loved_at  INTEGER NOT NULL
 );
+"#;
+
+/// Expression index on the artist key (`COALESCE(NULLIF(album_artist,''), artist)`)
+/// the artists list, artist detail, and stats group/filter on. Added in v6;
+/// `IF NOT EXISTS` so a fresh database (which already created it via `SCHEMA_BASE`)
+/// is unaffected.
+const SCHEMA_ARTIST_IDX: &str = r#"
+CREATE INDEX IF NOT EXISTS track_artist_key_idx
+  ON track(COALESCE(NULLIF(album_artist,''), artist));
 "#;
 
 /// Recently-played history (one row per track, newest play wins). Added in v3;

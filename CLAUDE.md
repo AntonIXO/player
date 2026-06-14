@@ -271,6 +271,18 @@ pin a large minimum width:
   `add_top_bar` (pinned), the list in `set_content` with `vexpand`. When phoc resizes for
   the on-screen keyboard (squeekboard/Stevia, via `text-input-v3`) only the content shrinks
   — the entry stays put.
+- **The `ViewStack` is set `vhomogeneous(false)` so the OSK can't scale the whole app down.**
+  `AdwViewStack` defaults **both** `hhomogeneous` and `vhomogeneous` to TRUE, so its *minimum
+  height* tracks its **tallest** page — the non-scrolling Now Playing cluster (~645 px),
+  even while Search is the visible page. On Phosh the OSK shrinks the window via
+  `text-input-v3`; if the window's min content height exceeds the reduced height, phoc can't
+  fit the surface and **scales the entire window down** (everything looks smaller/blurry on
+  Search). Setting `stack.set_vhomogeneous(false)` (in `main.rs`) makes the min height track
+  the *visible* page instead — Search scrolls, so its min is ~148 px and the window shrinks
+  cleanly for the keyboard with no scaling. **Keep `hhomogeneous` TRUE**: the ≤360 width
+  discipline (every page must fit the narrowest device) depends on it. (Measured with the
+  `measure(Vertical,-1)` probe: visible=Search reports 645 px with vhom=true, 148 px with
+  vhom=false.)
 - **Do NOT add a height-keyed `AdwBreakpoint` to hide the switcher for the OSK.** It seems
   tidy ("steps the switcher aside for the keyboard") but on Phosh it *flickers the keyboard
   open/closed*: the OSK resizes the window, the `max-height` breakpoint crosses its

@@ -230,6 +230,16 @@ fn build_ui(app: &adw::Application) {
     add_page(&stack, &search_page, "search", "Search", "system-search-symbolic");
     add_page(&stack, &queue_page, "lists", "Queue", "view-list-symbolic");
     stack.set_visible_child_name("library");
+    // `AdwViewStack` is vhomogeneous by default → its *minimum height* tracks the
+    // **tallest** page (the non-scrolling Now Playing cluster). On Phosh the OSK
+    // shrinks the window via text-input-v3; if that minimum exceeds the reduced
+    // height, phoc can't fit the surface and **scales the whole window down**
+    // ("everything gets smaller" on the Search page). Making the stack
+    // vertically NON-homogeneous lets its min height track the *visible* page —
+    // Search scrolls (AdwToolbarView + scroller), so its min is small and the
+    // window can shrink for the keyboard without phoc scaling it. Keep
+    // hhomogeneous TRUE: the ≤360 width discipline relies on it.
+    stack.set_vhomogeneous(false);
 
     // --- mini player ---
     let (mini, mp_art, mp_title, mp_artist, mp_play, mp_progress) = build_mini();

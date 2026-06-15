@@ -3,7 +3,7 @@ Type=Application
 Name=Bit-Perfect Player
 GenericName=Music Player
 Comment=Bit-perfect lossless playback straight to the ALSA hardware device
-Exec=env PLAYER_AUDIO_CPU=7 player-gtk
+Exec=env PLAYER_AUDIO_CPU=7 GSK_RENDERER=vulkan player-gtk
 Icon=hifi-player
 Terminal=false
 Categories=AudioVideo;Player;GTK;

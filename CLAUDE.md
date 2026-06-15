@@ -145,18 +145,32 @@ workload leans on. PGO/BOLT touch only the Rust we compile, not system gtk4/cair
 (`packaging/aports/hifi-player/APKBUILD`) collects its own PGO profile inside the
 pmbootstrap chroot. By default it trains on small ffmpeg-synthesized clips, but it
 auto-detects a real music library bind-mounted at `/mnt/pgo-music` (or `$PLAYER_PGO_MUSIC`)
-and trains on **that** instead — `dump --start/--seconds` over a bounded sample of real
-FLAC/MP3/ALAC (decode + seek/rewind), a bounded slice of any SACD `.iso` (the DST
-arithmetic decoder — the branchiest code we ship), a `scan --force` over real
-Cyrillic-tagged metadata + embedded art (lofty/FTS5), and fuzzy/FTS search over a
+and trains on **that** instead — `dump --start/--seconds` over **every** real FLAC/MP3/ALAC
+track (decode + seek/rewind; `PLAYER_PGO_MAX_PER_CODEC>0` caps it), a bounded slice of any
+SACD `.iso` (the DST arithmetic decoder — the branchiest code we ship), a `scan --force` over
+real Cyrillic-tagged metadata + embedded art (lofty/FTS5), and fuzzy/FTS search over a
 realistically sized index. `pmbootstrap --src` can't carry the library (it's gitignored)
 and `mount --bind` isn't recursive, so use the one-command wrapper
 `scripts/pmb-build-pgo.sh` — it RO-binds the library into the buildroot chroot, runs
 `pmbootstrap build`, and unmounts after. The build never *depends* on the library
 (synth fallback), and the bit-perfect gate still runs on deterministic synth FLAC/WAV.
-The new `dump --start <secs>`/`--seconds <secs>` flags reuse `Decoder::seek`/`set_limit`
+The `dump --start <secs>`/`--seconds <secs>` flags reuse `Decoder::seek`/`set_limit`
 and never alter samples (they only change where/how much we decode); they're the headless
 seek/rewind exerciser and the `.iso` decode bounder.
+
+**Profiling the UI's own code (`_pgo_ui=1`, default on).** The shared decode/library code
+gets profiled by the headless player-cli workload, but player-gtk's *own* code (page build,
+list models, layout, album/hero rescale, search render) has no display in the chroot to run
+under. So the build also instruments player-gtk and runs `player-gtk --bench` — a headless
+self-test (env `PLAYER_GTK_BENCH`) that steps the UI through its hot paths and quits, with a
+watchdog so it can never hang the build — under a throwaway **Xvfb** (`xvfb` makedepend) with
+an isolated `$HOME`/XDG so it touches nothing real. Best-effort: if Xvfb/the bench can't run,
+only the shared code is profiled. Costs one extra instrumented player-gtk build under qemu
+(`_pgo_ui=0` to skip). **PGO requires `lto="off"` in the `release-pgo` profile** (see
+Cargo.toml): ThinLTO + `-Cprofile-use` trips rust-lang/rust#115344 ("ProfileSummary IDs have
+conflicting values") on LLVM 22 — disabling cross-crate LTO removes the offending bitcode
+import while keeping full per-crate PGO (our hot code is intra-crate). System gtk4/cairo/pango
+are *not* ours to compile, so PGO/BOLT never touch them.
 
 ## Verifying bit-perfect output (do this for any change touching the audio path)
 

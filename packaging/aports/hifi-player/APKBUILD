@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=10
+pkgrel=11
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -23,6 +23,9 @@ depends="alsa-utils adwaita-icon-theme"
 # ffmpeg: build()'s bit-perfect gate decodes each testfile and byte-compares the
 #         output against ffmpeg's, refusing to package a binary whose samples differ
 #         (the PGO/BOLT safety net).
+# xvfb:   headless X server for the UI PGO pass (_pgo_ui=1) — runs the instrumented
+#         player-gtk `--bench` so PGO also covers the UI's OWN code. Best-effort: if
+#         the bench can't run, only the shared decode/library code is profiled.
 # NOTE:   BOLT (_bolt=1) needs `llvm-bolt` + `merge-fdata`, which Alpine does NOT
 #         package — so BOLT auto-skips in the chroot (PGO still applies). Run BOLT on
 #         the host/on-device instead: scripts/pgo-bolt-build.sh --bolt
@@ -34,6 +37,7 @@ makedepends="
 	libadwaita-dev
 	alsa-lib-dev
 	ffmpeg
+	xvfb
 "
 install="$pkgname.post-install"
 # net:    cargo fetches crate sources in prepare() (build() then runs offline).
@@ -83,6 +87,14 @@ prepare() {
 # re-proves byte-equality vs ffmpeg before the binary is allowed to be packaged.
 _pgo=1
 _bolt=0
+# _pgo_ui=1: also profile player-gtk's OWN UI code (page build, list models,
+#         layout, album/hero rescale, search render) — not just the shared
+#         decode/library code. Instruments player-gtk too and runs it headless via
+#         `--bench` under Xvfb during collection. Costs one extra (instrumented)
+#         player-gtk build under qemu; set 0 to skip if builds get too slow. The
+#         lto="off" PGO profile is what makes profiling extra crates safe here
+#         (no ThinLTO ProfileSummary conflicts — see Cargo.toml / rust#115344).
+_pgo_ui=1
 
 # The whole pipeline builds the `release-pgo` cargo profile (= release but
 # strip=false, since BOLT needs symbols/relocations); abuild strips the installed
@@ -169,12 +181,13 @@ _workload_synth() {
 # Tunable: PLAYER_PGO_DECODE_SECS / _MAX_PER_CODEC / _ISO_START / _ISO_SECS.
 _workload_real() {
 	_cli="$1"
-	_secs="${PLAYER_PGO_DECODE_SECS:-20}"
-	_maxpc="${PLAYER_PGO_MAX_PER_CODEC:-12}"
+	_secs="${PLAYER_PGO_DECODE_SECS:-15}"
+	_maxpc="${PLAYER_PGO_MAX_PER_CODEC:-0}"   # 0 = every track of each codec
 	_iso_start="${PLAYER_PGO_ISO_START:-20}"
 	_iso_secs="${PLAYER_PGO_ISO_SECS:-25}"
 	_db="$builddir/target/.pgo-real.db"; rm -f "$_db"
-	msg "PGO: real-corpus workload (decode ${_secs}s ×≤${_maxpc}/codec, iso ${_iso_secs}s) over $_PGO_MUSIC"
+	if [ "$_maxpc" -gt 0 ]; then _cov="≤${_maxpc}/codec"; else _cov="all tracks"; fi
+	msg "PGO: real-corpus workload (decode ${_secs}s × ${_cov}, iso ${_iso_secs}s) over $_PGO_MUSIC"
 
 	# Library index: real tags, embedded art, .cue, Unicode metadata, FTS5 build.
 	"$_cli" scan "$_PGO_MUSIC" --db "$_db" --force >/dev/null 2>&1 || true
@@ -187,11 +200,16 @@ _workload_real() {
 		done
 	done
 
-	# Decode a bounded sample per codec (diversity over repetition); on the first
-	# few of each, add seek offsets to profile the rewind path. `while read` (not
-	# a glob) handles spaces/Unicode in real filenames safely.
+	# Decode every track of each codec (PLAYER_PGO_MAX_PER_CODEC=0), each bounded
+	# to _secs; on the first few of each, add seek offsets to profile the rewind
+	# path. Set _MAX_PER_CODEC>0 to cap per codec if qemu builds get too slow.
+	# `while read` (not a glob) handles spaces/Unicode in real filenames safely.
 	for _ext in flac mp3 m4a; do
-		find "$_PGO_MUSIC" -type f -iname "*.$_ext" 2>/dev/null | head -n "$_maxpc" | (
+		if [ "$_maxpc" -gt 0 ]; then
+			find "$_PGO_MUSIC" -type f -iname "*.$_ext" 2>/dev/null | head -n "$_maxpc"
+		else
+			find "$_PGO_MUSIC" -type f -iname "*.$_ext" 2>/dev/null
+		fi | (
 			_i=0
 			while IFS= read -r _f; do
 				"$_cli" dump "$_f" -o /dev/null --seconds "$_secs" >/dev/null 2>&1 || true
@@ -221,6 +239,39 @@ _workload() {
 	[ -n "$_PGO_MUSIC" ] && _workload_real "$1"
 	_workload_synth "$1"
 }
+
+# Headless UI exerciser for PGO: run the INSTRUMENTED player-gtk through its own
+# hot paths (`--bench`: page switches, search, album-grid + hero rescale, detail
+# pages) under a throwaway Xvfb, so profile-generate collects coverage for
+# player-gtk's OWN code (the shared decode/library code is already covered by the
+# player-cli workload). Fully isolated (its own HOME/XDG) and best-effort — if
+# Xvfb or the bench can't run, it's skipped and everything else still gets PGO.
+# Runs in a () subshell so its env never leaks. $1 = instrumented player-gtk.
+_workload_gtk() (
+	[ "$_pgo_ui" = 1 ] || exit 0
+	_gtk="$1"; [ -x "$_gtk" ] || exit 0
+	command -v Xvfb >/dev/null 2>&1 || { warning "UI PGO skipped: Xvfb not found"; exit 0; }
+	# Isolated throwaway library so the UI has real rows + art to render without
+	# touching anything real. build_ui reads the XDG default paths.
+	_h="$builddir/target/.gtkbench"; rm -rf "$_h"
+	export HOME="$_h" XDG_DATA_HOME="$_h/share" XDG_CACHE_HOME="$_h/cache" XDG_RUNTIME_DIR="$_h/run"
+	mkdir -p "$XDG_DATA_HOME/player" "$XDG_CACHE_HOME/player" "$XDG_RUNTIME_DIR"
+	chmod 700 "$XDG_RUNTIME_DIR"
+	# Populate the default-path DB from the real corpus (best-effort, bounded).
+	[ -n "$_PGO_MUSIC" ] && "$_outdir/player-cli" scan "$_PGO_MUSIC" --force >/dev/null 2>&1 || true
+	msg "PGO: UI bench (player-gtk --bench under Xvfb)"
+	Xvfb :99 -screen 0 720x1440x24 >/dev/null 2>&1 &
+	_xp=$!
+	# LLVM_PROFILE_FILE is inherited (exported by _pgo_build) and absolute, so the
+	# gtk profraw lands beside the cli profraw; %p/%m keep the binaries distinct.
+	export DISPLAY=:99 GDK_BACKEND=x11 PLAYER_GTK_BENCH=1 \
+		PLAYER_GTK_BENCH_SECS="${PLAYER_PGO_GTK_SECS:-25}"
+	# The bench self-quits via its watchdog; `timeout` is a hard backstop so a
+	# stuck UI can never stall the build.
+	timeout 120 "$_gtk" >/dev/null 2>&1 || true
+	kill "$_xp" 2>/dev/null || true
+	exit 0
+)
 
 # Optional BOLT of player-cli. Returns non-zero (caller warns) if tools missing.
 _bolt_cli() {
@@ -254,13 +305,19 @@ _pgo_build() {
 	[ -z "$_profdata" ] && _profdata="$(ls /usr/lib/llvm*/bin/llvm-profdata 2>/dev/null | head -n1)"
 	[ -n "$_profdata" ] || { warning "PGO skipped: llvm-profdata not found — add 'llvm$_major' (or 'llvm') to makedepends"; return 1; }
 	_prof="$builddir/target/.pgo"; rm -rf "$_prof"; mkdir -p "$_prof" || return 1
-	msg "PGO: instrumenting player-cli (profdata=$_profdata; material=$_TESTDIR)"
+	# Instrument player-cli always; player-gtk too when _pgo_ui=1 (so the UI bench
+	# can collect coverage for the UI's own code). Unquoted on purpose to expand
+	# into separate -p args.
+	_instr="-p player-cli"
+	[ "$_pgo_ui" = 1 ] && _instr="$_instr -p player-gtk"
+	msg "PGO: instrumenting$_instr (profdata=$_profdata; material=$_TESTDIR)"
 	RUSTFLAGS="$_base_rustflags -C profile-generate=$_prof" \
-		cargo build --profile "$_cargo_profile" --frozen -p player-cli \
+		cargo build --profile "$_cargo_profile" --frozen $_instr \
 		|| { warning "PGO skipped: instrumented build failed (rustc without profiler runtime?)"; return 1; }
 	msg "PGO: collecting profiles"
-	export LLVM_PROFILE_FILE="$_prof/cli-%p-%m.profraw"
+	export LLVM_PROFILE_FILE="$_prof/pgo-%p-%m.profraw"
 	_workload "$_outdir/player-cli" || true
+	_workload_gtk "$_outdir/player-gtk" || true
 	unset LLVM_PROFILE_FILE
 	[ -n "$(find "$_prof" -name '*.profraw' 2>/dev/null)" ] \
 		|| { warning "PGO skipped: no .profraw produced (could not run instrumented binary?)"; return 1; }

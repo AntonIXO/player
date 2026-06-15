@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=9
+pkgrel=10
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -69,11 +69,13 @@ prepare() {
 
 # --- PGO/BOLT toggles --------------------------------------------------------
 # _pgo=1: Profile-Guided Optimization (default). Auto-collected here: instrument
-#         player-cli, run a branch-heavy headless workload (FLAC decode + forced
-#         rescan + fuzzy search — NOT flat PCM, which shows ~0 gain), merge, then
-#         rebuild BOTH binaries with the profile (player-gtk benefits on the shared
-#         decode/library code via function matching). Falls back to a plain build
-#         if testfiles or llvm-profdata are missing, or rustc lacks the profiler
+#         player-cli, run a branch-heavy headless workload — over the REAL music
+#         library when one is bind-mounted (scripts/pmb-build-pgo.sh → /mnt/pgo-music:
+#         varied FLAC/MP3/ALAC decode + seek, bounded SACD .iso DST, real-metadata
+#         scan + fuzzy/FTS search), else synth clips — NOT flat PCM (~0 gain), merge,
+#         then rebuild BOTH binaries with the profile (player-gtk benefits on the
+#         shared decode/library code via function matching). Falls back to a plain
+#         build if material or llvm-profdata are missing, or rustc lacks the profiler
 #         runtime — pmbootstrap build never breaks because of PGO.
 # _bolt=1: also BOLT player-cli (opt-in, off by default). Needs llvm-bolt +
 #         merge-fdata in the chroot; player-gtk isn't BOLTed (no display to train).
@@ -90,6 +92,23 @@ _outdir="target/$_cargo_profile"
 
 # Directory of training/gate clips, set by _prep_testdata (global, sh-scoped).
 _TESTDIR=""
+
+# Real PGO corpus: a user music library bind-mounted into the chroot (RO at
+# /mnt/pgo-music by scripts/pmb-build-pgo.sh; $PLAYER_PGO_MUSIC overrides the
+# path). When present, _workload trains on real FLAC/MP3/ALAC + the SACD .iso
+# DST decoder + a real Cyrillic-tagged index — far richer than the synth clips.
+# Empty = portable synth-only default; the build never depends on it existing.
+_PGO_MUSIC=""
+_detect_corpus() {
+	for _d in "$PLAYER_PGO_MUSIC" /mnt/pgo-music; do
+		[ -n "$_d" ] && [ -d "$_d" ] || continue
+		if find "$_d" -type f \( -iname '*.flac' -o -iname '*.mp3' \
+			-o -iname '*.m4a' -o -iname '*.iso' \) 2>/dev/null | head -n1 | grep -q .; then
+			_PGO_MUSIC="$_d"; return 0
+		fi
+	done
+	return 1
+}
 
 # Synthesize one clip with ffmpeg: $1=outfile $2=rate $3=sample_fmt $4=codec.
 # Tones + pink noise so FLAC residuals are non-trivial (exercises the real decode
@@ -120,8 +139,9 @@ _prep_testdata() {
 	[ -f "$_TESTDIR/train_s16_44k.flac" ] || return 1
 }
 
-# Branch-heavy, headless, audio-HW-free workload over $_TESTDIR. $1 = player-cli.
-_workload() {
+# Synthetic workload over $_TESTDIR — the portable fallback, and an always-run
+# baseline (adds WAV + rate variety the real library may lack). $1 = player-cli.
+_workload_synth() {
 	_cli="$1"
 	_db="$builddir/target/.pgo-lib.db"; rm -f "$_db"
 	_n=0; while [ "$_n" -lt 5 ]; do
@@ -139,6 +159,67 @@ _workload() {
 	done
 	"$_cli" library-stats --db "$_db" >/dev/null 2>&1 || true
 	rm -f "$_db"
+}
+
+# Rich workload over the REAL mounted library ($_PGO_MUSIC): varied real
+# FLAC/MP3/ALAC decode (+ seek/rewind), the bounded SACD .iso DST decoder, a
+# library scan over real Cyrillic-tagged metadata + embedded art (lofty/FTS5),
+# and fuzzy + FTS search over a realistically sized index. Every decode is
+# bounded (--seconds) so qemu-user stays tractable; no sample is altered.
+# Tunable: PLAYER_PGO_DECODE_SECS / _MAX_PER_CODEC / _ISO_START / _ISO_SECS.
+_workload_real() {
+	_cli="$1"
+	_secs="${PLAYER_PGO_DECODE_SECS:-20}"
+	_maxpc="${PLAYER_PGO_MAX_PER_CODEC:-12}"
+	_iso_start="${PLAYER_PGO_ISO_START:-20}"
+	_iso_secs="${PLAYER_PGO_ISO_SECS:-25}"
+	_db="$builddir/target/.pgo-real.db"; rm -f "$_db"
+	msg "PGO: real-corpus workload (decode ${_secs}s ×≤${_maxpc}/codec, iso ${_iso_secs}s) over $_PGO_MUSIC"
+
+	# Library index: real tags, embedded art, .cue, Unicode metadata, FTS5 build.
+	"$_cli" scan "$_PGO_MUSIC" --db "$_db" --force >/dev/null 2>&1 || true
+	"$_cli" library-stats --db "$_db" >/dev/null 2>&1 || true
+
+	# Search: fuzzy + FTS over the real index (Latin + Cyrillic, prefix/typo).
+	for _q in the love live remix piano jazz rock 2024 vol mix acoustic концерт любовь музыка лучшее симфония; do
+		for _filt in all tracks albums artists; do
+			"$_cli" search "$_q" --db "$_db" --filter "$_filt" >/dev/null 2>&1 || true
+		done
+	done
+
+	# Decode a bounded sample per codec (diversity over repetition); on the first
+	# few of each, add seek offsets to profile the rewind path. `while read` (not
+	# a glob) handles spaces/Unicode in real filenames safely.
+	for _ext in flac mp3 m4a; do
+		find "$_PGO_MUSIC" -type f -iname "*.$_ext" 2>/dev/null | head -n "$_maxpc" | (
+			_i=0
+			while IFS= read -r _f; do
+				"$_cli" dump "$_f" -o /dev/null --seconds "$_secs" >/dev/null 2>&1 || true
+				if [ "$_i" -lt 3 ]; then
+					"$_cli" probe "$_f" >/dev/null 2>&1 || true
+					"$_cli" dump "$_f" -o /dev/null --start 10 --seconds "$_secs" >/dev/null 2>&1 || true
+					"$_cli" dump "$_f" -o /dev/null --start 45 --seconds 5 >/dev/null 2>&1 || true
+				fi
+				_i=$((_i + 1))
+			done
+		)
+	done
+
+	# SACD .iso: bounded DST decode (arithmetic coder + adaptive FIR) — the
+	# branchiest code in the project. Bounded so qemu stays tractable.
+	find "$_PGO_MUSIC" -type f -iname '*.iso' 2>/dev/null | head -n 2 | while IFS= read -r _f; do
+		"$_cli" probe "$_f" >/dev/null 2>&1 || true
+		"$_cli" dump "$_f" -o /dev/null --start "$_iso_start" --seconds "$_iso_secs" >/dev/null 2>&1 || true
+	done
+
+	rm -f "$_db"
+}
+
+# Dispatcher: the rich real-library pass when a corpus is mounted, plus the cheap
+# synth baseline (extra WAV/rate coverage) always. $1 = player-cli.
+_workload() {
+	[ -n "$_PGO_MUSIC" ] && _workload_real "$1"
+	_workload_synth "$1"
 }
 
 # Optional BOLT of player-cli. Returns non-zero (caller warns) if tools missing.
@@ -226,6 +307,11 @@ build() {
 	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort"
 	_base_rustflags="$RUSTFLAGS"
 	_prep_testdata || warning "no training/gate material (testfiles/ absent and ffmpeg synth failed)"
+	if _detect_corpus; then
+		msg "PGO: real music corpus at $_PGO_MUSIC (rich profile)"
+	else
+		msg "PGO: no real corpus — bind-mount one (scripts/pmb-build-pgo.sh → /mnt/pgo-music) for a richer profile; using synth workload"
+	fi
 
 	if [ "$_pgo" = 1 ] && _pgo_build; then
 		msg "PGO build complete"

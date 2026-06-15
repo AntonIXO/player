@@ -47,6 +47,14 @@ enum Cmd {
         file: PathBuf,
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Seek to this offset (seconds) before decoding. 0 = from the start.
+        /// Exercises the seek/rewind path; for DSD it lands on a frame boundary.
+        #[arg(long, default_value_t = 0.0)]
+        start: f64,
+        /// Decode at most this many seconds (0 = whole file). Bounds expensive
+        /// decodes — e.g. a large SACD .iso — without altering any sample.
+        #[arg(long, default_value_t = 0.0)]
+        seconds: f64,
     },
 
     /// Play through snd-aloop and capture it back, then byte-compare.
@@ -129,7 +137,12 @@ fn main() -> ExitCode {
             device,
             seconds,
         } => play(&file, &device, seconds),
-        Cmd::Dump { file, out } => dump(&file, out.as_deref()),
+        Cmd::Dump {
+            file,
+            out,
+            start,
+            seconds,
+        } => dump(&file, out.as_deref(), start, seconds),
         Cmd::LoopbackVerify {
             file,
             out,
@@ -294,23 +307,55 @@ fn play_dsd(file: &Path, device: &str) -> player_core::Result<()> {
     Ok(())
 }
 
-fn dump(file: &Path, out: Option<&Path>) -> player_core::Result<()> {
+fn dump(file: &Path, out: Option<&Path>, start: f64, seconds: f64) -> player_core::Result<()> {
     let mut sink: Box<dyn Write> = match out {
         Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
     };
     // DSD: dump raw native DSD bytes (interleaved, MSB-first) — comparable to a
-    // reference DSD extraction (e.g. for DST-decode verification).
+    // reference DSD extraction (e.g. for DST-decode verification). `--start`
+    // seeks to a frame boundary (best-effort) and `--seconds` caps the output so
+    // a huge SACD .iso can be bounded; neither alters a single bit.
     if is_dsd_path(file) {
         let mut src = open_dsd(file, None)?;
+        let dspec = src.spec();
+        let dop_rate = (dspec.dsd_rate / 16) as f64; // DoP PCM frame rate
+        if start > 0.0 {
+            // Seek is best-effort: sources that can't seek return None — then we
+            // just stream from the top (still bounded by `--seconds`).
+            let _ = src.seek((start * dop_rate) as u64)?;
+        }
+        // 1 DoP frame carries 16 DSD bits/ch = 2 bytes/ch of native DSD.
+        let cap_bytes = (seconds > 0.0)
+            .then(|| (seconds * dop_rate) as u64 * 2 * dspec.channels.max(1) as u64);
         let mut buf: Vec<u8> = Vec::new();
+        let mut written: u64 = 0;
         while src.next(&mut buf)? {
-            sink.write_all(&buf)?;
+            let mut chunk: &[u8] = &buf;
+            if let Some(cap) = cap_bytes {
+                let remaining = cap.saturating_sub(written) as usize;
+                if remaining == 0 {
+                    break;
+                }
+                if chunk.len() > remaining {
+                    chunk = &chunk[..remaining];
+                }
+            }
+            sink.write_all(chunk)?;
+            written += chunk.len() as u64;
         }
         sink.flush()?;
         return Ok(());
     }
     let mut dec = Decoder::open(file)?;
+    // Seek first (resets decoder + sample buffer), then arm the frame limit so
+    // `next()` stops after exactly `seconds` of audio from the seek point.
+    if start > 0.0 {
+        dec.seek(Duration::from_secs_f64(start))?;
+    }
+    if seconds > 0.0 {
+        dec.set_limit((seconds * dec.spec.rate as f64) as u64);
+    }
     let mut block: Vec<i32> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     while dec.next(&mut block)? {

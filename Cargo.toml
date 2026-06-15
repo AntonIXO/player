@@ -69,13 +69,32 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
-# PGO/BOLT pipeline profile (driven by scripts/pgo-bolt-build.sh). Inherits the
-# bit-perfect release settings but DISABLES strip: LLVM BOLT needs symbols +
-# relocations in its input binary, and a stripped binary cannot be BOLTed. The
-# script strips the final artifact itself after BOLT. opt-level/lto/codegen-units
-# are inherited from [profile.release]; PGO/BOLT only change code LAYOUT (block/
-# function ordering, inlining heuristics) — never numeric results — so the
-# bit-perfect invariant is preserved (and re-verified by the script's loopback gate).
+# PGO/BOLT pipeline profile (driven by scripts/pgo-bolt-build.sh and the aarch64
+# APKBUILD). Inherits the bit-perfect release settings with two overrides:
+#
+#   strip = false  — LLVM BOLT needs symbols + relocations in its input binary,
+#                    and a stripped binary cannot be BOLTed. The script (and
+#                    abuild) strip the final artifact afterwards, so shipped size
+#                    is unchanged.
+#
+#   lto   = "off"  — REQUIRED for `-Cprofile-use` to link. ThinLTO + PGO trips
+#                    rust-lang/rust#115344 ("ProfileSummary IDs have conflicting
+#                    values"): ThinLTO imports a dependency's bitcode (e.g.
+#                    aho_corasick) whose profile coverage differs from the leaf
+#                    crate's, and LLVM 22 rejects the conflicting ProfileSummary
+#                    module flag. Disabling cross-crate LTO removes the bitcode
+#                    import entirely. PGO still applies fully per crate (branch
+#                    weights, block ordering, intra-crate inlining via
+#                    codegen-units=1) — our hot code (DST, FLAC, scan, search) is
+#                    intra-crate, so the cross-crate inlining loss is negligible.
+#                    (For absolute-max optimization on a host with plenty of RAM,
+#                    `lto = "fat"` also avoids #115344 by unifying into one module
+#                    before profile-use — but it's slow/memory-heavy under qemu.)
+#
+# opt-level/codegen-units are inherited from [profile.release]; PGO/BOLT only
+# change code LAYOUT (block/function ordering, inlining heuristics) — never
+# numeric results — so the bit-perfect invariant holds (re-verified by the gate).
 [profile.release-pgo]
 inherits = "release"
-strip = false       
+strip = false
+lto = "off"

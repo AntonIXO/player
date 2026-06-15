@@ -1,9 +1,13 @@
-//! DSD → DoP integration test. Generates a tiny synthetic stereo DSD64 `.dsf`
-//! with a known pattern, reads it through the real `dsd-reader`-backed source,
-//! and proves (headless, no audio hardware):
+//! DSD → DoP integration test. Generates tiny synthetic stereo DSD64 `.dsf`/
+//! `.dff` files with known patterns, reads them through the direct-offset
+//! [`open_dsd`] source, and proves (headless, no audio hardware):
 //!   1. the source yields interleaved **MSB-first** DSD (DSF stores LSB-first,
-//!      so each byte must be bit-reversed) in clustered-frame layout, and
-//!   2. DoP packing is lossless (decode the DoP stream back to the exact DSD).
+//!      so each byte must be bit-reversed) in clustered-frame layout,
+//!   2. DoP packing is lossless (decode the DoP stream back to the exact DSD),
+//!   3. byte-for-byte equivalence with the `dsd-reader` crate (the previous
+//!      backend, kept as a dev-dependency oracle), including a partial last DSF
+//!      block, and
+//!   4. seeking lands bit-exact (O(1), by byte offset — not a rescan).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -200,6 +204,142 @@ fn dsf_seek_lands_bit_exact_on_block_boundaries() {
     let landed = src.seek(1_000_000).expect("seek").expect("supported");
     assert_eq!(landed, BLOCKS as u64 * frames_per_block);
     assert!(read_all(&mut *src).is_empty(), "no audio past end of stream");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Like [`write_dsf_blocks`] but with an explicit per-channel `sample_count`
+/// (bits), so the last on-disc block can be only partly valid (block padding) —
+/// the case the direct reader and `dsd-reader` must agree on.
+fn write_dsf_sc(ch0: &[u8], ch1: &[u8], blocks: usize, sample_count_per_ch: u64) -> PathBuf {
+    assert_eq!(ch0.len(), blocks * BLOCK);
+    assert_eq!(ch1.len(), blocks * BLOCK);
+    let data_len = ch0.len() + ch1.len();
+    let data_chunk = 4 + 8 + data_len as u64;
+    let total = 28 + 52 + data_chunk;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"DSD ");
+    b.extend_from_slice(&28u64.to_le_bytes());
+    b.extend_from_slice(&total.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes());
+    b.extend_from_slice(b"fmt ");
+    b.extend_from_slice(&52u64.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&2u32.to_le_bytes());
+    b.extend_from_slice(&2u32.to_le_bytes());
+    b.extend_from_slice(&RATE.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&sample_count_per_ch.to_le_bytes()); // samples / ch (may imply a partial last block)
+    b.extend_from_slice(&(BLOCK as u32).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_chunk.to_le_bytes());
+    for blk in 0..blocks {
+        let r = blk * BLOCK..(blk + 1) * BLOCK;
+        b.extend_from_slice(&ch0[r.clone()]);
+        b.extend_from_slice(&ch1[r]);
+    }
+    let path = std::env::temp_dir().join(format!("pc-dsd-sc-{}.dsf", std::process::id()));
+    std::fs::File::create(&path).unwrap().write_all(&b).unwrap();
+    path
+}
+
+/// Write a minimal valid stereo `.dff` (DSDIFF) carrying uncompressed,
+/// interleaved MSB-first `audio` (clustered-frame order already). All chunk sizes
+/// are big-endian, per the DSDIFF spec.
+fn write_dff(audio: &[u8]) -> PathBuf {
+    fn chunk(out: &mut Vec<u8>, id: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0); // DSDIFF pads odd-length chunks
+        }
+    }
+    // PROP body: "SND " + FS + CHNL sub-chunks.
+    let mut prop = Vec::new();
+    prop.extend_from_slice(b"SND ");
+    chunk(&mut prop, b"FS  ", &RATE.to_be_bytes());
+    let mut chnl = Vec::new();
+    chnl.extend_from_slice(&2u16.to_be_bytes()); // num channels
+    chnl.extend_from_slice(b"SLFT");
+    chnl.extend_from_slice(b"SRGT");
+    chunk(&mut prop, b"CHNL", &chnl);
+
+    // FORM body: "DSD " form-type + FVER + PROP + DSD (audio).
+    let mut form = Vec::new();
+    form.extend_from_slice(b"DSD ");
+    chunk(&mut form, b"FVER", &[0x01, 0x05, 0x00, 0x00]);
+    chunk(&mut form, b"PROP", &prop);
+    chunk(&mut form, b"DSD ", audio);
+
+    let mut b = Vec::new();
+    chunk(&mut b, b"FRM8", &form);
+
+    let path = std::env::temp_dir().join(format!("pc-dsd-{}.dff", std::process::id()));
+    std::fs::File::create(&path).unwrap().write_all(&b).unwrap();
+    path
+}
+
+/// The bytes the previous `dsd-reader` backend yielded for `path` — the oracle
+/// the direct reader must match exactly. Mirrors the old source's read loop
+/// (interleaved, MSB-first, valid `read_size` per block).
+fn dsd_reader_oracle(path: &std::path::Path) -> Vec<u8> {
+    let r = dsd_reader::DsdReader::from_container(path.to_path_buf()).expect("dsd-reader open");
+    let mut out = Vec::new();
+    for (read_size, bufs) in r.interl_iter(false, None).expect("interl iter") {
+        if let Some(buf) = bufs.first() {
+            out.extend_from_slice(&buf[..read_size.min(buf.len())]);
+        }
+    }
+    out
+}
+
+#[test]
+fn dsf_matches_dsd_reader_full_and_partial() {
+    const BLOCKS: usize = 3;
+    let ch0: Vec<u8> = (0..BLOCKS * BLOCK).map(|i| ((i * 73 + 5) & 0xff) as u8).collect();
+    let ch1: Vec<u8> = (0..BLOCKS * BLOCK).map(|i| (255 - ((i * 31 + 7) & 0xff)) as u8).collect();
+
+    // Whole blocks: every byte valid.
+    let path = write_dsf_sc(&ch0, &ch1, BLOCKS, (BLOCKS * BLOCK * 8) as u64);
+    let mine = read_all(&mut *open_dsd(&path, None).expect("open .dsf"));
+    assert_eq!(mine, dsd_reader_oracle(&path), "DSF full-block output must equal dsd-reader");
+    assert_eq!(mine.len(), BLOCKS * 2 * BLOCK);
+    let _ = std::fs::remove_file(&path);
+
+    // Partial last block: only `valid_last` bytes/channel are real audio; the
+    // block tail is padding both readers must skip identically.
+    let valid_last = 1000usize;
+    let sc = (((BLOCKS - 1) * BLOCK + valid_last) * 8) as u64;
+    let path = write_dsf_sc(&ch0, &ch1, BLOCKS, sc);
+    let mine = read_all(&mut *open_dsd(&path, None).expect("open .dsf"));
+    assert_eq!(mine.len(), ((BLOCKS - 1) * BLOCK + valid_last) * 2, "partial block trims padding");
+    assert_eq!(mine, dsd_reader_oracle(&path), "DSF partial-last-block output must equal dsd-reader");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn dff_matches_dsd_reader_and_seeks() {
+    // Interleaved stereo audio (clustered-frame order); length a multiple of one
+    // DoP frame (2 ch × 2 bytes = 4).
+    let audio: Vec<u8> = (0..8000u32).map(|i| ((i * 97 + 3) & 0xff) as u8).collect();
+    let path = write_dff(&audio);
+
+    let mut src = open_dsd(&path, None).expect("open .dff");
+    assert_eq!(src.spec().channels, 2);
+    assert_eq!(src.spec().dsd_rate, RATE);
+    let mine = read_all(&mut *src);
+    assert_eq!(mine, audio, "DFF audio is interleaved MSB-first — identity passthrough");
+    assert_eq!(mine, dsd_reader_oracle(&path), "DFF output must equal dsd-reader");
+
+    // Seek to DoP frame 100 (= 100 × 2 ch × 2 bytes = 400 bytes) → exact tail.
+    let mut src = open_dsd(&path, None).expect("open .dff");
+    let landed = src.seek(100).expect("seek").expect("dff seek supported");
+    assert_eq!(landed, 100);
+    assert_eq!(read_all(&mut *src), audio[400..], "DFF seek lands bit-exact");
 
     let _ = std::fs::remove_file(&path);
 }

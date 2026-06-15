@@ -26,7 +26,7 @@ mod toc;
 
 pub use error::{Error, Result};
 
-use disc::{FrameKind, FrameReader};
+use disc::{Checkpoint, FrameKind, FrameReader};
 use toc::{AreaToc, Toc};
 
 /// DSD64 sample rate (64 × 44.1 kHz). SACD audio is always DSD64.
@@ -176,12 +176,19 @@ impl SacdImage {
             dst: dst::Decoder::new(a.channel_count as usize),
             is_dst_area: a.frame_format == 0,
             frame_idx: 0,
+            index: Vec::new(),
+            indexed_through: 0,
         })
     }
 }
 
 /// Streams one track's DSD frames. Yields **interleaved, MSB-first** DSD bytes
 /// (DoP-ready), transparently DST-decoding compressed frames.
+/// Sample one seek checkpoint roughly every second (75 frames = 1 s of audio).
+/// At ~32 bytes/entry this is ~115 KB for a 60-minute track — negligible — and
+/// bounds the post-jump scan to at most this many frames.
+const SEEK_INDEX_INTERVAL: u64 = raw::FRAME_RATE as u64;
+
 pub struct SacdTrackReader {
     frames: FrameReader,
     channels: u32,
@@ -190,6 +197,13 @@ pub struct SacdTrackReader {
     /// Number of frames yielded so far — the seek anchor. Each frame is a fixed
     /// 1/75 s of audio (588·64/8 = 4704 DSD bytes/channel).
     frame_idx: u64,
+    /// Sparse `(frame_idx, resume position)` index, ascending in `frame_idx`,
+    /// grown as the track is played or scanned. Lets a backward/replayed seek
+    /// jump near the target instead of rescanning from the track start.
+    index: Vec<(u64, Checkpoint)>,
+    /// Highest `frame_idx` already recorded in `index` (keeps it monotonic and
+    /// deduplicated across re-seeks over the same region).
+    indexed_through: u64,
 }
 
 impl SacdTrackReader {
@@ -200,35 +214,78 @@ impl SacdTrackReader {
             Some(FrameKind::Dsd) => {
                 out.extend_from_slice(self.frames.frame());
                 self.frame_idx += 1;
+                self.record_checkpoint();
                 Ok(true)
             }
             Some(FrameKind::Dst) => {
                 self.dst.decode(self.frames.frame(), out)?;
                 self.frame_idx += 1;
+                self.record_checkpoint();
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
+    /// Record a seek checkpoint for the current position if it is a fresh, clean
+    /// frame boundary at the sampling interval. Called after each frame advance
+    /// (during playback and during a seek scan) so the index fills in as the
+    /// track is traversed. Cheap and idempotent over re-traversed regions.
+    fn record_checkpoint(&mut self) {
+        if self.frame_idx < self.indexed_through + SEEK_INDEX_INTERVAL {
+            return;
+        }
+        if let Some(cp) = self.frames.checkpoint() {
+            self.index.push((self.frame_idx, cp));
+            self.indexed_through = self.frame_idx;
+        }
+    }
+
     /// Seek so the next `next()` yields frame `target` (a frame = 1/75 s). DST
-    /// frames are self-contained, so skipped frames need no decode; a backward
-    /// seek rewinds to the track start and re-skips. Returns the landed frame
+    /// frames are self-contained, so skipped frames need no decode. Jumps to the
+    /// nearest indexed checkpoint at or before `target` (filled in as the track
+    /// is played/scanned) and only scans the bounded remainder, so a backward
+    /// seek into already-played audio costs ≤ [`SEEK_INDEX_INTERVAL`] frames
+    /// instead of a full rescan from the track start. Returns the landed frame
     /// (clamped to end of track). Bit-exact: it lands on a real frame boundary.
     pub fn seek_frame(&mut self, target: u64) -> Result<u64> {
-        if target < self.frame_idx {
-            self.frames.reset()?;
-            self.frame_idx = 0;
-            // DST frames are independent; a fresh decoder guarantees clean state.
-            self.dst = dst::Decoder::new(self.channels as usize);
+        // Only reposition when we'd otherwise have to read backward, or when a
+        // checkpoint lets us skip a long forward gap. The common case (seeking
+        // slightly ahead of the current position) just scans forward as before.
+        let nearest = self.nearest_checkpoint(target);
+        match nearest {
+            // A checkpoint strictly ahead of us, or any checkpoint when we must
+            // rewind: jump to it (DST frames are independent → fresh decoder).
+            Some((cp_frame, cp)) if cp_frame > self.frame_idx || target < self.frame_idx => {
+                self.frames.seek_to_checkpoint(cp)?;
+                self.frame_idx = cp_frame;
+                self.dst = dst::Decoder::new(self.channels as usize);
+            }
+            // No usable checkpoint and we must rewind: restart from the top.
+            _ if target < self.frame_idx => {
+                self.frames.reset()?;
+                self.frame_idx = 0;
+                self.dst = dst::Decoder::new(self.channels as usize);
+            }
+            // Forward seek with nothing nearer than where we already are: scan on.
+            _ => {}
         }
         while self.frame_idx < target {
             match self.frames.read_frame()? {
-                Some(_) => self.frame_idx += 1,
+                Some(_) => {
+                    self.frame_idx += 1;
+                    self.record_checkpoint();
+                }
                 None => break,
             }
         }
         Ok(self.frame_idx)
+    }
+
+    /// The indexed checkpoint with the largest `frame_idx <= target`, if any.
+    fn nearest_checkpoint(&self, target: u64) -> Option<(u64, Checkpoint)> {
+        let i = self.index.partition_point(|(f, _)| *f <= target);
+        (i > 0).then(|| self.index[i - 1])
     }
 
     pub fn dsd_rate(&self) -> u32 {
@@ -242,5 +299,68 @@ impl SacdTrackReader {
     /// Whether this track is DST-compressed.
     pub fn is_dst(&self) -> bool {
         self.is_dst_area
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disc::test_support::synth_track;
+
+    const SECTOR: usize = 64;
+    const PART: usize = 16;
+    const PAYLOAD: usize = 2 * PART; // bytes per frame (two sectors per frame)
+
+    fn open(path: &Path, n_frames: usize) -> SacdTrackReader {
+        let file = File::open(path).unwrap();
+        SacdTrackReader {
+            frames: FrameReader::new(file, SECTOR, 0, 0, (2 * n_frames) as u32),
+            channels: 2,
+            dst: dst::Decoder::new(2),
+            is_dst_area: false, // raw DSD: next() copies the payload verbatim
+            frame_idx: 0,
+            index: Vec::new(),
+            indexed_through: 0,
+        }
+    }
+
+    /// Read every remaining frame from the current position into one buffer.
+    fn drain(r: &mut SacdTrackReader) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while r.next(&mut buf).unwrap() {}
+        buf
+    }
+
+    #[test]
+    fn seek_frame_lands_bit_exact_via_index() {
+        // > SEEK_INDEX_INTERVAL frames so the index gets populated (at 75, 150).
+        const N: usize = 200;
+        let (path, payloads) = synth_track("seek", SECTOR, N, PART);
+        let flat: Vec<u8> = payloads.concat();
+        assert_eq!(flat.len(), N * PAYLOAD);
+
+        // Play through once to fill the seek index.
+        let mut r = open(&path, N);
+        assert_eq!(drain(&mut r), flat);
+        assert!(!r.index.is_empty(), "playback should populate the seek index");
+
+        // Backward (rewind) and forward seeks to a mix of targets — those with a
+        // checkpoint ≤ target jump; the rest fall back to a clean rescan.
+        for &target in &[180u64, 100, 150, 30, 0, 120, 199] {
+            let landed = r.seek_frame(target).unwrap();
+            assert_eq!(landed, target, "seek lands exactly on the target frame");
+            assert_eq!(
+                drain(&mut r),
+                flat[target as usize * PAYLOAD..],
+                "tail after seek to {target} must be bit-exact"
+            );
+        }
+
+        // Seek past the end clamps to the total frame count, no audio past EOF.
+        let landed = r.seek_frame(10_000).unwrap();
+        assert_eq!(landed, N as u64);
+        assert!(drain(&mut r).is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

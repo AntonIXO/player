@@ -45,9 +45,15 @@ clap = { version = "4.6.1", features = ["derive"] }
 gtk4 = { version = "0.11.3", features = ["v4_16"] }
 libadwaita = { version = "0.9.1", features = ["v1_6"] }
 async-channel = "2.5.0"
-# DSD: .dsf/.dff frame reader (interleaved, MSB-first); the SACD .iso path is
-# the in-tree `sacd` crate.
+# DSD: .dsf/.dff frame reader (interleaved, MSB-first), used by player-library
+# for tag/art extraction and by player-core's tests as a bit-exact oracle. The
+# player-core audio path reads .dsf/.dff directly (dsf-meta/dff-meta below) so it
+# can seek by byte offset; the SACD .iso path is the in-tree `sacd` crate.
 dsd-reader = "0.3"
+# Container header parsers (the same ones dsd-reader uses): give us the audio
+# data offset / block layout needed for O(1) seeking in player-core::dsd.
+dsf-meta = "0.2"
+dff-meta = "0.1"
 sacd = { path = "crates/sacd" }
 
 [profile.release]

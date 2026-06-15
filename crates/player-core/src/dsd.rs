@@ -3,9 +3,12 @@
 //! engine wraps that stream with a [`crate::dop::DopPacker`] into a bit-perfect
 //! DoP PCM stream and pushes the bytes through the same ring/sink path as PCM.
 //!
-//! Concrete readers: `.dsf`/`.dff` via the `dsd-reader` crate, `.iso` (SACD) via
-//! the in-tree `sacd` crate. The [`open_dsd`] factory dispatches on extension.
+//! Concrete readers: `.dsf`/`.dff` via a direct-offset reader (so a rewind seeks
+//! by byte offset instead of rescanning from the start), `.iso` (SACD) via the
+//! in-tree `sacd` crate. The [`open_dsd`] factory dispatches on extension.
 
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -89,76 +92,161 @@ pub fn is_dsd_path(path: &Path) -> bool {
     )
 }
 
-/// `.dsf` / `.dff` source backed by the `dsd-reader` crate. We request its
-/// **interleaved, MSB-first** iterator, which yields the clustered-frame layout
-/// the [`crate::dop::DopPacker`] expects (and normalizes DSF's native LSB-first
-/// bit order for us).
+/// DFF read granularity (bytes per `next()` for the no-transform interleaved
+/// path). Any size works — [`crate::dop::DopPacker`] carries partial frames — so
+/// this just trades syscalls for buffer size.
+const DFF_CHUNK: usize = 64 * 1024;
+
+/// On-disc layout of a `.dsf`/`.dff` audio stream.
+enum Container {
+    /// DSDIFF: audio is already **interleaved, MSB-first** raw DSD, so a DoP
+    /// frame maps to a plain byte offset and reads need no transform.
+    Dff,
+    /// DSF: audio is **planar, LSB-first** in fixed `block_size`-per-channel
+    /// blocks laid out block-interleaved (`[ch0 blk][ch1 blk][ch0 blk]…`). We
+    /// read a whole super-block, optionally bit-reverse (`reverse` when the file
+    /// stores LSB-first, i.e. `bits_per_sample == 1`), and interleave across
+    /// channels into clustered-frame order.
+    Dsf { block_size: usize, reverse: bool },
+}
+
+/// Direct-offset `.dsf`/`.dff` reader. Yields **interleaved, MSB-first** DSD in
+/// the clustered-frame layout [`crate::dop::DopPacker`] expects — byte-identical
+/// to what the `dsd-reader` iterator produced (proved in `tests/dsd_dop.rs`).
+/// Unlike a forward-only iterator it seeks by computing the exact file offset of
+/// the target DoP frame, so a backward seek (rewind) is O(1) instead of a rescan
+/// from the track start.
 struct DsfDffSource {
-    /// Kept so a backward seek can re-`interl_iter` from the top (the iterator is
-    /// forward-only).
-    reader: dsd_reader::DsdReader,
-    iter: dsd_reader::DsdIter,
+    file: File,
+    container: Container,
+    /// File byte offset where audio data begins.
+    data_offset: u64,
+    channels: usize,
     spec: DsdSpec,
-    /// DSD bytes yielded so far — the seek anchor.
-    pos_bytes: u64,
-    /// A block read past the seek target and stashed to be yielded next.
-    pending: Option<Vec<u8>>,
+    /// Total valid DSD bytes in the stream (excludes any DSF block padding).
+    valid_total: u64,
+    /// Valid (output) DSD bytes already emitted — the seek anchor.
+    pos: u64,
+    /// Reused raw-read scratch (DSF super-block).
+    rbuf: Vec<u8>,
 }
 
 impl DsfDffSource {
     fn open(path: &Path) -> Result<Self> {
-        let reader = dsd_reader::DsdReader::from_container(path.to_path_buf())
-            .map_err(|e| Error::Dsd(e.to_string()))?;
-        let channels = reader.channels_num() as u32;
-        // `dsd_rate()` is the multiple over DSD64 (1/2/4/8).
-        let dsd_rate = DSD64_RATE.saturating_mul(reader.dsd_rate().max(1) as u32);
-        let audio_len = reader.audio_length();
-        // One DoP frame consumes 2 DSD bytes per channel.
-        let n_frames = (channels > 0 && audio_len > 0).then(|| audio_len / (2 * channels as u64));
-        let iter = reader
-            .interl_iter(false, None)
-            .map_err(|e| Error::Dsd(e.to_string()))?;
-        Ok(DsfDffSource {
-            reader,
-            iter,
-            spec: DsdSpec {
-                dsd_rate,
-                channels,
-                n_frames,
-            },
-            pos_bytes: 0,
-            pending: None,
-        })
+        match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+            Some("dsf") => Self::open_dsf(path),
+            Some("dff") => Self::open_dff(path),
+            _ => Err(Error::Dsd(format!("not a .dsf/.dff file: {}", path.display()))),
+        }
     }
 
-    /// Pull the next interleaved block (pending first, else the iterator), or
-    /// `None` at end of stream. Does not advance `pos_bytes`.
-    fn next_block(&mut self) -> Option<Vec<u8>> {
-        if let Some(p) = self.pending.take() {
-            return Some(p);
+    fn open_dsf(path: &Path) -> Result<Self> {
+        let meta = dsf_meta::DsfFile::open(path).map_err(|e| Error::Dsd(e.to_string()))?;
+        let fmt = meta.fmt_chunk();
+        let channels = fmt.channel_num() as usize;
+        let block_size = fmt.block_size_per_channel() as usize;
+        let reverse = fmt.bits_per_sample() == 1; // 1 = LSB-first → reverse to MSB-first
+        // `sample_count` is samples (bits) per channel → /8 bytes per channel.
+        let valid_total = (fmt.sample_count() / 8).saturating_mul(channels as u64);
+        let container = Container::Dsf { block_size, reverse };
+        Self::finish(File::open(path)?, container, dsf_meta::DSF_SAMPLE_DATA_OFFSET, channels, fmt.sampling_frequency(), valid_total)
+    }
+
+    fn open_dff(path: &Path) -> Result<Self> {
+        let meta = dff_meta::DffFile::open(path).map_err(|e| Error::Dsd(e.to_string()))?;
+        let channels = meta.get_num_channels().map_err(|e| Error::Dsd(e.to_string()))?;
+        let dsd_rate = meta.get_sample_rate().map_err(|e| Error::Dsd(e.to_string()))?;
+        Self::finish(File::open(path)?, Container::Dff, meta.get_dsd_data_offset(), channels, dsd_rate, meta.get_audio_length())
+    }
+
+    fn finish(file: File, container: Container, data_offset: u64, channels: usize, dsd_rate: u32, valid_total: u64) -> Result<Self> {
+        if channels == 0 {
+            return Err(Error::Dsd("DSD file reports zero channels".into()));
         }
-        match self.iter.next() {
-            // Interleaved output is a single buffer; `read_size` is its valid
-            // length (the whole clustered frame for all channels).
-            Some((read_size, bufs)) => bufs.first().map(|buf| {
-                let n = read_size.min(buf.len());
-                buf[..n].to_vec()
-            }),
-            None => None,
+        // Never read past the file (guards a corrupt header); DSF block padding
+        // already keeps the on-disc size ≥ valid_total, so this is a no-op there.
+        // Keep it a whole number of channels so the DSF per-channel block math
+        // always reaches the end (a no-op for valid files — DSD byte counts are
+        // already a multiple of the channel count).
+        let file_len = file.metadata()?.len();
+        let valid_total = valid_total.min(file_len.saturating_sub(data_offset));
+        let valid_total = valid_total - valid_total % channels as u64;
+        let n_frames = (valid_total > 0).then(|| valid_total / (2 * channels as u64));
+        Ok(DsfDffSource {
+            file,
+            container,
+            data_offset,
+            channels,
+            spec: DsdSpec { dsd_rate, channels: channels as u32, n_frames },
+            valid_total,
+            pos: 0,
+            rbuf: Vec::new(),
+        })
+    }
+}
+
+/// Read up to `buf.len()` bytes, returning how many were read (tolerates a short
+/// final block / EOF rather than erroring like `read_exact`).
+fn read_up_to(file: &mut File, buf: &mut [u8]) -> Result<usize> {
+    let mut off = 0;
+    while off < buf.len() {
+        match file.read(&mut buf[off..]) {
+            Ok(0) => break,
+            Ok(n) => off += n,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
         }
     }
+    Ok(off)
 }
 
 impl DsdSource for DsfDffSource {
     fn next(&mut self, out: &mut Vec<u8>) -> Result<bool> {
         out.clear();
-        match self.next_block() {
-            Some(block) => {
-                self.pos_bytes += block.len() as u64;
-                out.extend_from_slice(&block);
+        if self.pos >= self.valid_total {
+            return Ok(false);
+        }
+        match self.container {
+            Container::Dff => {
+                let n = (self.valid_total - self.pos).min(DFF_CHUNK as u64) as usize;
+                self.file.seek(SeekFrom::Start(self.data_offset + self.pos))?;
+                out.resize(n, 0);
+                self.file.read_exact(out)?;
+                self.pos += n as u64;
                 Ok(true)
             }
-            None => Ok(false),
+            Container::Dsf { block_size, reverse } => {
+                let ch = self.channels;
+                let super_block = block_size * ch; // on-disc bytes == full-block output bytes
+                let block_idx = self.pos / super_block as u64;
+                let block_out_start = block_idx * super_block as u64;
+                // Valid per-channel bytes in this block (the last block may be short).
+                let valid_per_chan = self.valid_total / ch as u64;
+                let per_chan = block_size.min((valid_per_chan - block_idx * block_size as u64) as usize);
+                // Read the on-disc super-block (channels are block-interleaved, so
+                // every channel's block must be in hand to interleave them).
+                self.file.seek(SeekFrom::Start(self.data_offset + block_out_start))?;
+                self.rbuf.resize(super_block, 0);
+                let got = read_up_to(&mut self.file, &mut self.rbuf)?;
+                // Transform the valid region to clustered-frame MSB-first.
+                out.reserve(per_chan * ch);
+                for i in 0..per_chan {
+                    for c in 0..ch {
+                        let idx = c * block_size + i;
+                        if idx < got {
+                            let b = self.rbuf[idx];
+                            out.push(if reverse { b.reverse_bits() } else { b });
+                        }
+                    }
+                }
+                // Drop the within-block prefix a mid-block seek landed inside.
+                let skip = (self.pos - block_out_start) as usize;
+                if skip > 0 {
+                    out.drain(..skip.min(out.len()));
+                }
+                self.pos += out.len() as u64;
+                Ok(true)
+            }
         }
     }
 
@@ -167,30 +255,12 @@ impl DsdSource for DsfDffSource {
     }
 
     fn seek(&mut self, dop_frame: u64) -> Result<Option<u64>> {
-        // 2 DSD bytes per channel make one DoP frame.
-        let bpf = 2 * self.spec.channels.max(1) as u64;
-        let target = dop_frame.saturating_mul(bpf);
-        // The iterator only moves forward; rewind by recreating it from the top.
-        if target < self.pos_bytes {
-            self.iter = self
-                .reader
-                .interl_iter(false, None)
-                .map_err(|e| Error::Dsd(e.to_string()))?;
-            self.pos_bytes = 0;
-            self.pending = None;
-        }
-        // Discard whole blocks until one would straddle the target; stash it so
-        // playback resumes from that block's (frame-aligned) start.
-        loop {
-            let Some(block) = self.next_block() else {
-                return Ok(Some(self.pos_bytes / bpf)); // sought past end
-            };
-            if self.pos_bytes + block.len() as u64 > target {
-                self.pending = Some(block);
-                return Ok(Some(self.pos_bytes / bpf));
-            }
-            self.pos_bytes += block.len() as u64;
-        }
+        // One DoP frame is 2 DSD bytes per channel; land on a frame boundary,
+        // clamped to end of stream.
+        let bpf = 2 * self.channels as u64;
+        let target = dop_frame.saturating_mul(bpf).min(self.valid_total);
+        self.pos = target - (target % bpf); // frame-align (valid_total may not be whole frames)
+        Ok(Some(self.pos / bpf))
     }
 }
 

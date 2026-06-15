@@ -41,6 +41,20 @@ pub enum FrameKind {
     Dst,
 }
 
+/// A resumable read position captured at a frame boundary (between frames, with
+/// the next frame's start packet not yet consumed). Restoring it reproduces the
+/// exact mid-sector parser state, so seeking is bit-identical to having read
+/// straight through. Used to build the [`crate::SacdTrackReader`] seek index.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checkpoint {
+    /// File byte offset of the sector currently in `FrameReader::sector`.
+    sector_pos: u64,
+    /// Index of the next (unconsumed) packet within that sector.
+    packet_idx: usize,
+    /// Read cursor of that packet's payload within the logical-sector payload.
+    offset: usize,
+}
+
 #[derive(Clone, Copy, Default)]
 struct PacketInfo {
     frame_start: bool,
@@ -148,6 +162,41 @@ impl FrameReader {
         Ok(())
     }
 
+    /// A resumable position for the *next* frame, or `None` if not at a clean
+    /// frame boundary (mid-frame, or at end of track). Valid immediately after
+    /// `read_frame` returns a non-final frame: the next frame's start packet is
+    /// parsed but not yet consumed.
+    pub(crate) fn checkpoint(&self) -> Option<Checkpoint> {
+        if self.done || self.frame_started || self.packet_idx >= self.packet_count {
+            return None;
+        }
+        let sector_size = self.sector.len() as u64;
+        Some(Checkpoint {
+            sector_pos: (self.current_lsn as u64 - 1) * sector_size,
+            packet_idx: self.packet_idx,
+            offset: self.offset,
+        })
+    }
+
+    /// Jump to a previously captured [`Checkpoint`] so the next `read_frame`
+    /// resumes exactly where that checkpoint was taken (the caller restores its
+    /// own frame counter). Re-reads and re-parses the saved sector — which
+    /// rebuilds the identical packet table — then restores the mid-sector cursor.
+    pub(crate) fn seek_to_checkpoint(&mut self, cp: Checkpoint) -> Result<()> {
+        let sector_size = self.sector.len() as u64;
+        self.file.seek(SeekFrom::Start(cp.sector_pos))?;
+        self.file.read_exact(&mut self.sector)?;
+        self.current_lsn = (cp.sector_pos / sector_size) as u32 + 1;
+        self.parse_sector_header();
+        self.packet_idx = cp.packet_idx;
+        self.offset = cp.offset;
+        self.frame.clear();
+        self.frame_started = false;
+        self.frame_dst = false;
+        self.done = false;
+        Ok(())
+    }
+
     /// Read the next complete frame, or `None` at end of track.
     pub(crate) fn read_frame(&mut self) -> Result<Option<FrameKind>> {
         if self.done {
@@ -210,5 +259,121 @@ impl FrameReader {
     /// The last frame's bytes (valid after `read_frame` returns `Some`).
     pub(crate) fn frame(&self) -> &[u8] {
         &self.frame
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    /// Write a synthetic single-track sector stream: `n_frames` frames, each
+    /// spanning **two** sectors (one audio packet per sector; `frame_start` set
+    /// only on the first), so `read_frame` yields exactly `n_frames` frames whose
+    /// payloads (`2 * part_len` bytes) are the returned vectors. Two sectors per
+    /// frame mirrors real discs — the last frame's trailing sector has no
+    /// `frame_start`, so the end-of-track flush returns it. `base = 0`
+    /// (LSN-style); small `sector_size`/`part_len` keep the fixture tiny while
+    /// exercising the same packet/sector machinery.
+    pub(crate) fn synth_track(
+        tag: &str,
+        sector_size: usize,
+        n_frames: usize,
+        part_len: usize,
+    ) -> (PathBuf, Vec<Vec<u8>>) {
+        assert!(part_len + 3 <= sector_size, "packet must fit one sector");
+        assert!(part_len <= 0x7ff, "packet_length is 11 bits");
+        let mut file_bytes = Vec::with_capacity(n_frames * 2 * sector_size);
+        let mut payloads = Vec::with_capacity(n_frames);
+        for f in 0..n_frames {
+            let mut frame = Vec::with_capacity(2 * part_len);
+            for half in 0..2 {
+                let mut sector = vec![0u8; sector_size];
+                // header: dst_encoded=0, frame_info_count=0, packet_info_count=1.
+                sector[0] = 1 << 5;
+                // packet 0: frame_start on the first half only, data_type=2 (audio).
+                let frame_start = if half == 0 { 1u8 } else { 0 };
+                sector[1] = (frame_start << 7) | (2 << 3) | (((part_len >> 8) & 7) as u8);
+                sector[2] = (part_len & 0xff) as u8;
+                let part: Vec<u8> = (0..part_len)
+                    .map(|i| {
+                        let v = f.wrapping_mul(131).wrapping_add(half * 53).wrapping_add(i.wrapping_mul(17));
+                        ((v + 7) & 0xff) as u8
+                    })
+                    .collect();
+                sector[3..3 + part_len].copy_from_slice(&part);
+                file_bytes.extend_from_slice(&sector);
+                frame.extend_from_slice(&part);
+            }
+            payloads.push(frame);
+        }
+        let path = std::env::temp_dir().join(format!("sacd-synth-{tag}-{}.bin", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&file_bytes)
+            .unwrap();
+        (path, payloads)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::synth_track;
+    use super::*;
+
+    const SECTOR: usize = 64;
+    const PART: usize = 16; // two parts per frame → 32-byte frames
+
+    fn open_reader(path: &std::path::Path, n_frames: usize) -> FrameReader {
+        let file = File::open(path).unwrap();
+        FrameReader::new(file, SECTOR, 0, 0, (2 * n_frames) as u32)
+    }
+
+    fn read_all_frames(r: &mut FrameReader) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while r.read_frame().unwrap().is_some() {
+            out.push(r.frame().to_vec());
+        }
+        out
+    }
+
+    #[test]
+    fn synth_yields_expected_frames() {
+        let (path, payloads) = synth_track("rf", SECTOR, 6, PART);
+        let mut r = open_reader(&path, 6);
+        assert_eq!(read_all_frames(&mut r), payloads);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checkpoint_resumes_bit_exact_at_every_boundary() {
+        const N: usize = 12;
+        let (path, payloads) = synth_track("cp", SECTOR, N, PART);
+
+        // Read straight through, capturing the checkpoint after each frame.
+        let mut r = open_reader(&path, N);
+        let mut checkpoints: Vec<(usize, Checkpoint)> = Vec::new();
+        let mut produced = 0usize;
+        while r.read_frame().unwrap().is_some() {
+            produced += 1;
+            if let Some(cp) = r.checkpoint() {
+                checkpoints.push((produced, cp)); // resume point for frame `produced`
+            }
+        }
+        assert_eq!(produced, N);
+        // A clean boundary exists after every frame except the last (end of track).
+        assert_eq!(checkpoints.len(), N - 1);
+
+        // Each checkpoint must re-yield the exact tail from that frame onward.
+        for (next_frame, cp) in checkpoints {
+            let mut r = open_reader(&path, N);
+            r.seek_to_checkpoint(cp).unwrap();
+            assert_eq!(
+                read_all_frames(&mut r),
+                payloads[next_frame..],
+                "resume at frame {next_frame} must be bit-exact"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

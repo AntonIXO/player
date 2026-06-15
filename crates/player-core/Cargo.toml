@@ -11,5 +11,10 @@ rtrb.workspace = true
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 libc.workspace = true
-dsd-reader.workspace = true
+dsf-meta.workspace = true
+dff-meta.workspace = true
 sacd.workspace = true
+
+[dev-dependencies]
+# Bit-exact oracle for the direct .dsf/.dff reader's equivalence tests.
+dsd-reader.workspace = true

@@ -45,7 +45,11 @@ format from source bit depth, *widened* to the narrowest container the device su
 
 **DSD / DoP** (the parallel source path; still bit-perfect — DoP only re-frames DSD,
 never alters bits): `dsd.rs` is the `DsdSource` seam + `open_dsd` factory (`.dsf`/`.dff`
-via the `dsd-reader` crate; SACD `.iso` via the `sacd` crate). `dop.rs` `DopPacker`
+via a direct-offset reader using `dsf-meta`/`dff-meta` for headers — so a rewind seeks by
+byte offset instead of rescanning from the start; `dsd-reader` is kept only as a test
+oracle + for `player-library` tag/art extraction; SACD `.iso` via the `sacd` crate, whose
+`SacdTrackReader` keeps a sparse frame→sector index so backward seeks skip the rescan).
+`dop.rs` `DopPacker`
 wraps interleaved **MSB-first** DSD bytes into `S32_LE`/`S24_3LE` PCM at `dsd_rate/16`
 with alternating `0x05`/`0xFA` markers — a normal `StreamSpec{is_dop:true}`. The engine
 seam (`engine/decode_thread.rs`) is a `TrackProducer` enum (`Pcm`=Decoder+Packer,

@@ -1314,7 +1314,9 @@ version = "0.1.0"
 dependencies = [
  "alsa",
  "crossbeam-channel",
+ "dff-meta",
  "dsd-reader",
+ "dsf-meta",
  "libc",
  "rtrb",
  "sacd",

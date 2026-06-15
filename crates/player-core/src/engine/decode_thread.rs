@@ -385,21 +385,24 @@ fn apply_cmd(
                     // DSD seeks in DoP PCM frames (= the wire rate, dsd_rate / 16).
                     // Range is always `None` for DSD, so no cue rebasing.
                     TrackProducer::Dsd { reader, dop, .. } => {
+                        // Tear the segment down *before* seeking (matching the PCM
+                        // branch's flush-first order) so the open DoP stream can't
+                        // starve while a cold seek scans — a starved DoP stream
+                        // loses its marker lock and the Mojo 2 drops to 176.4 kHz
+                        // PCM (blue light). The post-seek segment is re-led with
+                        // DoP-silence preroll (`producer_for`), which re-locks it.
+                        writer.flush();
+                        dop.reset(); // fresh marker phase + drop any partial-frame carry
                         let dpf = (reader.spec().dsd_rate as u64 / 16).max(1);
                         let target = (d.as_millis() as u64) * dpf / 1000;
                         match reader.seek(target) {
-                            Ok(Some(landed)) => {
-                                writer.flush();
-                                // Fresh DoP marker phase + drop any partial-frame carry.
-                                dop.reset();
-                                writer.set_next_pos_base(landed);
-                                *paused = false;
-                                interrupt.store(false, Ordering::SeqCst);
-                            }
-                            // Source can't seek: leave playback untouched.
+                            Ok(Some(landed)) => writer.set_next_pos_base(landed),
+                            // Non-seekable source (no concrete one is): restart at 0.
                             Ok(None) => {}
                             Err(e) => emit(Event::Error(e.to_string())),
                         }
+                        *paused = false;
+                        interrupt.store(false, Ordering::SeqCst);
                     }
                 }
             }

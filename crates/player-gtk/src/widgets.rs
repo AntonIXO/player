@@ -3,6 +3,7 @@
 //! they live apart from the wiring in `main.rs` to keep that file focused on
 //! behaviour rather than widget plumbing.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4 as gtk;
@@ -12,7 +13,7 @@ use adw::prelude::*;
 use gtk::{Orientation, SelectionMode};
 use player_library::Album;
 
-use crate::art::ArtCache;
+use crate::art::{ArtCache, ArtSlot};
 
 /// Album-art sizes used across the shell (list row · mini-player · hero).
 pub(crate) const ART_ROW: i32 = 46;
@@ -45,6 +46,15 @@ pub(crate) fn circle(icon: &str, size: i32, tip: &str) -> gtk::Button {
 /// invoked with the new state when tapped. Boxed so the row builders can stay
 /// non-generic over it (and so non-track rows can pass `None`).
 pub(crate) type Heart = Option<(bool, Box<dyn Fn(bool)>)>;
+
+/// A recycled row's re-targetable button callbacks: the per-item closure is
+/// swapped in on each bind (the buttons are built once in [`row_setup`]).
+/// `HeartCb` receives the new loved state; `ActionCb` is the trailing tap.
+type HeartCb = Rc<RefCell<Option<Box<dyn Fn(bool)>>>>;
+type ActionCb = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
+/// A row's optional trailing button as applied on bind: icon name, tooltip, tap.
+type Trailing<'a> = Option<(&'a str, &'a str, Box<dyn Fn()>)>;
 
 /// Reflect `loved` on a heart button (filled/accented when loved, dim otherwise).
 fn style_heart(b: &gtk::Button, loved: bool) {
@@ -194,72 +204,195 @@ pub(crate) fn row_widget(
     lbr
 }
 
-pub(crate) fn album_cell(cache: &ArtCache, al: &Album, art_px: i32) -> gtk::Box {
-    let cell = gtk::Box::new(Orientation::Vertical, 6);
-    cell.add_css_class("album-cell");
-    let art = art_widget(cache, al.art_hash.as_deref(), art_px, false);
-    art.set_size_request(art_px, art_px);
-    cell.append(&art);
-    let t = gtk::Label::new(Some(&al.album));
-    t.add_css_class("heading");
-    t.set_xalign(0.0);
-    t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    t.set_max_width_chars(10);
-    let a = gtk::Label::new(Some(al.album_artist.as_deref().unwrap_or("Unknown Artist")));
-    a.add_css_class("dim-label");
-    a.add_css_class("caption");
-    a.set_xalign(0.0);
-    a.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    a.set_max_width_chars(10);
-    cell.append(&t);
-    cell.append(&a);
-    cell
+/// The reusable widgets of one virtualised list row (art · title/subtitle · mono
+/// meta · heart · trailing button), updated per [`list`](crate::list) bind. Built
+/// once by [`row_setup`]; the `set_*` helpers re-point it at a new item (text, art
+/// paintable, and the per-row heart/trailing callbacks) without rebuilding the
+/// subtree. The static `GtkListBox` path still uses [`row_inner`].
+pub(crate) struct RowHandle {
+    art: ArtSlot,
+    title: gtk::Label,
+    subtitle: gtk::Label,
+    meta: gtk::Label,
+    heart: gtk::Button,
+    heart_cb: HeartCb,
+    trailing: gtk::Button,
+    trailing_cb: ActionCb,
 }
 
-pub(crate) fn art_widget(cache: &ArtCache, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
-    // A fixed square `Box` with `overflow: hidden` + the `.art` radius clips its
-    // child to rounded corners (the standard GTK4 recipe — an `AspectFrame` does
-    // not). The cover is shown via a `gtk::Image`, which paints a paintable at
-    // exactly `pixel_size` (a bare `Picture` reports its source pixels as its
-    // natural size and balloons past `size` in an unconstrained parent like the
-    // now-playing hero / mini-player). The texture is loaded asynchronously
-    // through the cache; a placeholder icon shows until it arrives.
-    let frame = gtk::Box::new(Orientation::Vertical, 0);
-    frame.set_size_request(size, size);
-    frame.set_halign(gtk::Align::Center);
-    frame.set_valign(gtk::Align::Center);
-    frame.set_hexpand(false);
-    frame.set_vexpand(false);
-    frame.set_overflow(gtk::Overflow::Hidden);
-    frame.add_css_class("art");
-    if big {
-        frame.add_css_class("art-lg");
-    }
+/// Build one reusable list row for a list factory's `setup`. All optional bits
+/// (meta · heart · trailing) start hidden and are revealed per bind.
+pub(crate) fn row_setup() -> (gtk::Widget, Rc<RowHandle>) {
+    let row = gtk::Box::new(Orientation::Horizontal, 13);
+    row.set_margin_top(8);
+    row.set_margin_bottom(8);
+    row.set_margin_start(12);
+    row.set_margin_end(8);
 
-    frame.add_css_class("art-placeholder");
-    let icon = gtk::Image::from_icon_name("folder-music-symbolic");
-    icon.set_pixel_size((size as f32 * 0.42) as i32);
-    icon.add_css_class("dim-label");
-    icon.set_hexpand(true);
-    icon.set_vexpand(true);
-    frame.append(&icon);
+    let art = ArtSlot::new(ART_ROW, false);
+    row.append(&art.widget());
 
-    if let Some(h) = hash {
-        let frame_weak = frame.downgrade();
-        cache.request(h, size, move |tex| {
-            let Some(frame) = frame_weak.upgrade() else { return };
-            while let Some(c) = frame.first_child() {
-                frame.remove(&c);
+    let texts = gtk::Box::new(Orientation::Vertical, 1);
+    texts.set_hexpand(true);
+    texts.set_valign(gtk::Align::Center);
+    let title = gtk::Label::new(None);
+    title.add_css_class("heading");
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let subtitle = gtk::Label::new(None);
+    subtitle.add_css_class("dim-label");
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    texts.append(&title);
+    texts.append(&subtitle);
+    row.append(&texts);
+
+    // Ellipsize so a long spec ("3:46 · FLAC · 44.1 kHz · 24-bit") can't pin a
+    // row (and thus the page) wider than a phone screen.
+    let meta = gtk::Label::new(None);
+    meta.add_css_class("dim-label");
+    meta.add_css_class("mono");
+    meta.add_css_class("caption");
+    meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    meta.set_visible(false);
+    row.append(&meta);
+
+    let heart = circle("emblem-favorite-symbolic", 32, "");
+    heart.set_visible(false);
+    let heart_cb: HeartCb = Rc::new(RefCell::new(None));
+    {
+        let (hb, cb) = (heart.clone(), heart_cb.clone());
+        heart.connect_clicked(move |_| {
+            let now = !hb.has_css_class("loved");
+            style_heart(&hb, now);
+            if let Some(f) = cb.borrow().as_ref() {
+                f(now);
             }
-            frame.remove_css_class("art-placeholder");
-            let img = gtk::Image::from_paintable(Some(tex));
-            img.set_pixel_size(size);
-            img.set_hexpand(true);
-            img.set_vexpand(true);
-            frame.append(&img);
         });
     }
-    frame.upcast()
+    row.append(&heart);
+
+    let trailing = circle("media-playback-start-symbolic", 32, "");
+    trailing.set_visible(false);
+    let trailing_cb: ActionCb = Rc::new(RefCell::new(None));
+    {
+        let cb = trailing_cb.clone();
+        trailing.connect_clicked(move |_| {
+            if let Some(f) = cb.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+    row.append(&trailing);
+
+    let handle = Rc::new(RowHandle {
+        art,
+        title,
+        subtitle,
+        meta,
+        heart,
+        heart_cb,
+        trailing,
+        trailing_cb,
+    });
+    (row.upcast(), handle)
+}
+
+impl RowHandle {
+    pub(crate) fn set_art(&self, hash: Option<&str>, cache: &ArtCache) {
+        self.art.set(hash, cache);
+    }
+
+    pub(crate) fn set_texts(&self, title: &str, subtitle: &str, meta: Option<&str>) {
+        self.title.set_label(title);
+        self.subtitle.set_label(subtitle);
+        match meta {
+            Some(m) => {
+                self.meta.set_label(m);
+                self.meta.set_visible(true);
+            }
+            None => self.meta.set_visible(false),
+        }
+    }
+
+    pub(crate) fn set_heart(&self, heart: Heart) {
+        match heart {
+            Some((loved, on_toggle)) => {
+                style_heart(&self.heart, loved);
+                *self.heart_cb.borrow_mut() = Some(on_toggle);
+                self.heart.set_visible(true);
+            }
+            None => {
+                *self.heart_cb.borrow_mut() = None;
+                self.heart.set_visible(false);
+            }
+        }
+    }
+
+    pub(crate) fn set_trailing(&self, trailing: Trailing) {
+        match trailing {
+            Some((icon, tip, on_activate)) => {
+                self.trailing.set_icon_name(icon);
+                self.trailing.set_tooltip_text(Some(tip));
+                *self.trailing_cb.borrow_mut() = Some(on_activate);
+                self.trailing.set_visible(true);
+            }
+            None => {
+                *self.trailing_cb.borrow_mut() = None;
+                self.trailing.set_visible(false);
+            }
+        }
+    }
+}
+
+/// The reusable widgets of one album-grid cell, updated per [`list`](crate::list)
+/// bind. Built once by [`album_cell_setup`]; [`album_cell_bind`] re-points it at a
+/// new album (text + art paintable) without rebuilding the subtree.
+pub(crate) struct AlbumCellHandle {
+    art: ArtSlot,
+    title: gtk::Label,
+    artist: gtk::Label,
+}
+
+/// Build one reusable album cell at `art_px` (square cover). Returns the cell
+/// widget and its handle for the grid factory's `setup`.
+pub(crate) fn album_cell_setup(art_px: i32) -> (gtk::Widget, Rc<AlbumCellHandle>) {
+    let cell = gtk::Box::new(Orientation::Vertical, 6);
+    cell.add_css_class("album-cell");
+    let art = ArtSlot::new(art_px, false);
+    cell.append(&art.widget());
+    let title = grid_label("heading");
+    let artist = grid_label("caption");
+    artist.add_css_class("dim-label");
+    cell.append(&title);
+    cell.append(&artist);
+    (cell.upcast(), Rc::new(AlbumCellHandle { art, title, artist }))
+}
+
+/// Apply `al` to a cell built by [`album_cell_setup`] (the grid factory's `bind`).
+pub(crate) fn album_cell_bind(h: &AlbumCellHandle, al: &Album, cache: &ArtCache) {
+    h.art.set(al.art_hash.as_deref(), cache);
+    h.title.set_label(&al.album);
+    h.artist.set_label(al.album_artist.as_deref().unwrap_or("Unknown Artist"));
+}
+
+fn grid_label(css: &str) -> gtk::Label {
+    let l = gtk::Label::new(None);
+    l.add_css_class(css);
+    l.set_xalign(0.0);
+    l.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    l.set_max_width_chars(10);
+    l
+}
+
+/// A one-shot square cover for non-recycled placements (now-playing hero, mini
+/// player, album detail). Builds an [`ArtSlot`], points it at `hash`, and returns
+/// the widget. (List/grid cells use a persistent [`ArtSlot`] re-targeted per bind
+/// — see [`AlbumCellHandle`] / [`RowHandle`] — so they don't rebuild this.)
+pub(crate) fn art_widget(cache: &ArtCache, hash: Option<&str>, size: i32, big: bool) -> gtk::Widget {
+    let slot = ArtSlot::new(size, big);
+    slot.set(hash, cache);
+    slot.widget()
 }
 
 pub(crate) fn format_chip(spec: &str) -> gtk::Box {

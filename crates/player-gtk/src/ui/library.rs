@@ -19,7 +19,8 @@ use crate::playback::{
 use crate::state::{SharedState, SharedUi};
 use crate::ui::libworker::{spinner_after, submit_action, submit_render, LibPayload};
 use crate::widgets::{
-    album_cell, art_widget, boxed_list, clamp, row_inner, row_widget, status_page, wrap_scroller,
+    album_cell_bind, album_cell_setup, art_widget, boxed_list, clamp, row_setup, row_widget,
+    status_page, wrap_scroller, AlbumCellHandle, RowHandle,
 };
 
 /// Widgets the library page exposes to the rest of the app.
@@ -290,9 +291,10 @@ pub(crate) fn rebuild_albums(state: &SharedState, ui: &SharedUi) {
         albums.clone(),
         3,
         3,
+        move || album_cell_setup(px),
         {
             let cache = ui.art.clone();
-            move |al: &Album| album_cell(&cache, al, px).upcast()
+            move |h: &AlbumCellHandle, al: &Album| album_cell_bind(h, al, &cache)
         },
         {
             let (state, ui) = (state.clone(), ui.clone());
@@ -424,9 +426,10 @@ pub(crate) fn show_browse_tab(_state: &SharedState, ui: &SharedUi, name: &str) {
 fn render_artists(state: &SharedState, ui: &SharedUi, artists: Vec<Artist>) {
     let lv = list_view(
         artists,
+        row_setup,
         {
             let (state, ui) = (state.clone(), ui.clone());
-            move |a: &Artist| {
+            move |h: &RowHandle, a: &Artist| {
                 let meta = format!(
                     "{} album{} · {} track{}",
                     a.album_count,
@@ -434,19 +437,15 @@ fn render_artists(state: &SharedState, ui: &SharedUi, artists: Vec<Artist>) {
                     a.track_count,
                     if a.track_count == 1 { "" } else { "s" },
                 );
-                let cache = ui.art.clone();
+                h.set_art(None, &ui.art);
+                h.set_texts(&a.name, &meta, None);
+                h.set_heart(None);
                 let (state, ui, name) = (state.clone(), ui.clone(), a.name.clone());
-                row_inner(
-                    &cache,
-                    None,
-                    &name.clone(),
-                    &meta,
-                    None,
-                    None,
-                    Some(("media-playback-start-symbolic", "Play all")),
-                    move || play_artist(&state, &ui, &name),
-                )
-                .upcast()
+                h.set_trailing(Some((
+                    "media-playback-start-symbolic",
+                    "Play all",
+                    Box::new(move || play_artist(&state, &ui, &name)),
+                )));
             }
         },
         {
@@ -461,22 +460,19 @@ fn render_artists(state: &SharedState, ui: &SharedUi, artists: Vec<Artist>) {
 fn render_folders(state: &SharedState, ui: &SharedUi, folders: Vec<Folder>) {
     let lv = list_view(
         folders,
+        row_setup,
         {
             let (state, ui) = (state.clone(), ui.clone());
-            move |f: &Folder| {
-                let cache = ui.art.clone();
+            move |h: &RowHandle, f: &Folder| {
+                h.set_art(None, &ui.art);
+                h.set_texts(f.name(), &f.path, Some(&f.meta()));
+                h.set_heart(None);
                 let (state, ui, path) = (state.clone(), ui.clone(), f.path.clone());
-                row_inner(
-                    &cache,
-                    None,
-                    f.name(),
-                    &f.path,
-                    Some(&f.meta()),
-                    None,
-                    Some(("media-playback-start-symbolic", "Play folder")),
-                    move || play_folder(&state, &ui, &path),
-                )
-                .upcast()
+                h.set_trailing(Some((
+                    "media-playback-start-symbolic",
+                    "Play folder",
+                    Box::new(move || play_folder(&state, &ui, &path)),
+                )));
             }
         },
         {
@@ -507,23 +503,21 @@ fn render_loved(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) {
 fn track_list_view(state: &SharedState, ui: &SharedUi, tracks: Vec<Track>) -> gtk::ListView {
     list_view(
         tracks,
+        row_setup,
         {
             let (state, ui) = (state.clone(), ui.clone());
-            move |t: &Track| {
+            move |h: &RowHandle, t: &Track| {
+                h.set_art(t.art_hash.as_deref(), &ui.art);
+                h.set_texts(&t.display_title(), &t.subtitle(), Some(&t.format_spec()));
                 let (id, loved) = (t.id, t.loved);
-                let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
                 let (sh, uh) = (state.clone(), ui.clone());
-                row_inner(
-                    &ui.art,
-                    t.art_hash.as_deref(),
-                    &t.display_title(),
-                    &t.subtitle(),
-                    Some(&t.format_spec()),
-                    Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))),
-                    Some(("list-add-symbolic", "Add to queue")),
-                    move || enqueue_track(&s2, &u2, tc.clone()),
-                )
-                .upcast()
+                h.set_heart(Some((loved, Box::new(move |now| toggle_loved(&sh, &uh, id, now)))));
+                let (s2, u2, tc) = (state.clone(), ui.clone(), t.clone());
+                h.set_trailing(Some((
+                    "list-add-symbolic",
+                    "Add to queue",
+                    Box::new(move || enqueue_track(&s2, &u2, tc.clone())),
+                )));
             }
         },
         {

@@ -68,31 +68,42 @@ pub(crate) fn toggle_play(state: &SharedState, ui: &SharedUi) {
         (s.playing, s.paused, s.current.is_some(), !s.queue.is_empty())
     };
     if playing {
-        // Real pause: hold output at the device, keep the track loaded.
-        state.borrow().player.pause();
-        let mut s = state.borrow_mut();
-        s.playing = false;
-        s.paused = true;
-        drop(s);
-        set_play_icon(ui, false);
+        pause_playback(state, ui);
     } else if paused {
-        // Resume the held track (do not restart it).
-        state.borrow().player.resume();
-        let mut s = state.borrow_mut();
-        s.playing = true;
-        s.paused = false;
-        drop(s);
-        set_play_icon(ui, true);
+        resume_playback(state, ui);
     } else if has_current {
         state.borrow_mut().playing = true;
         start_current(state, ui);
     } else if has_queue {
-        let mut s = state.borrow_mut();
-        s.current = Some(0);
-        s.playing = true;
-        drop(s);
+        {
+            let mut s = state.borrow_mut();
+            s.current = Some(0);
+            s.playing = true;
+        }
         start_current(state, ui);
     }
+}
+
+/// Real pause: hold output at the device, keep the track loaded.
+fn pause_playback(state: &SharedState, ui: &SharedUi) {
+    state.borrow().player.pause();
+    {
+        let mut s = state.borrow_mut();
+        s.playing = false;
+        s.paused = true;
+    }
+    set_play_icon(ui, false);
+}
+
+/// Resume the held track (do not restart it).
+fn resume_playback(state: &SharedState, ui: &SharedUi) {
+    state.borrow().player.resume();
+    {
+        let mut s = state.borrow_mut();
+        s.playing = true;
+        s.paused = false;
+    }
+    set_play_icon(ui, true);
 }
 
 /// Total duration (ms) of the currently-selected queue track, or 0 if unknown.
@@ -388,17 +399,21 @@ pub(crate) fn quick_track(path: &Path) -> Track {
 // Session + playlist persistence
 // ---------------------------------------------------------------------------
 
+/// The queue's track paths as strings, in order — shared by the session save and
+/// the `.m3u` export.
+fn queue_paths(queue: &[Track]) -> Vec<String> {
+    queue
+        .iter()
+        .map(|t| t.path.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Persist the current queue, selected index, and position for next launch.
 /// Written as one transaction (single WAL commit) so it does not stall the
 /// closing window with a commit per key.
 pub(crate) fn save_session(state: &SharedState) {
     let s = state.borrow();
-    let queue = s
-        .queue
-        .iter()
-        .map(|t| t.path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let queue = queue_paths(&s.queue).join("\n");
     let current = s.current.map(|i| i.to_string()).unwrap_or_default();
     let pos = s.last_pos_ms.to_string();
     let music_dir = s.music_dir.as_ref().map(|d| d.to_string_lossy().into_owned());
@@ -467,12 +482,7 @@ pub(crate) fn restore_session(state: &SharedState, ui: &SharedUi) {
 
 /// Save the current queue to `path` as an `.m3u` playlist.
 pub(crate) fn save_playlist(state: &SharedState, ui: &SharedUi, path: PathBuf) {
-    let paths: Vec<String> = state
-        .borrow()
-        .queue
-        .iter()
-        .map(|t| t.path.to_string_lossy().into_owned())
-        .collect();
+    let paths = queue_paths(&state.borrow().queue);
     if paths.is_empty() {
         ui.toast("Queue is empty — nothing to save");
         return;

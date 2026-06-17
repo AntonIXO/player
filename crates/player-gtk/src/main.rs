@@ -34,6 +34,7 @@ use player_core::{Event, Player};
 use player_library::Library;
 
 mod art;
+mod bench;
 mod events;
 mod hw_keys;
 mod list;
@@ -42,13 +43,13 @@ mod standby;
 mod state;
 mod ui;
 mod widgets;
+mod wiring;
 
 use art::ArtCache;
-use events::{on_ended, on_position, on_started, start_scan};
+use events::{on_ended, on_position, on_started};
 use playback::{
-    advance, clear_queue, current_total_ms, current_track, load_playlist, play_list, prev_track,
-    quick_track, restore_session, save_playlist, save_session, seek_by, seek_to_fraction,
-    toggle_loved, toggle_play,
+    advance, clear_queue, current_track, load_playlist, restore_session, save_playlist,
+    save_session, toggle_loved, toggle_play,
 };
 use state::{SharedState, SharedUi, State, Ui};
 use ui::library::{
@@ -56,12 +57,11 @@ use ui::library::{
     refresh_library, window_width, wire_segmented, wire_sort,
 };
 use ui::mini::build_mini;
-use ui::now_playing::{build_now_playing, resize_hero, update_mini, update_now_playing_empty};
+use ui::now_playing::{build_now_playing, resize_hero, update_now_playing_empty};
 use ui::queue::refresh_queue;
 use ui::libworker::spawn_library_worker;
-use ui::search::{build_search, kick_search, render_search_results, spawn_search_worker};
-use ui::settings::open_settings;
-use widgets::{add_page, flat_menu_item, mmss, section_label, toggle_accent, wrap_scroller};
+use ui::search::{build_search, render_search_results, spawn_search_worker};
+use widgets::{add_page, section_label, wrap_scroller};
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
@@ -320,7 +320,7 @@ fn build_ui(app: &adw::Application) {
         art: ArtCache::new(state.borrow().art_dir.clone()),
     });
 
-    wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
+    wiring::wire(&state, &ui, &open_btn, &menu_btn, &mp_play, &np.play, &np.shuffle, &np.repeat, &np.prev, &np.next, &np.rewind, &np.fwd);
     wire_segmented(&state, &ui, &lib.seg);
     wire_sort(&state, &ui, &lib.sort_btn, &lib.sort_opts);
 
@@ -572,273 +572,6 @@ fn build_ui(app: &adw::Application) {
     // decode/library code is already covered by the player-cli workload). No-op
     // in normal use. See the aarch64 APKBUILD's _workload_gtk.
     if std::env::var_os("PLAYER_GTK_BENCH").is_some() {
-        run_bench(app, &state, &ui);
+        bench::run_bench(app, &state, &ui);
     }
-}
-
-/// Drive the UI through its hot code paths on the main loop, then quit. Stepped
-/// (one action per tick) so each layout/search/render settles; a watchdog
-/// force-quits after `PLAYER_GTK_BENCH_SECS` (default 30) so the build can never
-/// hang on a stalled step. Only reached when `PLAYER_GTK_BENCH` is set.
-fn run_bench(app: &adw::Application, state: &SharedState, ui: &SharedUi) {
-    let secs: u64 = std::env::var("PLAYER_GTK_BENCH_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    {
-        let app = app.clone();
-        glib::timeout_add_local_once(Duration::from_secs(secs), move || app.quit());
-    }
-
-    let app = app.clone();
-    let (state, ui) = (state.clone(), ui.clone());
-    let mut step = 0u32;
-    glib::timeout_add_local(Duration::from_millis(140), move || {
-        match step {
-            0 => refresh_library(&state, &ui),
-            1 => ui.stack.set_visible_child_name("playing"),
-            2 => {
-                ui.stack.set_visible_child_name("search");
-                ui.search_entry.set_text("love");
-                kick_search(&ui);
-            }
-            3 => {
-                ui.search_entry.set_text("концерт");
-                kick_search(&ui);
-            }
-            4 => {
-                ui.stack.set_visible_child_name("lists");
-                refresh_queue(&state, &ui);
-            }
-            5 => {
-                ui.stack.set_visible_child_name("library");
-                // Width-derived album-grid + Now-Playing hero rescale.
-                for w in [360i32, 540, 720] {
-                    ui.cover_px.set(album_cover_px(w));
-                    rebuild_albums(&state, &ui);
-                    resize_hero(&state, &ui, w);
-                }
-            }
-            6 => {
-                // Album/artist detail pages, if the library populated by now.
-                let first = state
-                    .borrow()
-                    .albums
-                    .first()
-                    .map(|a| (a.album.clone(), a.album_artist.clone()));
-                if let Some((album, aa)) = first {
-                    open_album_for(&state, &ui, &album, aa.as_deref());
-                    if let Some(a) = aa.filter(|a| !a.is_empty()) {
-                        open_artist_detail(&state, &ui, &a);
-                    }
-                }
-            }
-            7 => ui.stack.set_visible_child_name("library"),
-            // Settle: let the async search/library-worker renders and layout
-            // passes actually run (so their code is covered) before quitting.
-            8..=24 => {}
-            _ => {
-                app.quit();
-                return glib::ControlFlow::Break;
-            }
-        }
-        step += 1;
-        glib::ControlFlow::Continue
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn wire(
-    state: &SharedState,
-    ui: &SharedUi,
-    open_btn: &gtk::Button,
-    menu_btn: &gtk::MenuButton,
-    mp_play: &gtk::Button,
-    np_play: &gtk::Button,
-    np_shuffle: &gtk::Button,
-    np_repeat: &gtk::Button,
-    np_prev: &gtk::Button,
-    np_next: &gtk::Button,
-    np_rewind: &gtk::Button,
-    np_fwd: &gtk::Button,
-) {
-    // open file → play immediately
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        open_btn.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::builder().title("Choose an audio file").build();
-            let (state, ui) = (state.clone(), ui.clone());
-            let win = ui.window.clone();
-            dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
-                if let Ok(file) = res {
-                    if let Some(path) = file.path() {
-                        let t = quick_track(&path);
-                        play_list(&state, &ui, vec![t], 0);
-                    }
-                }
-            });
-        });
-    }
-
-    // menu: scan / rescan
-    {
-        let popover = gtk::Popover::new();
-        let menu = gtk::Box::new(Orientation::Vertical, 2);
-        let scan_btn = flat_menu_item("folder-symbolic", "Scan Music Folder…");
-        let rescan_btn = flat_menu_item("view-refresh-symbolic", "Rescan Library");
-        let settings_btn = flat_menu_item("emblem-system-symbolic", "Settings…");
-        menu.append(&scan_btn);
-        menu.append(&rescan_btn);
-        menu.append(&gtk::Separator::new(Orientation::Horizontal));
-        menu.append(&settings_btn);
-        popover.set_child(Some(&menu));
-        menu_btn.set_popover(Some(&popover));
-
-        {
-            let (state, ui, popover) = (state.clone(), ui.clone(), popover.clone());
-            settings_btn.connect_clicked(move |_| {
-                popover.popdown();
-                open_settings(&state, &ui);
-            });
-        }
-
-        {
-            let (state, ui, popover) = (state.clone(), ui.clone(), popover.clone());
-            scan_btn.connect_clicked(move |_| {
-                popover.popdown();
-                let dialog = gtk::FileDialog::builder().title("Choose your music folder").build();
-                let (state, ui) = (state.clone(), ui.clone());
-                let win = ui.window.clone();
-                dialog.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
-                    if let Ok(folder) = res {
-                        if let Some(path) = folder.path() {
-                            state.borrow_mut().music_dir = Some(path.clone());
-                            start_scan(&state, &ui, path, false);
-                        }
-                    }
-                });
-            });
-        }
-        {
-            let (state, ui, popover) = (state.clone(), ui.clone(), popover.clone());
-            rescan_btn.connect_clicked(move |_| {
-                popover.popdown();
-                let dir = state.borrow().music_dir.clone();
-                match dir {
-                    // Force re-extraction so covers/tags refresh even when files
-                    // are byte-unchanged on disk.
-                    Some(d) => start_scan(&state, &ui, d, true),
-                    None => ui.toast("Pick a music folder first (Scan Music Folder…)"),
-                }
-            });
-        }
-    }
-
-    // play / pause (mirrored on both buttons)
-    for btn in [mp_play, np_play] {
-        let (state, ui) = (state.clone(), ui.clone());
-        btn.connect_clicked(move |_| toggle_play(&state, &ui));
-    }
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        np_prev.connect_clicked(move |_| prev_track(&state, &ui));
-    }
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        np_next.connect_clicked(move |_| advance(&state, &ui, true));
-    }
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        np_rewind.connect_clicked(move |_| seek_by(&state, &ui, -10_000));
-    }
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        np_fwd.connect_clicked(move |_| seek_by(&state, &ui, 10_000));
-    }
-    {
-        let state = state.clone();
-        np_shuffle.connect_clicked(move |b| {
-            let on = !state.borrow().shuffle;
-            state.borrow_mut().shuffle = on;
-            toggle_accent(b, on);
-        });
-    }
-    {
-        let state = state.clone();
-        np_repeat.connect_clicked(move |b| {
-            let on = !state.borrow().repeat;
-            state.borrow_mut().repeat = on;
-            toggle_accent(b, on);
-        });
-    }
-
-    // interactive seek. `change-value` fires only on *user* input (drag, click,
-    // arrow/scroll) — never on our programmatic `set_value` in `on_position`,
-    // which would otherwise feed back as a seek. A `GestureClick` on a `Scale` is
-    // unreliable (the Scale claims the drag sequence, so `released` is cancelled
-    // and the seek never commits — the bug we're fixing). Each move marks
-    // `seeking` (freezing `on_position`), updates the elapsed readout live, and
-    // arms a debounce: only the latest generation commits the engine seek, so a
-    // continuous drag results in one seek when the handle settles.
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        ui.np_seek.clone().connect_change_value(move |_, _, value| {
-            let frac = value.clamp(0.0, 1.0);
-            ui.seeking.set(true);
-            let total_ms = current_total_ms(&state);
-            if total_ms > 0 {
-                ui.np_elapsed.set_label(&mmss((frac * total_ms as f64 / 1000.0) as u64));
-            }
-            let gen = ui.seek_gen.get().wrapping_add(1);
-            ui.seek_gen.set(gen);
-            let (state, ui) = (state.clone(), ui.clone());
-            glib::timeout_add_local_once(Duration::from_millis(180), move || {
-                if ui.seek_gen.get() != gen {
-                    return; // a newer move superseded this one
-                }
-                ui.seeking.set(false);
-                seek_to_fraction(&state, &ui, frac);
-            });
-            glib::Propagation::Proceed
-        });
-    }
-
-    // mini-player tap → Playing page
-    {
-        let ui2 = ui.clone();
-        let click = gtk::GestureClick::new();
-        click.connect_released(move |_, _, _, _| ui2.stack.set_visible_child_name("playing"));
-        ui.mini.add_controller(click);
-    }
-
-    // hide the mini bar on the Playing page
-    {
-        let (state, ui) = (state.clone(), ui.clone());
-        let stack = ui.stack.clone();
-        stack.connect_visible_child_name_notify(move |_| update_mini(&state, &ui));
-    }
-
-    // search: typed query + filter chips. Debounced; the query runs on the
-    // worker thread and results are rendered by the search-results pump.
-    {
-        let ui = ui.clone();
-        let entry = ui.search_entry.clone();
-        entry.connect_search_changed(move |_| kick_search(&ui));
-    }
-    for (f, btn) in &ui.filter_buttons {
-        let (ui, f) = (ui.clone(), *f);
-        btn.connect_toggled(move |b| {
-            if !b.is_active() {
-                return;
-            }
-            *ui.filter.borrow_mut() = f;
-            for (of, ob) in &ui.filter_buttons {
-                if *of != f {
-                    ob.set_active(false);
-                }
-            }
-            kick_search(&ui);
-        });
-    }
-    // (Album activation is wired by `refresh_library` on the GridView itself.)
 }

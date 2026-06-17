@@ -176,7 +176,7 @@ impl TrackProducer {
     /// Returns `false` at end of track.
     pub(crate) fn next_bytes(&mut self, out: &mut Vec<u8>) -> Result<bool> {
         match self {
-            TrackProducer::Pcm { dec, packer, block } => {
+            Self::Pcm { dec, packer, block } => {
                 if dec.next(block)? {
                     out.clear();
                     append_bytes(out, &packer.pack(block));
@@ -185,7 +185,7 @@ impl TrackProducer {
                     Ok(false)
                 }
             }
-            TrackProducer::Dsd { reader, dop, buf } => {
+            Self::Dsd { reader, dop, buf } => {
                 if reader.next(buf)? {
                     out.clear();
                     out.extend_from_slice(dop.pack(buf));
@@ -244,7 +244,7 @@ pub(crate) fn build_producer(
                 emit(Event::Error(e.to_string()));
             }
             if end > start {
-                let frames = (end - start).as_millis() as u64 * dec.spec.rate as u64 / 1000;
+                let frames = end.checked_sub(start).unwrap().as_millis() as u64 * dec.spec.rate as u64 / 1000;
                 dec.set_limit(frames);
             }
         }
@@ -448,8 +448,7 @@ pub(crate) fn run_interactive(
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
-                    if let CmdOutcome::Quit =
-                        apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit)
+                    if matches!(apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit), CmdOutcome::Quit)
                     {
                         return;
                     }
@@ -466,18 +465,14 @@ pub(crate) fn run_interactive(
         // 1b) While paused, output is held at the device; don't decode (which
         // would only spin filling the ring). Block for the next command instead.
         if paused {
-            match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if let CmdOutcome::Quit =
-                        apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit)
-                    {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    writer.quit();
+            if let Ok(cmd) = cmd_rx.recv() {
+                if matches!(apply_cmd(cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit), CmdOutcome::Quit)
+                {
                     return;
                 }
+            } else {
+                writer.quit();
+                return;
             }
             continue;
         }
@@ -509,18 +504,15 @@ pub(crate) fn run_interactive(
                     if writer.has_segment() {
                         writer.finish(false);
                     }
-                    match cmd_rx.recv() {
-                        Ok(cmd) => {
-                            if let CmdOutcome::Quit = apply_cmd(
-                                cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit,
-                            ) {
-                                return;
-                            }
-                        }
-                        Err(_) => {
-                            writer.quit();
+                    if let Ok(cmd) = cmd_rx.recv() {
+                        if matches!(apply_cmd(
+                            cmd, &mut queue, &mut cur, &mut writer, &interrupt, &mut paused, &emit,
+                        ), CmdOutcome::Quit) {
                             return;
                         }
+                    } else {
+                        writer.quit();
+                        return;
                     }
                     continue;
                 }

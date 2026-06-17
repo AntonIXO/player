@@ -42,7 +42,7 @@ pub(crate) struct Toc {
 
 impl Toc {
     /// Detect the on-disc sector size, then parse the master and area TOCs.
-    pub(crate) fn open(file: &mut File) -> Result<Toc> {
+    pub(crate) fn open(file: &mut File) -> Result<Self> {
         let (sector_size, base) = detect_sector_size(file)?;
 
         let master = read_blocks_raw(file, sector_size, START_OF_MASTER_TOC as u32, MASTER_TOC_LEN)?;
@@ -78,7 +78,7 @@ impl Toc {
             return Err(Error::Malformed("no readable area TOC".into()));
         }
 
-        Ok(Toc {
+        Ok(Self {
             sector_size,
             base,
             album_title,

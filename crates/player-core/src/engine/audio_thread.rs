@@ -73,23 +73,20 @@ pub(crate) fn run(
     'outer: loop {
         // Acquire the next segment to play (from buffered directives, else block).
         let (spec, mut consumer, pos_base) = loop {
-            let dir = match pending.pop_front() {
-                Some(d) => d,
-                None => {
-                    // Nothing queued: going idle. Release the latency guard so
-                    // the CPU may sleep until the next segment arrives.
-                    latency_guard = None;
-                    match ctl_rx.recv() {
-                        Ok(Ctl::Open {
-                            spec,
-                            consumer,
-                            pos_base,
-                        }) => Next::Open(spec, consumer, pos_base),
-                        Ok(Ctl::Finish { quit }) => Next::Finish { quit },
-                        // Idle flush / pause / resume: no active segment to act on.
-                        Ok(Ctl::Flush) | Ok(Ctl::Pause) | Ok(Ctl::Resume) => continue,
-                        Ok(Ctl::Quit) | Err(_) => Next::Quit,
-                    }
+            let dir = if let Some(d) = pending.pop_front() { d } else {
+                // Nothing queued: going idle. Release the latency guard so
+                // the CPU may sleep until the next segment arrives.
+                latency_guard = None;
+                match ctl_rx.recv() {
+                    Ok(Ctl::Open {
+                        spec,
+                        consumer,
+                        pos_base,
+                    }) => Next::Open(spec, consumer, pos_base),
+                    Ok(Ctl::Finish { quit }) => Next::Finish { quit },
+                    // Idle flush / pause / resume: no active segment to act on.
+                    Ok(Ctl::Flush | Ctl::Pause | Ctl::Resume) => continue,
+                    Ok(Ctl::Quit) | Err(_) => Next::Quit,
                 }
             };
             match dir {

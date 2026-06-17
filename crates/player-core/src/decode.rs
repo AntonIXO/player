@@ -71,7 +71,7 @@ impl Decoder {
             .make_audio_decoder(cp, &AudioDecoderOptions::default())?;
         let codec_name = decoder.codec_info().short_name;
 
-        Ok(Decoder {
+        Ok(Self {
             format,
             decoder,
             track_id,
@@ -167,8 +167,7 @@ mod tests {
         Command::new("ffmpeg")
             .arg("-version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     fn gen_wav(path: &Path, secs: f32, rate: u32) {
@@ -178,8 +177,7 @@ mod tests {
             .args(["-ar", &rate.to_string(), "-ac", "2", "-sample_fmt", "s16"])
             .arg(path)
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .is_ok_and(|s| s.success());
         assert!(ok, "ffmpeg failed to generate fixture");
     }
 

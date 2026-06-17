@@ -115,7 +115,7 @@ impl SacdImage {
             })
             .collect();
 
-        Ok(SacdImage {
+        Ok(Self {
             path: path.to_path_buf(),
             sector_size,
             base,

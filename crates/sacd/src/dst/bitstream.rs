@@ -13,7 +13,7 @@ pub(crate) struct StrData {
 
 impl StrData {
     pub(crate) fn new() -> Self {
-        StrData {
+        Self {
             data: Vec::new(),
             total_bytes: 0,
             byte_counter: 0,

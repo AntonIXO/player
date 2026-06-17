@@ -67,7 +67,7 @@ impl AlsaSink {
             can_pause
         };
 
-        Ok(AlsaSink {
+        Ok(Self {
             pcm,
             channels: spec.channels as usize,
             spec,

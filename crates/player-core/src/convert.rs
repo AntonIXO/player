@@ -25,7 +25,7 @@ pub struct Packer {
 
 impl Packer {
     pub fn new(fmt: AlsaFmt) -> Self {
-        Packer {
+        Self {
             fmt,
             s16: Vec::new(),
             s24: Vec::new(),

@@ -53,7 +53,7 @@ struct AcData {
 
 impl AcData {
     fn new() -> Self {
-        AcData { c: 0, a: 0, cbptr: 0 }
+        Self { c: 0, a: 0, cbptr: 0 }
     }
 
     fn ptable_index(predic_val: i32, ptable_len: i32) -> i32 {
@@ -126,7 +126,7 @@ struct Segment {
 
 impl Segment {
     fn new() -> Self {
-        Segment {
+        Self {
             resolution: 0,
             segment_len: [[0; MAXNROF_SEGS]; MAX_CHANNELS],
             nr_of_segments: [0; MAX_CHANNELS],
@@ -147,7 +147,7 @@ struct CodedTable {
 impl CodedTable {
     fn filter() -> Self {
         // CCodedTableF: orders/coefs for filter-coefficient prediction.
-        CodedTable {
+        Self {
             cpred_order: [1, 2, 3],
             cpred_coef: [[-8, 0, 0], [-16, 8, 0], [-9, -5, 6]],
             coded: [0; MAX2CH],
@@ -157,7 +157,7 @@ impl CodedTable {
     }
     fn ptable() -> Self {
         // CCodedTableP: orders/coefs for Ptable-entry prediction.
-        CodedTable {
+        Self {
             cpred_order: [1, 2, 3],
             cpred_coef: [[-8, 0, 0], [-16, 8, 0], [-24, 24, -8]],
             coded: [0; MAX2CH],
@@ -195,7 +195,7 @@ struct FrameHeader {
 
 impl FrameHeader {
     fn new() -> Self {
-        FrameHeader {
+        Self {
             nr_of_channels: 0,
             nr_of_filters: 0,
             nr_of_ptables: 0,
@@ -604,7 +604,7 @@ impl Decoder {
         fh.max_nr_of_filters = 2 * channels as i32;
         fh.max_nr_of_ptables = 2 * channels as i32;
 
-        Decoder {
+        Self {
             fh,
             str_filter: CodedTable::filter(),
             str_ptable: CodedTable::ptable(),

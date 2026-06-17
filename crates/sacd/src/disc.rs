@@ -93,7 +93,7 @@ pub(crate) struct FrameReader {
 
 impl FrameReader {
     pub(crate) fn new(file: File, sector_size: usize, base: usize, start_lsn: u32, length_lsn: u32) -> Self {
-        FrameReader {
+        Self {
             file,
             base,
             start_lsn,
@@ -292,7 +292,7 @@ pub(crate) mod test_support {
                 // header: dst_encoded=0, frame_info_count=0, packet_info_count=1.
                 sector[0] = 1 << 5;
                 // packet 0: frame_start on the first half only, data_type=2 (audio).
-                let frame_start = if half == 0 { 1u8 } else { 0 };
+                let frame_start = u8::from(half == 0);
                 sector[1] = (frame_start << 7) | (2 << 3) | (((part_len >> 8) & 7) as u8);
                 sector[2] = (part_len & 0xff) as u8;
                 let part: Vec<u8> = (0..part_len)

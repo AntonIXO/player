@@ -302,12 +302,12 @@ impl Player {
             thread::Builder::new()
                 .name("player-decode".into())
                 .spawn(move || {
-                    decode_thread::run_interactive(cmd_rx, ctl_tx, interrupt, device, emit)
+                    decode_thread::run_interactive(cmd_rx, ctl_tx, interrupt, device, emit);
                 })
                 .expect("spawn decode thread")
         };
 
-        Player {
+        Self {
             cmd_tx,
             interrupt,
             decode: Some(decode),

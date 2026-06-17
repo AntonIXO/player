@@ -71,14 +71,10 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         let info = ctl.card_info().ok();
         let card_id = info
             .as_ref()
-            .and_then(|i| i.get_id().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| idx.to_string());
+            .and_then(|i| i.get_id().ok()).map_or_else(|| idx.to_string(), str::to_string);
         let card_name = info
             .as_ref()
-            .and_then(|i| i.get_name().ok())
-            .map(str::to_string)
-            .unwrap_or_else(|| card_id.clone());
+            .and_then(|i| i.get_name().ok()).map_or_else(|| card_id.clone(), str::to_string);
         let driver = info
             .as_ref()
             .and_then(|i| i.get_driver().ok())

@@ -19,7 +19,7 @@ pub fn try_set_realtime_fifo(priority: i32) -> Sched {
     let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
     param.sched_priority = priority;
     // Thread 0 == the calling thread.
-    let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+    let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &raw const param) };
     if ret == 0 {
         Sched::Fifo(priority)
     } else {
@@ -36,7 +36,7 @@ pub fn pin_to_cpu(cpu: usize) -> bool {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) == 0
     }
 }
 
@@ -69,7 +69,7 @@ impl CpuLatencyGuard {
         // The interface reads a single little-endian s32; the kernel keeps the
         // request alive only while this fd stays open.
         fd.write_all(&latency_us.to_le_bytes()).ok()?;
-        Some(CpuLatencyGuard { _fd: fd })
+        Some(Self { _fd: fd })
     }
 }
 
@@ -79,7 +79,7 @@ pub fn rtprio_limit() -> Option<u64> {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let ret = unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim) };
+    let ret = unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &raw mut lim) };
     if ret == 0 {
         Some(lim.rlim_cur)
     } else {

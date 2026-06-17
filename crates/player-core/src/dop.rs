@@ -62,7 +62,7 @@ impl DopPacker {
             matches!(fmt, AlsaFmt::S24_3 | AlsaFmt::S32),
             "DoP requires a 24- or 32-bit container, got {fmt:?}"
         );
-        DopPacker {
+        Self {
             fmt,
             channels: channels as usize,
             marker_b: false,
@@ -123,8 +123,12 @@ impl DopPacker {
         // overheads present in extend_from_slice, yielding ~30% faster packing.
         self.out.resize(start_len + req, 0);
         let out_slice = &mut self.out[start_len..];
+        // Invariant backing the `out_chunks.next().unwrap()` below: out_slice was
+        // sized to exactly `whole/frame_in` output frames, and the loops iterate
+        // that many input frames — so the chunk iterator is never exhausted early.
+        debug_assert_eq!(out_slice.len() / out_bytes_per_frame, whole / frame_in);
 
-        if let AlsaFmt::S32 = self.fmt {
+        if self.fmt == AlsaFmt::S32 {
             let mut out_chunks = out_slice.chunks_exact_mut(4 * self.channels);
             for frame in input[..whole].chunks_exact(frame_in) {
                 let chunk = out_chunks.next().unwrap();

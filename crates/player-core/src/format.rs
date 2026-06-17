@@ -22,43 +22,43 @@ impl AlsaFmt {
     /// Choose the native output format for a given source bit depth.
     pub fn from_source_bits(bits: u32) -> Self {
         match bits {
-            b if b <= 16 => AlsaFmt::S16,
-            b if b <= 24 => AlsaFmt::S24_3,
-            _ => AlsaFmt::S32,
+            b if b <= 16 => Self::S16,
+            b if b <= 24 => Self::S24_3,
+            _ => Self::S32,
         }
     }
 
     pub fn to_alsa(self) -> Format {
         match self {
-            AlsaFmt::S16 => Format::S16LE,
-            AlsaFmt::S24_3 => Format::S243LE,
-            AlsaFmt::S32 => Format::S32LE,
+            Self::S16 => Format::S16LE,
+            Self::S24_3 => Format::S243LE,
+            Self::S32 => Format::S32LE,
         }
     }
 
     /// Bytes per single sample (one channel) on the wire.
     pub fn bytes_per_sample(self) -> usize {
         match self {
-            AlsaFmt::S16 => 2,
-            AlsaFmt::S24_3 => 3,
-            AlsaFmt::S32 => 4,
+            Self::S16 => 2,
+            Self::S24_3 => 3,
+            Self::S32 => 4,
         }
     }
 
     /// Number of valid output bits; used to derive the down-shift from full scale.
     pub fn output_bits(self) -> u32 {
         match self {
-            AlsaFmt::S16 => 16,
-            AlsaFmt::S24_3 => 24,
-            AlsaFmt::S32 => 32,
+            Self::S16 => 16,
+            Self::S24_3 => 24,
+            Self::S32 => 32,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            AlsaFmt::S16 => "S16_LE",
-            AlsaFmt::S24_3 => "S24_3LE",
-            AlsaFmt::S32 => "S32_LE",
+            Self::S16 => "S16_LE",
+            Self::S24_3 => "S24_3LE",
+            Self::S32 => "S32_LE",
         }
     }
 }
@@ -79,7 +79,7 @@ pub struct StreamSpec {
 
 impl StreamSpec {
     pub fn new(rate: u32, channels: u32, source_bits: u32) -> Self {
-        StreamSpec {
+        Self {
             rate,
             channels,
             source_bits,
@@ -92,7 +92,7 @@ impl StreamSpec {
     /// `fmt` (`S24_3` or `S32`). `source_bits` is set to the container width so
     /// device-aware widening leaves it untouched.
     pub fn dop(rate: u32, channels: u32, fmt: AlsaFmt) -> Self {
-        StreamSpec {
+        Self {
             rate,
             channels,
             source_bits: fmt.output_bits(),
@@ -110,7 +110,7 @@ impl StreamSpec {
     /// gaplessly. `source_bits` is deliberately ignored: e.g. 20- and 24-bit
     /// both emit `S24_3LE`, so they are gapless-compatible. `is_dop` is *not*
     /// ignored: a DoP stream and a same-rate PCM stream must force a relock.
-    pub fn same_wire(&self, other: &StreamSpec) -> bool {
+    pub fn same_wire(&self, other: &Self) -> bool {
         self.rate == other.rate
             && self.channels == other.channels
             && self.fmt == other.fmt
@@ -136,7 +136,7 @@ impl DeviceFormats {
     /// behaviour matches the source-native choice and the real error (if any)
     /// surfaces at device open.
     pub fn all() -> Self {
-        DeviceFormats {
+        Self {
             s16: true,
             s24_3: true,
             s32: true,

@@ -69,7 +69,7 @@ pub fn open_dsd(path: &Path, track: Option<usize>) -> Result<Box<dyn DsdSource>>
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     match ext.as_str() {
         "dsf" | "dff" => Ok(Box::new(DsfDffSource::open(path)?)),
@@ -86,7 +86,7 @@ pub fn is_dsd_path(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
+            .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("dsf" | "dff" | "iso")
     )
@@ -133,7 +133,7 @@ struct DsfDffSource {
 
 impl DsfDffSource {
     fn open(path: &Path) -> Result<Self> {
-        match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("dsf") => Self::open_dsf(path),
             Some("dff") => Self::open_dff(path),
             _ => Err(Error::Dsd(format!("not a .dsf/.dff file: {}", path.display()))),
@@ -172,7 +172,7 @@ impl DsfDffSource {
         let valid_total = valid_total.min(file_len.saturating_sub(data_offset));
         let valid_total = valid_total - valid_total % channels as u64;
         let n_frames = (valid_total > 0).then(|| valid_total / (2 * channels as u64));
-        Ok(DsfDffSource {
+        Ok(Self {
             file,
             container,
             data_offset,
@@ -299,7 +299,7 @@ impl SacdSource {
         let reader = img
             .reader(area, track)
             .map_err(|e| Error::Dsd(e.to_string()))?;
-        Ok(SacdSource { reader, spec })
+        Ok(Self { reader, spec })
     }
 }
 

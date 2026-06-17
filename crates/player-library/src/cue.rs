@@ -47,7 +47,7 @@ pub fn parse_file(path: &Path) -> Option<CueSheet> {
 
 impl CueSheet {
     pub fn parse(text: &str) -> Self {
-        let mut sheet = CueSheet::default();
+        let mut sheet = Self::default();
         let mut cur_file: Option<CueFile> = None;
         let mut cur_track: Option<CueTrack> = None;
 

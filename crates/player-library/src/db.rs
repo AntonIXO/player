@@ -79,7 +79,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) 
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = stmt
         .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .any(|name| name == col);
     if !exists {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {decl}"), [])?;
@@ -87,7 +87,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, col: &str, decl: &str) 
     Ok(())
 }
 
-const SCHEMA_BASE: &str = r#"
+const SCHEMA_BASE: &str = r"
 CREATE TABLE track (
   id            INTEGER PRIMARY KEY,
   path          TEXT NOT NULL UNIQUE,
@@ -127,43 +127,43 @@ CREATE TABLE loved_tracks (
   track_id  INTEGER PRIMARY KEY,
   loved_at  INTEGER NOT NULL
 );
-"#;
+";
 
 /// Loved (favourite) tracks (one row per track). Added in v5; `IF NOT EXISTS` so a
 /// fresh database (which already created it via `SCHEMA_BASE`) is unaffected.
-const SCHEMA_LOVED: &str = r#"
+const SCHEMA_LOVED: &str = r"
 CREATE TABLE IF NOT EXISTS loved_tracks (
   track_id  INTEGER PRIMARY KEY,
   loved_at  INTEGER NOT NULL
 );
-"#;
+";
 
 /// Expression index on the artist key (`COALESCE(NULLIF(album_artist,''), artist)`)
 /// the artists list, artist detail, and stats group/filter on. Added in v6;
 /// `IF NOT EXISTS` so a fresh database (which already created it via `SCHEMA_BASE`)
 /// is unaffected.
-const SCHEMA_ARTIST_IDX: &str = r#"
+const SCHEMA_ARTIST_IDX: &str = r"
 CREATE INDEX IF NOT EXISTS track_artist_key_idx
   ON track(COALESCE(NULLIF(album_artist,''), artist));
-"#;
+";
 
 /// Recently-played history (one row per track, newest play wins). Added in v3;
 /// `IF NOT EXISTS` so a fresh database (which already created it via
 /// `SCHEMA_BASE`) is unaffected.
-const SCHEMA_PLAY_HISTORY: &str = r#"
+const SCHEMA_PLAY_HISTORY: &str = r"
 CREATE TABLE IF NOT EXISTS play_history (
   track_id  INTEGER PRIMARY KEY,
   played_at INTEGER NOT NULL
 );
-"#;
+";
 
 /// Drop the legacy FTS5 mirror + triggers when upgrading a v1 database.
-const DROP_FTS_V1: &str = r#"
+const DROP_FTS_V1: &str = r"
 DROP TRIGGER IF EXISTS track_ai;
 DROP TRIGGER IF EXISTS track_ad;
 DROP TRIGGER IF EXISTS track_au;
 DROP TABLE IF EXISTS track_fts;
-"#;
+";
 
 /// Column list shared by the row-building queries (keeps SELECTs in sync with
 /// `row_to_track`). Table-qualified so it is unambiguous when joined against
@@ -180,9 +180,7 @@ pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> 
     // Whole-file tracks store NULL source_path; fall back to `path` so the engine
     // always has a real file to decode.
     let source_path = r
-        .get::<_, Option<String>>(18)?
-        .map(Into::into)
-        .unwrap_or_else(|| path.clone().into());
+        .get::<_, Option<String>>(18)?.map_or_else(|| path.clone().into(), Into::into);
     Ok(crate::model::Track {
         id: r.get(0)?,
         path: path.into(),

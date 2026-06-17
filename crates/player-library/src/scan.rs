@@ -25,10 +25,13 @@ use crate::extract::{self, is_audio, Extracted};
 use crate::model::{ScanProgress, ScanStats};
 use crate::{db, Error, Result};
 
+/// Rows applied per write transaction before committing — bounds the WAL/redo
+/// size and peak memory on a huge first scan without paying a commit per file.
 const BATCH: usize = 1000;
 
-/// A SACD `.iso`'s `((mtime_ns, size), row_count)`, keyed by iso path.
-type IsoState = ((i64, i64), u64);
+/// A container's `((mtime_ns, size), row_count)` signature, keyed by its path —
+/// shared by the `.cue` and `.iso` incremental diffs.
+type ContainerState = ((i64, i64), u64);
 
 #[derive(Clone, Copy)]
 struct FileState {
@@ -85,7 +88,7 @@ pub fn scan(
         .build()
     {
         let Ok(d) = dent else { continue };
-        if !d.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !d.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         if is_audio(d.path()) {
@@ -124,7 +127,12 @@ pub fn scan(
             total,
             path: path.clone(),
         });
-        let msg = build_row(path, art_dir, &existing, force).unwrap_or(Msg::Failed);
+        let msg = build_row(path, art_dir, &existing, force).unwrap_or_else(|e| {
+            // Don't fail the whole scan for one bad file — count it and say why,
+            // so a file silently missing from the index is diagnosable.
+            eprintln!("scan: skipping {} — {e}", path.display());
+            Msg::Failed
+        });
         let _ = tx.send(msg);
     });
     // all senders dropped here → writer's recv loop ends.
@@ -146,8 +154,7 @@ pub fn scan(
 fn has_ext(path: &Path, ext: &str) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case(ext))
-        .unwrap_or(false)
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// The set of audio files referenced by any cue sheet (resolved against each
@@ -239,40 +246,63 @@ fn writer_loop(
     let mut conn = db::open(db_path)?;
     let mut stats = ScanStats::default();
     let mut seen: HashSet<i64> = HashSet::new();
+
+    // Phase 1 applies updates and buffers the brand-new rows; phase 2 reconciles
+    // those against everything not seen (turning a new+gone pair into a move).
+    let news = phase_upsert(&mut conn, &rx, &mut stats, &mut seen)?;
+    phase_reconcile(&mut conn, &existing, &seen, &news, &mut stats)?;
+    Ok(stats)
+}
+
+/// Drain the channel: apply updates to existing rows immediately (batched every
+/// [`BATCH`] commits), mark unchanged/updated ids `seen`, and return the
+/// brand-new rows buffered for move reconciliation.
+fn phase_upsert(
+    conn: &mut rusqlite::Connection,
+    rx: &Receiver<Msg>,
+    stats: &mut ScanStats,
+    seen: &mut HashSet<i64>,
+) -> Result<Vec<Box<Row>>> {
     let mut news: Vec<Box<Row>> = Vec::new();
-
-    // Phase 1: drain. Updates to existing rows are applied immediately (batched);
-    // brand-new rows are buffered for move reconciliation.
-    {
-        let mut count = 0usize;
-        let mut txn = conn.transaction()?;
-        for msg in rx.iter() {
-            match msg {
-                Msg::Failed => stats.errors += 1,
-                Msg::Unchanged(id) => {
-                    seen.insert(id);
-                    stats.unchanged += 1;
-                }
-                Msg::Upsert(row) => match row.existing_id {
-                    Some(id) => {
-                        update_track(&txn, id, &row)?;
-                        seen.insert(id);
-                        stats.updated += 1;
-                        count += 1;
-                        if count >= BATCH {
-                            txn.commit()?;
-                            txn = conn.transaction()?;
-                            count = 0;
-                        }
-                    }
-                    None => news.push(row),
-                },
+    let mut count = 0usize;
+    let mut txn = conn.transaction()?;
+    for msg in rx {
+        match msg {
+            Msg::Failed => stats.errors += 1,
+            Msg::Unchanged(id) => {
+                seen.insert(id);
+                stats.unchanged += 1;
             }
+            Msg::Upsert(row) => match row.existing_id {
+                Some(id) => {
+                    update_track(&txn, id, &row)?;
+                    seen.insert(id);
+                    stats.updated += 1;
+                    count += 1;
+                    if count >= BATCH {
+                        txn.commit()?;
+                        txn = conn.transaction()?;
+                        count = 0;
+                    }
+                }
+                None => news.push(row),
+            },
         }
-        txn.commit()?;
     }
+    txn.commit()?;
+    Ok(news)
+}
 
-    // Phase 2: reconcile deletes + moves against everything that wasn't seen.
+/// Reconcile the buffered new rows against the rows that went unseen this scan: a
+/// new row whose `(mtime, size)` matches a vanished one is a **move** (reuse the
+/// id); the rest are inserts, and anything still unmatched is deleted.
+fn phase_reconcile(
+    conn: &mut rusqlite::Connection,
+    existing: &HashMap<String, FileState>,
+    seen: &HashSet<i64>,
+    news: &[Box<Row>],
+    stats: &mut ScanStats,
+) -> Result<()> {
     let mut del_ids: HashSet<i64> = HashSet::new();
     let mut del_sig: HashMap<(i64, i64), i64> = HashMap::new();
     for fs in existing.values() {
@@ -282,28 +312,25 @@ fn writer_loop(
         }
     }
 
-    {
-        let txn = conn.transaction()?;
-        for row in &news {
-            if let Some(&id) = del_sig.get(&(row.mtime_ns, row.size)) {
-                if del_ids.remove(&id) {
-                    del_sig.remove(&(row.mtime_ns, row.size));
-                    update_track(&txn, id, row)?; // move: same content, new path
-                    stats.moved += 1;
-                    continue;
-                }
+    let txn = conn.transaction()?;
+    for row in news {
+        if let Some(&id) = del_sig.get(&(row.mtime_ns, row.size)) {
+            if del_ids.remove(&id) {
+                del_sig.remove(&(row.mtime_ns, row.size));
+                update_track(&txn, id, row)?; // move: same content, new path
+                stats.moved += 1;
+                continue;
             }
-            insert_track(&txn, row)?;
-            stats.added += 1;
         }
-        for id in &del_ids {
-            txn.execute("DELETE FROM track WHERE id = ?1", params![id])?;
-            stats.removed += 1;
-        }
-        txn.commit()?;
+        insert_track(&txn, row)?;
+        stats.added += 1;
     }
-
-    Ok(stats)
+    for id in &del_ids {
+        txn.execute("DELETE FROM track WHERE id = ?1", params![id])?;
+        stats.removed += 1;
+    }
+    txn.commit()?;
+    Ok(())
 }
 
 fn insert_track(txn: &Transaction, row: &Row) -> Result<()> {
@@ -371,7 +398,11 @@ fn scan_cues(
     stats: &mut ScanStats,
 ) -> Result<()> {
     let mut conn = db::open(db_path)?;
-    let existing = load_existing_cues(&conn)?;
+    // `.cue` rows are the ones with a non-null `start_ms`.
+    let existing = load_existing_containers(
+        &conn,
+        "SELECT path, mtime_ns, size FROM track WHERE start_ms IS NOT NULL",
+    )?;
     let mut current: HashSet<String> = HashSet::new();
 
     let txn = conn.transaction()?;
@@ -382,39 +413,57 @@ fn scan_cues(
             continue;
         };
         let sig = (mtime_ns(&meta), meta.len() as i64);
-        if existing.get(&key) == Some(&sig) {
+        if existing.get(&key).map(|(s, _)| *s) == Some(sig) {
             stats.unchanged += sheet.files.iter().map(|f| f.tracks.len() as u64).sum::<u64>();
             continue;
         }
         delete_cue_rows(&txn, &key)?;
         stats.added += insert_cue_tracks(&txn, art_dir, cue_path, sheet, sig)?;
     }
-    // Sheets that no longer exist on disk: drop their rows.
-    for old in existing.keys() {
-        if !current.contains(old) {
-            stats.removed += delete_cue_rows(&txn, old)?;
-        }
-    }
+    reap_removed_containers(&txn, existing.keys(), &current, stats)?;
     txn.commit()?;
     Ok(())
 }
 
-/// Map each existing cue's path to its (mtime, size) signature, recovered from
-/// the synthetic `<cue>#<seq>` track paths.
-fn load_existing_cues(conn: &rusqlite::Connection) -> Result<HashMap<String, (i64, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT path, mtime_ns, size FROM track WHERE start_ms IS NOT NULL")?;
+/// Map each existing container's path to its `(mtime, size)` signature and row
+/// count, recovered from the synthetic `<key>#<seq>` track paths matched by
+/// `sql`. Shared by the `.cue` and `.iso` diffs (`.cue` ignores the count). All
+/// rows of one container share the same mtime/size (the container file's), so the
+/// repeated assignment is harmless.
+fn load_existing_containers(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> Result<HashMap<String, ContainerState>> {
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
     })?;
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, ContainerState> = HashMap::new();
     for row in rows {
         let (path, mtime, size) = row?;
         if let Some(key) = strip_cue_suffix(&path) {
-            map.entry(key).or_insert((mtime, size));
+            let e = map.entry(key).or_insert(((mtime, size), 0));
+            e.0 = (mtime, size);
+            e.1 += 1;
         }
     }
     Ok(map)
+}
+
+/// Drop the rows of any container that has vanished from disk (its `<key>#%`
+/// rows), tallying the removals. Shared by the `.cue` and `.iso` diffs.
+fn reap_removed_containers<'a>(
+    txn: &Transaction,
+    existing_keys: impl Iterator<Item = &'a String>,
+    current: &HashSet<String>,
+    stats: &mut ScanStats,
+) -> Result<()> {
+    for old in existing_keys {
+        if !current.contains(old) {
+            stats.removed += delete_cue_rows(txn, old)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recover the owning cue path from a synthetic `<cue>#<seq>` track path.
@@ -553,7 +602,12 @@ fn scan_iso(
         return Ok(());
     }
     let mut conn = db::open(db_path)?;
-    let existing = load_existing_iso(&conn)?;
+    // SACD rows are identified by `start_ms NULL AND source_path NOT NULL`.
+    let existing = load_existing_containers(
+        &conn,
+        "SELECT path, mtime_ns, size FROM track \
+         WHERE start_ms IS NULL AND source_path IS NOT NULL",
+    )?;
     let mut current: HashSet<String> = HashSet::new();
 
     let txn = conn.transaction()?;
@@ -576,35 +630,9 @@ fn scan_iso(
             Err(_) => stats.errors += 1,
         }
     }
-    for old in existing.keys() {
-        if !current.contains(old) {
-            stats.removed += delete_cue_rows(&txn, old)?;
-        }
-    }
+    reap_removed_containers(&txn, existing.keys(), &current, stats)?;
     txn.commit()?;
     Ok(())
-}
-
-/// Map each existing SACD `.iso` path to its `(mtime, size)` signature and row
-/// count, recovered from the synthetic `<iso>#<seq>` track paths.
-fn load_existing_iso(conn: &rusqlite::Connection) -> Result<HashMap<String, IsoState>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, mtime_ns, size FROM track \
-         WHERE start_ms IS NULL AND source_path IS NOT NULL",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-    })?;
-    let mut map: HashMap<String, IsoState> = HashMap::new();
-    for row in rows {
-        let (path, mtime, size) = row?;
-        if let Some(key) = strip_cue_suffix(&path) {
-            let e = map.entry(key).or_insert(((mtime, size), 0));
-            e.0 = (mtime, size);
-            e.1 += 1;
-        }
-    }
-    Ok(map)
 }
 
 /// Insert one synthetic row per SACD track (`<iso>#NN`, `source_path` = the iso,
@@ -672,6 +700,5 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_nanos() as i64)
 }

@@ -36,8 +36,7 @@ pub fn extract(path: &Path) -> crate::Result<Extracted> {
     if path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("dsf"))
-        .unwrap_or(false)
+        .is_some_and(|e| e.eq_ignore_ascii_case("dsf"))
     {
         return extract_dsf(path);
     }
@@ -90,9 +89,7 @@ pub fn extract(path: &Path) -> crate::Result<Extracted> {
             if !bytes.is_empty() {
                 let hash = blake3::hash(&bytes).to_hex().to_string();
                 let mime = pic
-                    .mime_type()
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "image/jpeg".into());
+                    .mime_type().map_or_else(|| "image/jpeg".into(), |m| m.as_str().to_string());
                 e.art = Some((hash, mime, bytes));
             }
         }
@@ -100,47 +97,56 @@ pub fn extract(path: &Path) -> crate::Result<Extracted> {
 
     // Fallback: many libraries keep the cover as a folder sidecar (cover.jpg,
     // folder.jpg, …) rather than embedding it — common for M4A/ALAC rips.
+    Ok(with_folder_fallback(e, path))
+}
+
+/// If `e` has no embedded cover, fall back to a folder sidecar next to `path`.
+/// Shared by [`extract`] and [`extract_dsf`].
+fn with_folder_fallback(mut e: Extracted, path: &Path) -> Extracted {
     if e.art.is_none() {
         e.art = folder_cover(path);
     }
-
-    Ok(e)
+    e
 }
 
-/// Sidecar cover-image base names (without extension), case-insensitive.
+/// The DSD64 sample rate (Hz); higher DSD rates are integer multiples of it.
+const DSD64_RATE: u32 = 2_822_400;
+
+/// Sidecar cover-image base names (without extension), in preference order —
+/// `folder_cover` picks the lowest-ranked match, so "cover" beats "thumb".
 const COVER_NAMES: &[&str] = &["cover", "folder", "front", "albumart", "album", "thumb"];
 /// Image extensions we accept for a folder cover.
 const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif"];
 
 /// Look for a cover image alongside `path` (the track's folder). Returns the
 /// same `(blake3 hex, mime, bytes)` shape as embedded art so it caches/dedupes
-/// identically.
+/// identically. Picks the best-ranked name (see [`COVER_NAMES`]) deterministically
+/// rather than whatever the directory happens to enumerate first.
 pub(crate) fn folder_cover(path: &Path) -> Option<(String, String, Vec<u8>)> {
     let dir = path.parent()?;
-    let mut chosen: Option<std::path::PathBuf> = None;
+    let mut best: Option<(usize, std::path::PathBuf)> = None; // (rank, path)
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+        let (Some(stem), Some(ext)) = (
+            p.file_stem().and_then(|s| s.to_str()),
+            p.extension().and_then(|s| s.to_str()),
+        ) else {
             continue;
         };
-        let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let stem = stem.to_ascii_lowercase();
-        let ext = ext.to_ascii_lowercase();
-        if !COVER_EXTS.contains(&ext.as_str()) {
+        if !COVER_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
             continue;
         }
-        if COVER_NAMES.iter().any(|n| stem == *n) {
-            // Prefer the canonical "cover"/"folder"; take it immediately.
-            if stem == "cover" || stem == "folder" {
-                chosen = Some(p);
-                break;
+        let stem = stem.to_ascii_lowercase();
+        if let Some(rank) = COVER_NAMES.iter().position(|n| stem == *n) {
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, p));
+                if rank == 0 {
+                    break; // "cover" is the top preference; nothing can beat it.
+                }
             }
-            chosen.get_or_insert(p);
         }
     }
-    let p = chosen?;
+    let p = best?.1;
     let bytes = std::fs::read(&p).ok()?;
     if bytes.is_empty() {
         return None;
@@ -165,7 +171,7 @@ fn extract_dsf(path: &Path) -> crate::Result<Extracted> {
         .map_err(|e| crate::Error::Other(format!("DSF: {e}")))?;
     let channels = r.channels_num() as u32;
     // `dsd_rate()` is the multiple over DSD64 (1/2/4/8).
-    let dsd_rate = 2_822_400u32.saturating_mul(r.dsd_rate().max(1) as u32);
+    let dsd_rate = DSD64_RATE.saturating_mul(r.dsd_rate().max(1) as u32);
     let audio_len = r.audio_length();
     let duration_ms = (channels > 0 && audio_len > 0).then(|| {
         // Total DSD bytes / channels = bytes/channel; ×8 = samples/channel.
@@ -214,10 +220,7 @@ fn extract_dsf(path: &Path) -> crate::Result<Extracted> {
             }
         }
     }
-    if e.art.is_none() {
-        e.art = folder_cover(path);
-    }
-    Ok(e)
+    Ok(with_folder_fallback(e, path))
 }
 
 fn norm<S: AsRef<str>>(v: Option<S>) -> Option<String> {
@@ -264,11 +267,10 @@ pub const AUDIO_EXTS: &[&str] = &[
 pub fn is_audio(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| {
+        .is_some_and(|e| {
             let e = e.to_ascii_lowercase();
             AUDIO_EXTS.contains(&e.as_str())
         })
-        .unwrap_or(false)
 }
 
 // --- SACD .iso -------------------------------------------------------------
@@ -294,8 +296,7 @@ pub fn is_sacd_iso(path: &Path) -> bool {
     if !path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("iso"))
-        .unwrap_or(false)
+        .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
     {
         return false;
     }

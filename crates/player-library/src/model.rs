@@ -46,9 +46,7 @@ impl Track {
     pub fn display_title(&self) -> String {
         self.title.clone().unwrap_or_else(|| {
             self.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.path.display().to_string())
+                .file_stem().map_or_else(|| self.path.display().to_string(), |s| s.to_string_lossy().into_owned())
         })
     }
 
@@ -84,8 +82,7 @@ impl Track {
             && self
                 .source_path
                 .extension()
-                .map(|e| e.eq_ignore_ascii_case("iso"))
-                .unwrap_or(false)
+                .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
     }
 
     /// The 0-based SACD track index parsed from the synthetic `<iso>#NN` path,

@@ -19,7 +19,7 @@ use std::time::Instant;
 use crossbeam_channel::{bounded, Receiver};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use rusqlite::{params, Transaction};
+use rusqlite::{params, Connection, Transaction};
 
 use crate::extract::{self, is_audio, Extracted};
 use crate::model::{ScanProgress, ScanStats};
@@ -72,7 +72,13 @@ pub fn scan(
     let start = Instant::now();
     std::fs::create_dir_all(art_dir)?;
 
-    let existing = Arc::new(load_existing(db_path)?);
+    // One main-thread connection shared by the read phase (load_existing) and the
+    // post-writer container diffs (scan_cues/scan_iso) — they run sequentially and
+    // never overlap the writer thread, so a single open pays the schema-init +
+    // pragma cost once instead of three times (the writer thread keeps its own
+    // connection; WAL lets the idle main reader coexist with it).
+    let mut conn = db::open(db_path)?;
+    let existing = Arc::new(load_existing(&conn)?);
 
     // Cheap directory walk to collect candidate files; the heavy per-file work
     // is parallelized below. `.cue` sheets and SACD `.iso`s are container files,
@@ -143,9 +149,9 @@ pub fn scan(
 
     // Per-track rows for `.cue` sheets (incremental: a sheet whose file mtime+size
     // is unchanged is skipped; removed sheets have their rows deleted).
-    scan_cues(db_path, art_dir, &cues, &mut stats)?;
+    scan_cues(&mut conn, art_dir, &cues, &mut stats)?;
     // Per-track rows for SACD `.iso` images (same incremental contract).
-    scan_iso(db_path, art_dir, &iso_paths, &mut stats)?;
+    scan_iso(&mut conn, art_dir, &iso_paths, &mut stats)?;
 
     stats.elapsed_ms = start.elapsed().as_millis();
     Ok(stats)
@@ -170,8 +176,7 @@ fn cue_referenced_files(cues: &[(PathBuf, crate::cue::CueSheet)]) -> HashSet<Pat
     set
 }
 
-fn load_existing(db_path: &Path) -> Result<HashMap<String, FileState>> {
-    let conn = db::open(db_path)?;
+fn load_existing(conn: &Connection) -> Result<HashMap<String, FileState>> {
     // Whole-file tracks only. Container-derived rows are diffed separately:
     // `.cue` rows have `start_ms NOT NULL`; SACD `.iso` rows have `start_ms NULL`
     // but `source_path NOT NULL`. Whole-file rows alone have `source_path NULL`.
@@ -335,7 +340,10 @@ fn phase_reconcile(
 
 fn insert_track(txn: &Transaction, row: &Row) -> Result<()> {
     let e = &row.e;
-    txn.execute(
+    // prepare_cached: this upsert runs once per new/moved file, so caching the
+    // prepared statement on the connection avoids re-parsing its ~600 chars of
+    // SQL on every row (the dominant cost of a large scan in the profile).
+    txn.prepare_cached(
         "INSERT INTO track(path,folder,title,artist,album_artist,album,composer,genre,\
             track_no,disc_no,year,duration_ms,codec,sample_rate,bits,channels,art_hash,mtime_ns,size)\
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)\
@@ -346,27 +354,29 @@ fn insert_track(txn: &Transaction, row: &Row) -> Result<()> {
             codec=excluded.codec,sample_rate=excluded.sample_rate,bits=excluded.bits,\
             channels=excluded.channels,art_hash=excluded.art_hash,mtime_ns=excluded.mtime_ns,\
             size=excluded.size",
-        params![
-            row.path, row.folder, e.title, e.artist, e.album_artist, e.album, e.composer,
-            e.genre, e.track_no, e.disc_no, e.year, e.duration_ms.map(|v| v as i64), e.codec,
-            e.sample_rate, e.bits, e.channels, row.art_hash, row.mtime_ns, row.size,
-        ],
-    )?;
+    )?
+    .execute(params![
+        row.path, row.folder, e.title, e.artist, e.album_artist, e.album, e.composer,
+        e.genre, e.track_no, e.disc_no, e.year, e.duration_ms.map(|v| v as i64), e.codec,
+        e.sample_rate, e.bits, e.channels, row.art_hash, row.mtime_ns, row.size,
+    ])?;
     Ok(())
 }
 
 fn update_track(txn: &Transaction, id: i64, row: &Row) -> Result<()> {
     let e = &row.e;
-    txn.execute(
+    // prepare_cached: this runs once per changed/moved file — cache it so the
+    // statement is parsed once, not once per row (see `insert_track`).
+    txn.prepare_cached(
         "UPDATE track SET path=?2,folder=?3,title=?4,artist=?5,album_artist=?6,album=?7,\
             composer=?8,genre=?9,track_no=?10,disc_no=?11,year=?12,duration_ms=?13,codec=?14,\
             sample_rate=?15,bits=?16,channels=?17,art_hash=?18,mtime_ns=?19,size=?20 WHERE id=?1",
-        params![
-            id, row.path, row.folder, e.title, e.artist, e.album_artist, e.album, e.composer,
-            e.genre, e.track_no, e.disc_no, e.year, e.duration_ms.map(|v| v as i64), e.codec,
-            e.sample_rate, e.bits, e.channels, row.art_hash, row.mtime_ns, row.size,
-        ],
-    )?;
+    )?
+    .execute(params![
+        id, row.path, row.folder, e.title, e.artist, e.album_artist, e.album, e.composer,
+        e.genre, e.track_no, e.disc_no, e.year, e.duration_ms.map(|v| v as i64), e.codec,
+        e.sample_rate, e.bits, e.channels, row.art_hash, row.mtime_ns, row.size,
+    ])?;
     Ok(())
 }
 
@@ -392,12 +402,11 @@ fn write_art(art_dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
 /// unchanged sheet is skipped, a changed one is rebuilt, and a vanished one's
 /// rows are deleted.
 fn scan_cues(
-    db_path: &Path,
+    conn: &mut Connection,
     art_dir: &Path,
     cues: &[(PathBuf, crate::cue::CueSheet)],
     stats: &mut ScanStats,
 ) -> Result<()> {
-    let mut conn = db::open(db_path)?;
     // `.cue` rows are the ones with a non-null `start_ms`.
     let existing = load_existing_containers(
         &conn,
@@ -593,7 +602,7 @@ fn insert_cue_tracks(
 /// unchanged is skipped, a changed one is rebuilt, a vanished one's rows dropped.
 /// SACD rows are identified by `start_ms IS NULL AND source_path IS NOT NULL`.
 fn scan_iso(
-    db_path: &Path,
+    conn: &mut Connection,
     art_dir: &Path,
     iso_paths: &[PathBuf],
     stats: &mut ScanStats,
@@ -601,7 +610,6 @@ fn scan_iso(
     if iso_paths.is_empty() {
         return Ok(());
     }
-    let mut conn = db::open(db_path)?;
     // SACD rows are identified by `start_ms NULL AND source_path NOT NULL`.
     let existing = load_existing_containers(
         &conn,

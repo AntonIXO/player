@@ -121,7 +121,9 @@ impl Library {
     /// caller maps its own ordered path list through it. Chunked so a very long
     /// queue never exceeds SQLite's bound-parameter limit.
     pub fn tracks_by_paths(&self, paths: &[PathBuf]) -> Result<HashMap<PathBuf, Track>> {
-        let mut by_path: HashMap<PathBuf, Track> = HashMap::new();
+        // Pre-size to the request: at most one resolved track per input path, so
+        // this never rehashes while filling (free, output-identical).
+        let mut by_path: HashMap<PathBuf, Track> = HashMap::with_capacity(paths.len());
         for chunk in paths.chunks(PARAM_CHUNK) {
             let sql = format!(
                 "SELECT {} FROM track WHERE track.path IN ({})",
@@ -320,7 +322,7 @@ pub(crate) fn load_tracks_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<T
         placeholders(ids.len())
     );
     let bind: Vec<&dyn ToSql> = ids.iter().map(|i| i as &dyn ToSql).collect();
-    let mut by_id: HashMap<i64, Track> = HashMap::new();
+    let mut by_id: HashMap<i64, Track> = HashMap::with_capacity(ids.len());
     for t in query_collect(conn, &sql, bind.as_slice(), db::row_to_track)? {
         by_id.insert(t.id, t);
     }

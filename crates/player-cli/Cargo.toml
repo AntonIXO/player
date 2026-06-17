@@ -8,8 +8,10 @@ license.workspace = true
 name = "player-cli"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 player-core = { path = "../player-core" }
 player-library = { path = "../player-library" }
 clap.workspace = true
-alsa.workspace = true

@@ -8,5 +8,8 @@ license.workspace = true
 keywords = ["sacd", "dsd", "dst", "scarletbook", "audio"]
 categories = ["multimedia::audio", "parser-implementations"]
 
+[lints]
+workspace = true
+
 [dependencies]
 thiserror.workspace = true

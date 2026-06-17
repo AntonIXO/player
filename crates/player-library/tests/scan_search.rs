@@ -11,8 +11,7 @@ fn ffmpeg_ok() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn gen(path: &Path, title: &str, artist: &str, album: &str, dur: f32) {
@@ -24,6 +23,23 @@ fn gen(path: &Path, title: &str, artist: &str, album: &str, dur: f32) {
         .args(["-metadata", &format!("artist={artist}")])
         .args(["-metadata", &format!("album={album}")])
         .args(["-metadata", &format!("album_artist={artist}")])
+        .arg(path)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed for {}", path.display());
+}
+
+/// Like `gen` but also stamps a release `date` (year), for sort-order tests.
+fn gen_dated(path: &Path, title: &str, artist: &str, album: &str, year: i32) {
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+        .arg("sine=frequency=440:duration=1")
+        .args(["-ar", "44100", "-sample_fmt", "s16"])
+        .args(["-metadata", &format!("title={title}")])
+        .args(["-metadata", &format!("artist={artist}")])
+        .args(["-metadata", &format!("album={album}")])
+        .args(["-metadata", &format!("album_artist={artist}")])
+        .args(["-metadata", &format!("date={year}")])
         .arg(path)
         .status()
         .expect("spawn ffmpeg");
@@ -255,7 +271,7 @@ fn tracks_by_paths_resolves_batch() {
     assert_eq!(map.get(&b).and_then(|t| t.title.clone()).as_deref(), Some("Für Alina"));
 
     // The map lets the caller preserve its own arbitrary order (b before a here).
-    let order = [b.clone(), a.clone()];
+    let order = [b, a];
     let titles: Vec<_> = order
         .iter()
         .filter_map(|p| map.get(p).and_then(|t| t.title.clone()))
@@ -263,6 +279,107 @@ fn tracks_by_paths_resolves_batch() {
     assert_eq!(titles, vec!["Für Alina".to_string(), "Spiegel im Spiegel".to_string()]);
 
     assert!(lib.tracks_by_paths(&[]).unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Characterization: `tracks_by_paths` must resolve correctly even when the input
+/// list is larger than the SQLite bind-variable chunk size, i.e. when the query is
+/// split across multiple chunks. Guards the chunking refactor (off-by-one in the
+/// chunk size would silently drop rows that land past the first chunk).
+#[test]
+fn tracks_by_paths_crosses_chunk_boundary() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not found — skipping chunk-boundary test");
+        return;
+    }
+
+    let root = unique_dir();
+    let music = root.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    let db = root.join("library.db");
+    let art = root.join("art");
+
+    // Two real, indexed files; one placed well past the chunk boundary.
+    let a = music.join("a.flac");
+    let z = music.join("z.flac");
+    gen(&a, "First", "Artist", "Album", 1.0);
+    gen(&z, "Last", "Artist", "Album", 1.0);
+
+    let lib = Library::open(&db, &art).unwrap();
+    lib.scan(&music).unwrap();
+
+    // 1500 paths total (> 900 chunk size, forcing ≥2 chunks): the real ones are at
+    // index 0 and 1400, padded with non-existent paths in between.
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(1500);
+    paths.push(a.clone());
+    for i in 0..1398 {
+        paths.push(music.join(format!("ghost-{i}.flac")));
+    }
+    paths.push(z.clone());
+    paths.push(music.join("also-missing.flac"));
+
+    let map = lib.tracks_by_paths(&paths).unwrap();
+    assert_eq!(map.len(), 2, "both real paths resolve across the chunk boundary");
+    assert_eq!(map.get(&a).and_then(|t| t.title.clone()).as_deref(), Some("First"));
+    assert_eq!(
+        map.get(&z).and_then(|t| t.title.clone()).as_deref(),
+        Some("Last"),
+        "a real path in the SECOND chunk still resolves"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Characterization: pin the browse sort orders (`album_order` / `track_order`) so
+/// the upcoming extraction into a `browse` module is provably behaviour-preserving.
+#[test]
+fn browse_sort_orders() {
+    if !ffmpeg_ok() {
+        eprintln!("ffmpeg not found — skipping sort-order test");
+        return;
+    }
+
+    let root = unique_dir();
+    let music = root.join("music");
+    std::fs::create_dir_all(&music).unwrap();
+    let db = root.join("library.db");
+    let art = root.join("art");
+
+    // Three single-track albums with distinct artist / album / year so each Sort
+    // mode yields a different, unambiguous order.
+    gen_dated(&music.join("blue.flac"), "So What", "Miles Davis", "Kind of Blue", 1959);
+    gen_dated(&music.join("alina.flac"), "Für Alina", "Arvo Pärt", "Alina", 1976);
+    gen_dated(&music.join("ok.flac"), "Airbag", "Radiohead", "OK Computer", 1997);
+
+    let lib = Library::open(&db, &art).unwrap();
+    lib.scan(&music).unwrap();
+
+    // Newest first; ties (none here) aside, Year is a strict 1997 > 1976 > 1959.
+    let by_year: Vec<_> = lib.albums(Sort::Year).unwrap().into_iter().map(|a| a.album).collect();
+    assert_eq!(by_year, ["OK Computer", "Alina", "Kind of Blue"], "Year = newest first");
+
+    // Album-title sort is lexicographic.
+    let by_album: Vec<_> = lib.albums(Sort::Album).unwrap().into_iter().map(|a| a.album).collect();
+    assert_eq!(by_album, ["Alina", "Kind of Blue", "OK Computer"], "Album = A→Z by title");
+
+    // Artist sort orders by album_artist (Pärt < Miles? case/locale: 'A' < 'M' < 'R').
+    let by_artist: Vec<_> = lib
+        .albums(Sort::Artist)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.album_artist.unwrap_or_default())
+        .collect();
+    assert_eq!(by_artist, ["Arvo Pärt", "Miles Davis", "Radiohead"], "Artist = A→Z by album_artist");
+
+    // Track-level Title sort is lexicographic across all tracks.
+    let track_titles: Vec<_> = lib
+        .tracks(Sort::Title)
+        .unwrap()
+        .into_iter()
+        .filter_map(|t| t.title)
+        .collect();
+    assert_eq!(track_titles, ["Airbag", "Für Alina", "So What"], "Title = A→Z across tracks");
 
     let _ = std::fs::remove_dir_all(&root);
 }

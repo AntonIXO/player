@@ -15,6 +15,42 @@ version = "0.1.0"
 # sacd-ripper project; the whole workspace is relicensed to match.
 license = "GPL-3.0-or-later"
 
+# Workspace-wide lint policy. Opt every crate in via `[lints] workspace = true`.
+# pedantic + nursery at `warn` raise the bar during the refactor; the allow-list
+# silences the high-noise / low-value lints (notably the integer-cast lints, which
+# fire constantly on the intentional, bit-exact sample-packing math and would drown
+# out real findings). Re-enable any of these case-by-case if a crate wants it.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Stylistic / documentation noise:
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+# Intentional in this codebase (bit-exact integer math, sample packing):
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+# High-volume / low-value style lints (would force churn in sensitive bit-exact
+# code for little gain; remaining warnings stay a meaningful, fixable set):
+unreadable_literal = "allow"
+struct_field_names = "allow"
+trivially_copy_pass_by_ref = "allow"
+default_trait_access = "allow"
+too_long_first_doc_paragraph = "allow"
+# nursery lints that are unstable / churny:
+missing_const_for_fn = "allow"
+option_if_let_else = "allow"
+or_fun_call = "allow"
+redundant_pub_crate = "allow"
+
 [workspace.dependencies]
 symphonia = { version = "0.6", default-features = false, features = [
     "flac",

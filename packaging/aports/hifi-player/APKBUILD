@@ -30,9 +30,17 @@ depends="alsa-utils adwaita-icon-theme openssh-server avahi iw"
 # xvfb:   headless X server for the UI PGO pass (_pgo_ui=1) — runs the instrumented
 #         player-gtk `--bench` so PGO also covers the UI's OWN code. Best-effort: if
 #         the bench can't run, only the shared decode/library code is profiled.
-# NOTE:   BOLT (_bolt=1) needs `llvm-bolt` + `merge-fdata`, which Alpine does NOT
-#         package — so BOLT auto-skips in the chroot (PGO still applies). Run BOLT on
-#         the host/on-device instead: scripts/pgo-bolt-build.sh --bolt
+# NOTE:   BOLT (_bolt=1) needs `llvm-bolt` + `merge-fdata` (Alpine packages neither)
+#         AND, for instrument mode, an *aarch64* libbolt_rt_instr.a — BOLT links that
+#         runtime INTO the target, so it must match the TARGET arch even though the
+#         tool itself can be x86_64. `scripts/pmb-build-pgo.sh --bolt` wires both up:
+#         it RO-binds, at /mnt/x86-bolt in a bin/lib layout, the x86_64 llvm-bolt +
+#         merge-fdata (run NATIVELY via their loader — fast) under bin/, and the
+#         aarch64 libbolt_rt_instr.a (lifted from a downloaded aarch64 LLVM,
+#         LLVM-*-Linux-ARM64) under lib/, where BOLT resolves it. The host tool
+#         rewrites by ELF arch; only the instrumented binary's training run is
+#         emulated. Missing tools OR runtime => BOLT auto-skips and PGO still applies.
+#         (Alt: BOLT a host/on-device build: scripts/pgo-bolt-build.sh --bolt)
 # meson + phosh-dev/gtk+3.0-dev/libhandy1-dev/glib-dev: the Phosh quick-settings
 # plugin (the system-curtain "Music sync" button) is an out-of-tree GModule built
 # in build(). Phosh is GTK3 + libhandy (not GTK4). The plugin build is BEST-EFFORT:
@@ -102,12 +110,15 @@ prepare() {
 #         shared decode/library code via function matching). Falls back to a plain
 #         build if material or llvm-profdata are missing, or rustc lacks the profiler
 #         runtime — pmbootstrap build never breaks because of PGO.
-# _bolt=1: also BOLT player-cli (opt-in, off by default). Needs llvm-bolt +
-#         merge-fdata in the chroot; player-gtk isn't BOLTed (no display to train).
+# _bolt=1: also BOLT the optimized binaries (opt-in). Needs llvm-bolt + merge-fdata
+#         and an aarch64 instrumentation runtime (native, or host-staged at
+#         /mnt/x86-bolt — see NOTE above). BOLTs player-cli (trained by _workload)
+#         and, when _pgo_ui=1, player-gtk too (trained by the same headless Xvfb UI
+#         bench PGO uses) — so BOLT covers everything PGO does.
 # Both only change code LAYOUT, never numeric results — the bit-perfect gate below
 # re-proves byte-equality vs ffmpeg before the binary is allowed to be packaged.
-_pgo=0
-_bolt=0
+_pgo=1
+_bolt=1
 # _pgo_ui=1: also profile player-gtk's OWN UI code (page build, list models,
 #         layout, album/hero rescale, search render) — not just the shared
 #         decode/library code. Instruments player-gtk too and runs it headless via
@@ -115,7 +126,7 @@ _bolt=0
 #         player-gtk build under qemu; set 0 to skip if builds get too slow. The
 #         lto="off" PGO profile is what makes profiling extra crates safe here
 #         (no ThinLTO ProfileSummary conflicts — see Cargo.toml / rust#115344).
-_pgo_ui=0
+_pgo_ui=1
 
 # The whole pipeline builds the `release-pgo` cargo profile (= release but
 # strip=false, since BOLT needs symbols/relocations); abuild strips the installed
@@ -199,13 +210,17 @@ _workload_synth() {
 # library scan over real Cyrillic-tagged metadata + embedded art (lofty/FTS5),
 # and fuzzy + FTS search over a realistically sized index. Every decode is
 # bounded (--seconds) so qemu-user stays tractable; no sample is altered.
-# Tunable: PLAYER_PGO_DECODE_SECS / _MAX_PER_CODEC / _ISO_START / _ISO_SECS.
+# Tunable: PLAYER_PGO_DECODE_SECS / _MAX_PER_CODEC / _ISO_START / _ISO_SECS /
+# _ISO_REWIND_FROM / _ISO_REWIND_TO / _ISO_REWIND_SECS (the .iso backward-seek pass).
 _workload_real() {
 	_cli="$1"
 	_secs="${PLAYER_PGO_DECODE_SECS:-15}"
 	_maxpc="${PLAYER_PGO_MAX_PER_CODEC:-0}"   # 0 = every track of each codec
 	_iso_start="${PLAYER_PGO_ISO_START:-20}"
 	_iso_secs="${PLAYER_PGO_ISO_SECS:-25}"
+	_iso_rw_from="${PLAYER_PGO_ISO_REWIND_FROM:-60}"  # decode forward from here,
+	_iso_rw_to="${PLAYER_PGO_ISO_REWIND_TO:-5}"       # then seek BACK to here
+	_iso_rw_secs="${PLAYER_PGO_ISO_REWIND_SECS:-8}"   # bounded so qemu stays sane
 	_db="$builddir/target/.pgo-real.db"; rm -f "$_db"
 	if [ "$_maxpc" -gt 0 ]; then _cov="≤${_maxpc}/codec"; else _cov="all tracks"; fi
 	msg "PGO: real-corpus workload (decode ${_secs}s × ${_cov}, iso ${_iso_secs}s) over $_PGO_MUSIC"
@@ -249,6 +264,11 @@ _workload_real() {
 	find "$_PGO_MUSIC" -type f -iname '*.iso' 2>/dev/null | head -n 2 | while IFS= read -r _f; do
 		"$_cli" probe "$_f" >/dev/null 2>&1 || true
 		"$_cli" dump "$_f" -o /dev/null --start "$_iso_start" --seconds "$_iso_secs" >/dev/null 2>&1 || true
+		# Rewind: decode forward from a later offset, then seek BACK — exercises the
+		# SacdTrackReader sparse frame→sector backward-seek index (the rewind path
+		# that skips a full rescan). Bounded short; never alters samples.
+		"$_cli" dump "$_f" -o /dev/null --start "$_iso_rw_from" --seconds "$_iso_rw_secs" \
+			--rewind "$_iso_rw_to" >/dev/null 2>&1 || true
 	done
 
 	rm -f "$_db"
@@ -294,18 +314,78 @@ _workload_gtk() (
 	exit 0
 )
 
-# Optional BOLT of player-cli. Returns non-zero (caller warns) if tools missing.
-_bolt_cli() {
-	command -v llvm-bolt >/dev/null || return 1
-	command -v merge-fdata >/dev/null || return 1
-	_bin="$_outdir/player-cli"
-	_bd="$builddir/target/.bolt"; rm -rf "$_bd"; mkdir -p "$_bd" || return 1
-	llvm-bolt "$_bin" -instrument --instrumentation-file="$_bd/cli.fdata" \
-		--instrumentation-file-append-pid -o "$_bin.inst" || return 1
-	_workload "$_bin.inst" || true
-	[ -n "$(find "$_bd" -name 'cli.fdata*' 2>/dev/null)" ] || return 1
-	merge-fdata "$_bd"/cli.fdata* > "$_bd/merged.fdata" || return 1
-	llvm-bolt "$_bin" -o "$_bin.bolt" -data="$_bd/merged.fdata" \
+# Resolve the BOLT tools into $_LLVM_BOLT / $_MERGE_FDATA (which may be multi-word,
+# so callers expand them UNQUOTED) and set $_bolt_can_instr (1 = instrument mode is
+# usable, i.e. a TARGET-arch libbolt_rt_instr.a is available to link into the binary).
+# Prefer a native llvm-bolt on PATH (an on-device aarch64 build, if Alpine ever
+# packages it — its own runtime is target-arch, so instrument works). Otherwise use a
+# HOST toolchain bind-mounted at $PLAYER_BOLT_DIR (default /mnt/x86-bolt) by
+# scripts/pmb-build-pgo.sh --bolt in a bin/lib layout: the x86_64 llvm-bolt is run via
+# its loader from bin/ (fast, native) and BOLT resolves its runtime as <dir>/lib/
+# libbolt_rt_instr.a. That runtime is linked INTO the aarch64 target, so it must be the
+# aarch64 build (staged from a downloaded aarch64 LLVM); present => instrument works
+# cross-arch (proven: x86_64 tool + aarch64 runtime). Returns non-zero if no tools.
+_resolve_bolt() {
+	_bolt_can_instr=0
+	if command -v llvm-bolt >/dev/null && command -v merge-fdata >/dev/null; then
+		_LLVM_BOLT="llvm-bolt"; _MERGE_FDATA="merge-fdata"
+		_bolt_can_instr=1   # native: its own (target-arch) runtime is installed
+		return 0
+	fi
+	_bd_dir="${PLAYER_BOLT_DIR:-/mnt/x86-bolt}"; _bd_ld="$_bd_dir/bin/ld-linux-x86-64.so.2"
+	if [ -x "$_bd_dir/bin/llvm-bolt" ] && [ -x "$_bd_dir/bin/merge-fdata" ] && [ -x "$_bd_ld" ]; then
+		_LLVM_BOLT="$_bd_ld --library-path $_bd_dir/bin $_bd_dir/bin/llvm-bolt"
+		_MERGE_FDATA="$_bd_ld --library-path $_bd_dir/bin $_bd_dir/bin/merge-fdata"
+		[ -f "$_bd_dir/lib/libbolt_rt_instr.a" ] && _bolt_can_instr=1
+		return 0
+	fi
+	return 1
+}
+
+# BOLT one binary in place: $1=binary path, $2=short tag, $3=name of the training
+# function (invoked with the INSTRUMENTED binary as its arg, so it emits fdata).
+# instrument → train → merge-fdata → optimize. Layout-only (the bit-perfect gate
+# re-proves byte-equality afterwards). Returns non-zero on any failure; the caller
+# warns and keeps the PGO-only binary. Assumes _resolve_bolt already ran.
+#
+# musl does NOT call the main program's DT_FINI (it terminates via .fini_array), and
+# BOLT's default profile dump is a DT_FINI finalizer — so on Alpine the counters are
+# collected but never written: empty fdata, BOLT "fails" (verified on-target). Fix:
+# --instrumentation-sleep-time=N spawns a watcher that flushes the profile every N
+# seconds, independent of DT_FINI; --instrumentation-no-counters-clear keeps the
+# counts cumulative so the per-pid file always holds the FULL profile (bolt's
+# instr.cpp: "Time to sleep across dumps" / "Do not clear counters across dumps").
+# N is small so even mid-length decodes get a dump under qemu; the long real-corpus
+# decodes run many seconds and dump repeatedly. Override via PLAYER_BOLT_SLEEP.
+_bolt_one() {
+	_bin="$1"; _tag="$2"; _train="$3"
+	_sleep="${PLAYER_BOLT_SLEEP:-2}"
+	[ -x "$_bin" ] || return 1
+	_bd="$builddir/target/.bolt-$_tag"; rm -rf "$_bd"; mkdir -p "$_bd" || return 1
+	_fdata="$_bd/$_tag.fdata"
+	# --instrumentation-file-append-pid (per-pid dump AT EXIT) is what musl breaks and
+	# is mutually exclusive with --instrumentation-sleep-time anyway, so use sleep-time
+	# alone. But sleep-time writes ONE shared file, and our training is many SEQUENTIAL
+	# invocations that would each overwrite it. So wrap the binary: after each run,
+	# snapshot the (cumulative) fdata to a unique name; merge them all at the end.
+	# Short runs (< sleep-time) dump nothing and are skipped — fine, the long decode/
+	# scan phases are the hot code BOLT cares about.
+	$_LLVM_BOLT "$_bin" -instrument --instrumentation-file="$_fdata" \
+		--instrumentation-sleep-time="$_sleep" --instrumentation-no-counters-clear \
+		-o "$_bin.inst" || return 1
+	_wrap="$_bd/run.sh"
+	cat > "$_wrap" <<EOF
+#!/bin/sh
+"$_bin.inst" "\$@"; _rc=\$?
+[ -f "$_fdata" ] && mv -f "$_fdata" "\$(mktemp -u "$_fdata.XXXXXX")" 2>/dev/null
+exit \$_rc
+EOF
+	chmod +x "$_wrap"
+	"$_train" "$_wrap" || true
+	[ -f "$_fdata" ] && mv -f "$_fdata" "$_fdata.final" 2>/dev/null
+	[ -n "$(find "$_bd" -name "$_tag.fdata.*" 2>/dev/null)" ] || { rm -f "$_bin.inst"; return 1; }
+	$_MERGE_FDATA "$_bd/$_tag".fdata.* > "$_bd/merged.fdata" || return 1
+	$_LLVM_BOLT "$_bin" -o "$_bin.bolt" -data="$_bd/merged.fdata" \
 		-reorder-blocks=ext-tsp -reorder-functions=hfsort \
 		-split-functions -split-all-cold -icf=1 || return 1
 	mv "$_bin.bolt" "$_bin"; rm -f "$_bin.inst"
@@ -350,7 +430,26 @@ _pgo_build() {
 	RUSTFLAGS="$_base_rustflags $_use" \
 		cargo build --profile "$_cargo_profile" --frozen -p player-gtk -p player-cli \
 		|| { warning "PGO skipped: optimized build failed"; return 1; }
-	[ "$_bolt" = 1 ] && { _bolt_cli && msg "BOLT: player-cli optimized" || warning "BOLT skipped (llvm-bolt/merge-fdata not packaged by Alpine)"; }
+	if [ "$_bolt" = 1 ]; then
+		if ! _resolve_bolt; then
+			warning "BOLT skipped (no llvm-bolt; run scripts/pmb-build-pgo.sh --bolt to bind-mount the host toolchain at /mnt/x86-bolt)"
+		elif [ "$_bolt_can_instr" != 1 ]; then
+			# Instrumentation links an aarch64 libbolt_rt_instr.a into the target; the
+			# x86_64 host toolchain ships only an x86_64 one. Stage an aarch64 runtime
+			# (pmb-build-pgo.sh --bolt lifts it from a downloaded aarch64 LLVM) or this
+			# stays PGO-only. Don't waste qemu instrument passes failing on it.
+			warning "BOLT skipped: no aarch64 libbolt_rt_instr.a at ${_bd_dir:-/mnt/x86-bolt}/lib (need an aarch64 LLVM; see scripts/pmb-build-pgo.sh --bolt). PGO is applied."
+		else
+			_bolt_one "$_outdir/player-cli" cli _workload \
+				&& msg "BOLT: player-cli optimized" || warning "BOLT: player-cli failed (kept PGO binary)"
+			# Same coverage as PGO: also BOLT the UI binary, trained by the very
+			# same headless Xvfb bench, whenever UI profiling is on.
+			if [ "$_pgo_ui" = 1 ]; then
+				_bolt_one "$_outdir/player-gtk" gtk _workload_gtk \
+					&& msg "BOLT: player-gtk optimized" || warning "BOLT: player-gtk skipped (UI bench/Xvfb unavailable)"
+			fi
+		fi
+	fi
 	return 0
 }
 

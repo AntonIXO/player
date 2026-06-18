@@ -17,6 +17,10 @@
 # C++ SACD reference (sacd-ripper fork) — vendored reference, has its own repo.
 /sacd/
 
+# Downloaded LLVM toolchains (e.g. the aarch64 release whose libbolt_rt_instr.a
+# feeds cross-arch BOLT instrumentation) — multi-GB binaries, never source.
+/LLVM-*/
+
 # Bit-perfect verification artifacts (decoded PCM dumps)
 *.s32le
 *.raw

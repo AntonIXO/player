@@ -11,12 +11,21 @@
 # + seek, the bounded SACD .iso DST decoder, a real Cyrillic-tagged library scan,
 # and fuzzy/FTS search), runs `pmbootstrap build`, then unmounts on exit.
 #
-# Usage:
-#   scripts/pmb-build-pgo.sh [--music DIR] [--src DIR] [--no-music] [-- <pmb args>]
+# With --bolt it ALSO stages a BOLT toolchain READ-ONLY at /mnt/x86-bolt in a bin/lib
+# layout: the host's x86_64 llvm-bolt + merge-fdata (+ closure) under bin/, run
+# NATIVELY (fast), PLUS an *aarch64* libbolt_rt_instr.a under lib/. BOLT links that
+# runtime INTO the target, so it must match the target arch; it's lifted from a
+# downloaded aarch64 LLVM (auto-detected as LLVM-*-Linux-ARM64 in the repo, or pass
+# --bolt-rt DIR). The APKBUILD then BOLTs player-cli + player-gtk; only the instrumented
+# binary's training run is emulated. Needs a host llvm-bolt (Arch: `pacman -S llvm`)
+# AND the aarch64 runtime, else --bolt errors out.
 #
-# Defaults: --music /home/antonix/Музыка, --src <repo root>. Needs sudo for the
-# bind mount. Without a library (or --no-music) the build still works — the
-# APKBUILD falls back to its synthetic training corpus.
+# Usage:
+#   scripts/pmb-build-pgo.sh [--music DIR] [--src DIR] [--no-music] [--bolt [--bolt-rt DIR]] [-- <pmb args>]
+#
+# Defaults: --music /home/antonix/Музыка, --src <repo root>, BOLT off. Needs sudo for the
+# bind mount(s). Without a library (or --no-music) the build still works — the
+# APKBUILD falls back to its synthetic training corpus; without --bolt, PGO-only.
 #
 # Tune the workload via env (forwarded is unnecessary — set them in the APKBUILD
 # or here is informational only): PLAYER_PGO_DECODE_SECS, PLAYER_PGO_MAX_PER_CODEC,
@@ -27,6 +36,8 @@ PKG="hifi-player"
 MUSIC="/home/antonix/Музыка"
 SRC="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || echo /home/antonix/player)"
 NO_MUSIC=0
+BOLT=0
+BOLT_RT=""
 EXTRA=()
 
 while [ $# -gt 0 ]; do
@@ -34,7 +45,10 @@ while [ $# -gt 0 ]; do
 		--music) MUSIC="$2"; shift 2 ;;
 		--src)   SRC="$2";   shift 2 ;;
 		--no-music) NO_MUSIC=1; shift ;;
-		-h|--help) sed -n '3,28p' "$0"; exit 0 ;;
+		--bolt) BOLT=1; shift ;;
+		--no-bolt) BOLT=0; shift ;;
+		--bolt-rt) BOLT_RT="$2"; shift 2 ;;
+		-h|--help) sed -n '3,32p' "$0"; exit 0 ;;
 		--) shift; EXTRA+=("$@"); break ;;
 		*) EXTRA+=("$1"); shift ;;
 	esac
@@ -45,12 +59,18 @@ WORK="$(pmbootstrap config work 2>/dev/null | tail -n1)"
 [ -n "$WORK" ] || WORK="$HOME/.local/var/pmbootstrap"
 CHROOT="$WORK/chroot_buildroot_aarch64"
 MNT="$CHROOT/mnt/pgo-music"
+BMNT="$CHROOT/mnt/x86-bolt"
+BSTAGE=""   # host staging dir for the BOLT toolchain (set below when --bolt)
 
+_umount() {
+	mountpoint -q "$1" 2>/dev/null || return 0
+	sudo umount "$1" 2>/dev/null || sudo umount -l "$1" 2>/dev/null || true
+	echo "→ unmounted $1"
+}
 cleanup() {
-	if mountpoint -q "$MNT" 2>/dev/null; then
-		sudo umount "$MNT" 2>/dev/null || sudo umount -l "$MNT" 2>/dev/null || true
-		echo "→ unmounted $MNT"
-	fi
+	_umount "$MNT"
+	_umount "$BMNT"
+	[ -n "$BSTAGE" ] && rm -rf "$BSTAGE" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -76,6 +96,54 @@ if [ "$NO_MUSIC" = 0 ]; then
 	fi
 else
 	echo "→ --no-music: building with the synthetic PGO corpus"
+fi
+
+if [ "$BOLT" = 1 ]; then
+	command -v llvm-bolt >/dev/null && command -v merge-fdata >/dev/null || {
+		echo "error: --bolt needs host llvm-bolt + merge-fdata (Arch/CachyOS: sudo pacman -S llvm)" >&2
+		exit 1
+	}
+	# Instrumentation links an aarch64 libbolt_rt_instr.a INTO the target, so the
+	# RUNTIME must be aarch64 even though the tool is x86_64. Auto-detect a downloaded
+	# aarch64 LLVM (LLVM-*-Linux-ARM64) under the repo, or take --bolt-rt DIR.
+	[ -n "$BOLT_RT" ] || BOLT_RT="$(ls -d "$SRC"/LLVM-*-Linux-ARM64/lib 2>/dev/null | head -n1)"
+	RT_A=""
+	for c in "$BOLT_RT/libbolt_rt_instr.a" "$BOLT_RT/lib/libbolt_rt_instr.a"; do
+		[ -f "$c" ] && { RT_A="$c"; break; }
+	done
+	[ -n "$RT_A" ] || {
+		echo "error: --bolt needs an aarch64 libbolt_rt_instr.a (the instrumentation runtime)." >&2
+		echo "       Put a downloaded aarch64 LLVM (LLVM-*-Linux-ARM64) in the repo, or pass" >&2
+		echo "       --bolt-rt DIR pointing at its lib/ dir." >&2
+		exit 1
+	}
+	# Make sure the buildroot chroot exists before we mount into it (a no-op if the
+	# music branch above already created it).
+	pmbootstrap -y chroot -b aarch64 -- /bin/true >/dev/null 2>&1 || true
+	[ -d "$CHROOT" ] || { echo "error: buildroot chroot not found at $CHROOT" >&2; exit 1; }
+	# bin/ : x86_64 llvm-bolt + merge-fdata + their lib closure (statically linked vs
+	# LLVM, so the closure is just glibc/libstdc++/libz/zstd, ~55 MB). They run
+	# NATIVELY (fast) via the bundled loader. lib/ : the aarch64 runtime, which BOLT
+	# resolves relative to the tool as <parent-of-bin>/lib/libbolt_rt_instr.a.
+	BSTAGE="$(mktemp -d)"; mkdir -p "$BSTAGE/bin" "$BSTAGE/lib"
+	echo "→ staging x86_64 BOLT tools (native) + aarch64 runtime → $BSTAGE"
+	for t in llvm-bolt merge-fdata; do cp -L "$(command -v "$t")" "$BSTAGE/bin/"; done
+	ldd "$(command -v llvm-bolt)" \
+		| awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | sort -u \
+		| while read -r lib; do cp -L "$lib" "$BSTAGE/bin/" 2>/dev/null || true; done
+	cp -L /lib64/ld-linux-x86-64.so.2 "$BSTAGE/bin/ld-linux-x86-64.so.2"
+	cp -L "$RT_A" "$BSTAGE/lib/libbolt_rt_instr.a"
+	cp -L "$(dirname "$RT_A")/libbolt_rt_hugify.a" "$BSTAGE/lib/" 2>/dev/null || true
+	chmod -R a+rX "$BSTAGE"   # the in-chroot build user must read/exec it
+	echo "  runtime: $RT_A"
+	sudo mkdir -p "$BMNT"
+	_umount "$BMNT"   # drop any stale mount so we always bind THIS fresh staging
+	echo "→ bind-mounting (read-only) BOLT toolchain → $BMNT"
+	sudo mount --bind "$BSTAGE" "$BMNT"
+	sudo mount -o remount,ro,bind "$BMNT"
+	echo "  (watch for 'BOLT: player-cli optimized' — that confirms BOLT ran)"
+else
+	echo "→ --no-bolt: PGO only (pass --bolt to also BOLT player-cli + player-gtk)"
 fi
 
 echo "→ pmbootstrap build --src=$SRC $PKG ${EXTRA[*]:-}"

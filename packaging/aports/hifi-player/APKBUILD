@@ -361,7 +361,7 @@ build() {
 	# .cargo/config.toml — so it applies regardless of the chroot rustc's exact
 	# musl host triple. An env RUSTFLAGS replaces config rustflags (no merge), so
 	# everything codegen-related must live here.
-	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort"
+	export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=cortex-a75 -C panic=abort -C llvm-args=-cost-kind=latency"
 	_base_rustflags="$RUSTFLAGS"
 	_prep_testdata || warning "no training/gate material (testfiles/ absent and ffmpeg synth failed)"
 	if _detect_corpus; then

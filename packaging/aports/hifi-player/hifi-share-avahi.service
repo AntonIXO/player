@@ -1,0 +1,14 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- Advertise the phone's SSH/SFTP endpoint as _sftp-ssh._tcp so it appears
+     automatically in GNOME Nautilus' Network view while the share is up — the
+     laptop never has to type an IP. Installed to /etc/avahi/services/sftp.service;
+     avahi-daemon is started on demand by hifi-share.service (Wants=). Only
+     reachable while Wi-Fi is up, i.e. while the quick-settings button is on. -->
+<service-group>
+  <name replace-wildcards="yes">%h — music sync (SFTP)</name>
+  <service>
+    <type>_sftp-ssh._tcp</type>
+    <port>22</port>
+  </service>
+</service-group>

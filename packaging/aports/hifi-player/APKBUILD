@@ -15,7 +15,11 @@ license="MIT"
 # library, so abuild's tracing won't pick it up — list it explicitly. The GTK shell
 # looks up Adwaita symbolic names at runtime (e.g. emblem-favorite-symbolic for the
 # "love" pill); without the theme GTK falls back to hicolor and the icon is blank.
-depends="alsa-utils adwaita-icon-theme"
+# openssh-server + avahi: the one-touch "music sync" share (hifi-share) — sshd serves
+# the phone's storage over SFTP for drag-and-drop from GNOME Nautilus, avahi advertises
+# it as _sftp-ssh._tcp so it auto-appears in Nautilus' network view. NetworkManager
+# (the Wi-Fi half) is already part of the Phosh image.
+depends="alsa-utils adwaita-icon-theme openssh-server avahi iw"
 # llvm:   provides /usr/bin/llvm-profdata to merge PGO profiles. The UNVERSIONED
 #         `llvm` package tracks Alpine's default LLVM — the same one `rust` is built
 #         against — so it always matches rustc's raw-profile format (LLVM 22 here).
@@ -29,6 +33,11 @@ depends="alsa-utils adwaita-icon-theme"
 # NOTE:   BOLT (_bolt=1) needs `llvm-bolt` + `merge-fdata`, which Alpine does NOT
 #         package — so BOLT auto-skips in the chroot (PGO still applies). Run BOLT on
 #         the host/on-device instead: scripts/pgo-bolt-build.sh --bolt
+# meson + phosh-dev/gtk+3.0-dev/libhandy1-dev/glib-dev: the Phosh quick-settings
+# plugin (the system-curtain "Music sync" button) is an out-of-tree GModule built
+# in build(). Phosh is GTK3 + libhandy (not GTK4). The plugin build is BEST-EFFORT:
+# if phosh-plugins.pc isn't available for this Phosh release, build() skips the tile
+# and the share still works via `hifi-share` / the CLI (see the gating in build()).
 makedepends="
 	cargo
 	rust
@@ -38,6 +47,11 @@ makedepends="
 	alsa-lib-dev
 	ffmpeg
 	xvfb
+	meson
+	phosh-dev
+	gtk+3.0-dev
+	libhandy1-dev
+	glib-dev
 "
 install="$pkgname.post-install"
 # net:    cargo fetches crate sources in prepare() (build() then runs offline).
@@ -61,6 +75,13 @@ source="
 	audio.conf
 	99-audio-sysctl.conf
 	90-audio-cmdline.conf
+	hifi-share
+	hifi-share.service
+	hifi-share.conf
+	hifi-share-avahi.service
+	hifi-share-sshd.conf
+	hifi-share-polkit.rules
+	zz-hifi-sync.gschema.override
 "
 builddir="$srcdir/$pkgname-$pkgver"
 
@@ -85,7 +106,7 @@ prepare() {
 #         merge-fdata in the chroot; player-gtk isn't BOLTed (no display to train).
 # Both only change code LAYOUT, never numeric results — the bit-perfect gate below
 # re-proves byte-equality vs ffmpeg before the binary is allowed to be packaged.
-_pgo=1
+_pgo=0
 _bolt=0
 # _pgo_ui=1: also profile player-gtk's OWN UI code (page build, list models,
 #         layout, album/hero rescale, search render) — not just the shared
@@ -94,7 +115,7 @@ _bolt=0
 #         player-gtk build under qemu; set 0 to skip if builds get too slow. The
 #         lto="off" PGO profile is what makes profiling extra crates safe here
 #         (no ThinLTO ProfileSummary conflicts — see Cargo.toml / rust#115344).
-_pgo_ui=1
+_pgo_ui=0
 
 # The whole pipeline builds the `release-pgo` cargo profile (= release but
 # strip=false, since BOLT needs symbols/relocations); abuild strips the installed
@@ -378,6 +399,37 @@ build() {
 	fi
 
 	_bitperfect_gate || return 1
+
+	# --- Phosh quick-settings plugin (the system-curtain "Music sync" button) ----
+	# Out-of-tree GModule under packaging/phosh-plugin-hifi-sync/ (GTK3 + libhandy).
+	# pmOS phosh-dev ships only the entry-point header + the phosh-plugins.pc dir
+	# vars; the widget headers (quick-setting.h …) are vendored in phosh-vendor/ and
+	# the symbols resolve from the running phosh at dlopen time. BEST-EFFORT: skipped
+	# (tile absent, share still works headless via `hifi-share`) if the SDK is missing
+	# or phosh is outside the vendored ABI range. package() installs the built tree.
+	_plugin_build="$builddir/target/phosh-plugin"
+	rm -rf "$_plugin_build"
+	if command -v meson >/dev/null 2>&1 && pkg-config --exists phosh-plugins 2>/dev/null; then
+		_phosh_ver=$(pkg-config --modversion phosh-plugins 2>/dev/null || echo '?')
+		# Vendored headers (phosh-vendor/) track phosh 0.55.0's GTK3 QS ABI. The QS
+		# class struct (GtkBox + 10 reserved vfuncs) is stable across 0.x, so accept
+		# the whole 0.4x–0.x band; a 1.x / GTK4 phosh needs re-vendored headers.
+		if pkg-config --atleast-version=0.40 phosh-plugins 2>/dev/null \
+		   && ! pkg-config --atleast-version=1.0 phosh-plugins 2>/dev/null; then
+			msg "Building Phosh quick-settings plugin (hifi-sync) against phosh $_phosh_ver"
+			if meson setup "$_plugin_build" packaging/phosh-plugin-hifi-sync \
+				--prefix=/usr --libdir=lib && meson compile -C "$_plugin_build"; then
+				msg "Phosh plugin built"
+			else
+				warning "Phosh plugin build failed — skipping curtain tile (share still works via hifi-share)"
+				rm -rf "$_plugin_build"
+			fi
+		else
+			warning "phosh $_phosh_ver is outside the vendored QS ABI range (phosh-vendor/ targets 0.55.0) — skipping curtain tile; re-vendor headers for this release. Share still works via hifi-share."
+		fi
+	else
+		warning "phosh-plugins SDK not found — skipping curtain tile (install phosh-dev or build against the Phosh source); share still works via hifi-share"
+	fi
 }
 
 package() {
@@ -408,6 +460,31 @@ package() {
 	# with the player's standby battery saver (PLAYER_STANDBY_TIMEOUT_SECS).
 	install -Dm755 "$srcdir"/hifi-player-sleep-hook \
 		"$pkgdir"/usr/lib/systemd/system-sleep/hifi-player
+
+	# One-touch "music sync" share: control script + on-demand unit + config, plus
+	# the avahi (_sftp-ssh._tcp), sshd (hardening template), and polkit (lets the
+	# session user toggle ONLY hifi-share.service) drop-ins. The unit is owned by the
+	# curtain button — never enabled at boot — so the Wi-Fi-off/idle posture holds.
+	install -Dm755 "$srcdir"/hifi-share \
+		"$pkgdir"/usr/bin/hifi-share
+	install -Dm644 "$srcdir"/hifi-share.service \
+		"$pkgdir"/usr/lib/systemd/system/hifi-share.service
+	install -Dm644 "$srcdir"/hifi-share.conf \
+		"$pkgdir"/etc/hifi-share.conf
+	install -Dm644 "$srcdir"/hifi-share-avahi.service \
+		"$pkgdir"/etc/avahi/services/sftp.service
+	install -Dm644 "$srcdir"/hifi-share-sshd.conf \
+		"$pkgdir"/etc/ssh/sshd_config.d/10-hifi-share.conf
+	install -Dm644 "$srcdir"/hifi-share-polkit.rules \
+		"$pkgdir"/usr/share/polkit-1/rules.d/10-hifi-share.rules
+
+	# Phosh quick-settings plugin (.so + .plugin), only when build() produced it.
+	# The gschema override (which makes the tile appear by default) ships with it.
+	if [ -d "$builddir/target/phosh-plugin" ]; then
+		DESTDIR="$pkgdir" meson install --no-rebuild -C "$builddir/target/phosh-plugin"
+		install -Dm644 "$srcdir"/zz-hifi-sync.gschema.override \
+			"$pkgdir"/usr/share/glib-2.0/schemas/zz-hifi-sync.gschema.override
+	fi
 
 	# udev: keep the sound server off the DAC; let the audio group hold cpu_dma_latency.
 	install -Dm644 "$srcdir"/99-mojo2-nopulse.rules \
@@ -446,4 +523,11 @@ c1b4bb607f324b34004a36df2cc3a3cfd8e2509767dcb08f0393bd4977986943e73c95fa606572d3
 6fbb68c10725124c2fa2fc699afea3b641af3fd1f6e849c8766766126176915e4f4ded5e53c47412fe6a1ac00918680a5ba92aaeb801c2333960a356da0fc735  audio.conf
 25cd112f526c6ddaf8b48b0e5786e643b7b1ae66b4425b7db97db8b501245bdf1f769e913aa22bdd7718f2742ec2eedf81e9be24fd30b8d1a7645eb07c0e4af0  99-audio-sysctl.conf
 57b152060e7b17b69201dda2ce81de76a5acac26b6132f1823f3eb95512bb7f56145ac5a63650213a3261ed3152dd341d96f211822b337811a8bfc16fcab496b  90-audio-cmdline.conf
+90f943b51d78e71a3a4e51ef7bcb48b6c181996d4a236dd8684bed4c6b97afe3f17b492ad2d784351d342b6446ff94958cbe8251a4ba07c5fc0794275f47bd14  hifi-share
+9b56e6941b00aff186bf67c51aa541a2fd5d7c8bbee89c100c5d72bfe1821a904a793b918cd4c906aea5144f1861b34b42648477582e4ece143f450a78a194e5  hifi-share.service
+7c4bca0302f974e9340f09ebc1891880cc92bfa4f323a1bd15d1332053039f53d76c723892268fc4b82dabe422de93cea0a13e2ba4993fb4ac8acb4010725718  hifi-share.conf
+073fb919320c1bfad914f4c1b4b9e6f770147f42f91e93f6c48267ef2fedbb70fc0bf60401f57556bb7d0ada2271db891093f534c498c4887ec61d89fd82634b  hifi-share-avahi.service
+2e9f1377dc55765aa454dcef792fe5c698b4d07c601c0c13b3e53a7495a3ce92da88d62f6e042b40eebf732f981709817c21fac5571d3771b3c65081a7547ad1  hifi-share-sshd.conf
+e4f3754207a1b1bacfd921c87bad4b8ebf11df5a72ad9aa9f7d27c40c67219981c94c24fc5b03f642182e1b129e00c52d5871a2c9adba655187394eb8c042abd  hifi-share-polkit.rules
+97df1dc6bf8929fe2f2f8e902bcd403ee58b1f019437a26b3b6a585130bbf8e8e4726f5b00e7c47d28cfed75483d3163ea8ab7e7094689c74218b711409e2e16  zz-hifi-sync.gschema.override
 "

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Phosh is GTK3 + libhandy. Template + status-page mirror the upstream
+     simple-custom-quick-setting example so the bindings match the base class. -->
+<interface>
+  <requires lib="gtk+" version="3.24"/>
+  <template class="PhoshHifiSyncQuickSetting" parent="PhoshQuickSetting">
+    <property name="status-icon">info</property>
+    <property name="status-page">status_page</property>
+    <signal name="clicked" handler="on_clicked" object="PhoshHifiSyncQuickSetting" swapped="yes"/>
+  </template>
+  <object class="PhoshStatusIcon" id="info">
+    <property name="visible">1</property>
+    <property name="pixel-size">16</property>
+  </object>
+  <object class="PhoshStatusPage" id="status_page">
+    <property name="visible">1</property>
+    <property name="title" translatable="yes">Music sync</property>
+    <property name="content">placeholder</property>
+  </object>
+  <object class="PhoshStatusPagePlaceholder" id="placeholder">
+    <property name="visible">1</property>
+    <property name="icon-name">network-wireless-symbolic</property>
+    <property name="extra-widget">label</property>
+  </object>
+  <object class="GtkLabel" id="label">
+    <property name="visible">1</property>
+    <property name="justify">center</property>
+    <property name="wrap">1</property>
+    <property name="label" translatable="yes">Tap to share over Wi-Fi, then drag music here from Nautilus.</property>
+  </object>
+</interface>

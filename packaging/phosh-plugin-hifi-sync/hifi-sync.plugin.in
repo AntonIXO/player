@@ -1,0 +1,7 @@
+[Plugin]
+# Translators: This is an internal id, no need to translate it
+Id=@name@
+Name=Music Sync
+Types=quick-setting;
+Comment=Share storage over Wi-Fi to drag music onto the phone from your computer
+Plugin=@plugins_dir@/libphosh-plugin-@name@.so

@@ -1,0 +1,175 @@
+#!/bin/sh
+# One-touch "music sync" control for the bit-perfect player (Poco F1 / beryllium).
+#
+# The DAP keeps Wi-Fi OFF by default (battery/RF discipline — see the sleep hook).
+# This brings it up on demand and exposes the user's storage as a WRITABLE SFTP
+# share so music can be dragged onto the phone from GNOME Nautilus over Wi-Fi
+# (sftp://<host>.local/, auto-discovered via Avahi _sftp-ssh._tcp). Tapping off
+# tears the share down, re-indexes whatever was pushed, and turns Wi-Fi back off.
+#
+# Driven by the Phosh quick-settings plugin (subcommands start|stop|status, run as
+# the session user) and by hifi-share.service (mount-prep|mount-clean, run as root
+# at share start/stop). Safe to run any subcommand by hand for debugging.
+#
+# Privilege split: the user-facing actions only touch NetworkManager (allowed for
+# the active session via NM's own polkit) and `systemctl start/stop
+# hifi-share.service` (allowed for that ONE unit by 10-hifi-share.rules). All root
+# work — SD mount, home symlinks — lives in the service's mount-prep step. Every
+# step degrades quietly so a missing tool / node never aborts the toggle.
+set -u
+
+CONF=/etc/hifi-share.conf
+SERVICE=hifi-share.service
+
+[ -r "$CONF" ] && . "$CONF"
+
+# Defaults (filled only when the config left them empty).
+: "${SHARE_USER:=$(awk -F: '$3>=1000 && $3<65000 {print $1; exit}' /etc/passwd 2>/dev/null)}"
+: "${SHARE_USER:=user}"
+SHARE_HOME=$(getent passwd "$SHARE_USER" 2>/dev/null | cut -d: -f6)
+: "${SHARE_HOME:=/home/$SHARE_USER}"
+: "${MUSIC_ROOT:=$SHARE_HOME/Music}"
+: "${WIFI_CONNECTION:=}"
+: "${SD_MOUNT:=}"
+
+log() { logger -t hifi-share "$@" 2>/dev/null || true; }
+
+# Best guess at the host's current Wi-Fi IPv4 (for the sftp:// hint / button label).
+wifi_ip() {
+	nmcli -g IP4.ADDRESS device show 2>/dev/null | sed -n 's,/.*,,p' | head -n1
+}
+
+# The address to type into Nautilus. Prefer user@IP: it always resolves, and pins
+# the right login (Nautilus otherwise defaults to the *laptop's* username). Fall
+# back to the mDNS <host>.local name (still advertised via Avahi for auto-discovery)
+# only when we don't have an IP yet — note .local needs nss-mdns on the client.
+# Optional $1 = a pre-computed IP to avoid re-querying nmcli.
+share_url() {
+	_ip=${1:-$(wifi_ip)}
+	if [ -n "$_ip" ] && [ "$_ip" != "—" ]; then
+		echo "sftp://${SHARE_USER}@${_ip}/"
+	else
+		echo "sftp://${SHARE_USER}@$(hostname 2>/dev/null || echo phone).local/"
+	fi
+}
+
+# Name of the Wi-Fi device (don't hardcode wlan0).
+wifi_dev() {
+	nmcli -t -g DEVICE,TYPE device status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}'
+}
+
+# Disable Wi-Fi power-save while the share is up. The radio's power-save mode sleeps
+# between beacons, adding ~100ms latency + heavy jitter that throttles SFTP to a few
+# MB/s even on a strong 5GHz link. Measured on the Poco F1: idle RTT ~170ms -> ~2ms
+# and transfer rate jumped accordingly once power-save was off. We only touch it while
+# sharing; Wi-Fi is otherwise off, so this costs no standby battery. `iw` flips it live
+# (no reconnect); if absent, fall back to pinning powersave=2 on the active NM profile.
+disable_wifi_powersave() {
+	dev=$(wifi_dev)
+	[ -n "$dev" ] || return 0
+	if command -v iw >/dev/null 2>&1 && iw dev "$dev" set power_save off 2>/dev/null; then
+		log "wifi power-save off ($dev)"
+		return 0
+	fi
+	acon=$(nmcli -t -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+	[ -n "$acon" ] && nmcli connection modify "$acon" 802-11-wireless.powersave 2 2>/dev/null || true
+}
+
+# --- user-facing actions (run by the Phosh plugin / by hand) ------------------
+
+start() {
+	# Bring the radio up and join Wi-Fi. NM is allowed for the active session, so
+	# no extra privilege here.
+	nmcli radio wifi on 2>/dev/null || true
+	if [ -n "$WIFI_CONNECTION" ]; then
+		# Pin power-save off on the profile *before* activating, so the `up` applies it.
+		nmcli connection modify "$WIFI_CONNECTION" 802-11-wireless.powersave 2 2>/dev/null || true
+		nmcli -w 30 connection up "$WIFI_CONNECTION" 2>/dev/null \
+			|| log "could not bring up Wi-Fi connection '$WIFI_CONNECTION'"
+	fi
+	# Kill Wi-Fi power-save (the big SFTP-speed win) now that the link is up.
+	disable_wifi_powersave
+	# Bring the share up (sshd + avahi via the unit's Wants=, plus mount-prep as
+	# root). Scoped polkit lets the session user start exactly this unit.
+	systemctl start "$SERVICE" 2>/dev/null \
+		|| log "could not start $SERVICE (polkit rule installed? unit present?)"
+	ip=$(wifi_ip)
+	url=$(share_url "$ip")
+	log "share up: $url  (also sftp://$(hostname 2>/dev/null || echo phone).local/ when client mDNS works)"
+	echo "$url"
+}
+
+stop() {
+	# Take the share down first, then drop Wi-Fi promptly (the scan below is
+	# local-only and needs no network).
+	systemctl stop "$SERVICE" 2>/dev/null || true
+	nmcli radio wifi off 2>/dev/null || true
+	# Index whatever was pushed so it shows up in the library. Runs as this user,
+	# so player-cli writes the default XDG library.db. Best-effort + bounded by
+	# the scanner's own incrementality.
+	if command -v player-cli >/dev/null 2>&1 && [ -d "$MUSIC_ROOT" ]; then
+		player-cli scan "$MUSIC_ROOT" >/dev/null 2>&1 \
+			&& log "re-indexed $MUSIC_ROOT" \
+			|| log "scan of $MUSIC_ROOT failed (non-fatal)"
+	fi
+	log "share down, Wi-Fi off"
+}
+
+# Print a single status line the plugin parses: "<active|inactive> <ssid> <ip> <url>".
+status() {
+	if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then state=active; else state=inactive; fi
+	ssid=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -n1)
+	ip=$(wifi_ip)
+	echo "$state ${ssid:-—} ${ip:-—} $(share_url "$ip")"
+}
+
+# --- root actions (run by hifi-share.service Exec lines) ----------------------
+
+# Expose internal storage + the SD card under the SFTP home as plain folders.
+mount_prep() {
+	# Internal storage: a ~/Music drop target (created if missing, owned by user).
+	if [ ! -e "$SHARE_HOME/Music" ]; then
+		install -d -o "$SHARE_USER" -g "$SHARE_USER" "$SHARE_HOME/Music" 2>/dev/null \
+			|| mkdir -p "$SHARE_HOME/Music" 2>/dev/null || true
+	fi
+	# SD card: mount at the configured stable path when given, else reuse whatever
+	# udisks already mounted under /run/media/$SHARE_USER. Symlink it to ~/sdcard
+	# so it appears in Nautilus next to ~/Music (SFTP follows symlinks).
+	sd=""
+	if [ -n "$SD_MOUNT" ]; then
+		mkdir -p "$SD_MOUNT" 2>/dev/null || true
+		if ! mountpoint -q "$SD_MOUNT" 2>/dev/null; then
+			# Mount the first external block partition we can find, mapping owner to
+			# the share user for FAT/exFAT (which carry no Unix perms).
+			dev=$(lsblk -prno NAME,TYPE,RM 2>/dev/null | awk '$2=="part" && $3==1 {print $1; exit}')
+			uid=$(id -u "$SHARE_USER" 2>/dev/null); gid=$(id -g "$SHARE_USER" 2>/dev/null)
+			[ -n "$dev" ] && { mount -o "uid=${uid:-1000},gid=${gid:-1000},rw" "$dev" "$SD_MOUNT" 2>/dev/null \
+				|| mount "$dev" "$SD_MOUNT" 2>/dev/null; }
+		fi
+		mountpoint -q "$SD_MOUNT" 2>/dev/null && sd="$SD_MOUNT"
+	fi
+	[ -z "$sd" ] && sd=$(find "/run/media/$SHARE_USER" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1)
+	if [ -n "$sd" ] && [ -d "$sd" ]; then
+		ln -sfn "$sd" "$SHARE_HOME/sdcard" 2>/dev/null \
+			&& chown -h "$SHARE_USER:$SHARE_USER" "$SHARE_HOME/sdcard" 2>/dev/null || true
+		log "SD card exposed at ~/sdcard -> $sd"
+	else
+		log "no SD card mount found (internal storage still shared)"
+	fi
+}
+
+mount_clean() {
+	# Leave mounts in place (cheap, and the user may still want the card). Just
+	# drop the transient symlink so a stale target doesn't linger in the share.
+	[ -L "$SHARE_HOME/sdcard" ] && rm -f "$SHARE_HOME/sdcard" 2>/dev/null || true
+}
+
+case "${1:-status}" in
+	start)       start ;;
+	stop)        stop ;;
+	status)      status ;;
+	mount-prep)  mount_prep ;;
+	mount-clean) mount_clean ;;
+	*) echo "usage: $0 {start|stop|status|mount-prep|mount-clean}" >&2; exit 2 ;;
+esac
+exit 0

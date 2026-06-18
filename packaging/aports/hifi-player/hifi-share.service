@@ -1,0 +1,19 @@
+[Unit]
+Description=Music-sync share (SFTP over Wi-Fi for drag-and-drop from Nautilus)
+# Pull the SFTP server + mDNS advertiser up only while sharing, so the device's
+# default Wi-Fi-off/idle posture is preserved. These are wants, not requires:
+# a missing avahi just costs auto-discovery (sftp://host.local still works).
+Wants=sshd.service avahi-daemon.service
+After=sshd.service avahi-daemon.service NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Root work only: SD mount + home symlinks (sshd/avahi come from Wants= above).
+ExecStart=/usr/bin/hifi-share mount-prep
+ExecStop=/usr/bin/hifi-share mount-clean
+
+# Started/stopped on demand by the quick-settings button via the scoped polkit
+# rule; never enabled at boot (the button owns its lifecycle).
+[Install]
+WantedBy=multi-user.target

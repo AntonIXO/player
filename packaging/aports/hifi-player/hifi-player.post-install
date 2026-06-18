@@ -4,9 +4,14 @@
 # so it never fails the transaction when systemd isn't running (e.g. in the chroot).
 systemctl preset hifi-player-audio-setup.service >/dev/null 2>&1 || true
 
+# Compile the GSettings schemas so the shipped override (which adds the "Music sync"
+# tile to the Phosh curtain by default) and the plugin take effect. Guarded so it
+# never fails the transaction in the build chroot.
+glib-compile-schemas /usr/share/glib-2.0/schemas >/dev/null 2>&1 || true
+
 cat >&2 <<'EOF'
 
-hifi-player installed. Three manual follow-ups (one-time):
+hifi-player installed. Four manual follow-ups (one-time):
 
   1. Add your login user to the 'audio' group (RT scheduling + DAC access):
          sudo adduser <user> audio          # then log out and back in
@@ -18,6 +23,22 @@ hifi-player installed. Three manual follow-ups (one-time):
 
   3. If a sound server still grabs the DAC, set its vendor:product in
      /etc/udev/rules.d/99-mojo2-nopulse.rules from:  lsusb | grep -i chord
+
+  4. Music sync (the "Music sync" tile in the system curtain): authorize your
+     laptop and pick your Wi-Fi so it's truly one-touch:
+       a. Put your laptop's SSH public key in ~/.ssh/authorized_keys on the phone.
+       b. Edit /etc/hifi-share.conf — set WIFI_CONNECTION to your home Wi-Fi
+          profile (nmcli -g NAME connection show) and, if you use a microSD card,
+          SD_MOUNT to a stable path. SHARE_USER/MUSIC_ROOT default sensibly.
+     Then connect from the laptop's Nautilus. The tile shows the exact address —
+     sftp://<user>@<phone-ip>/ — which ALWAYS works (Files ▸ Other Locations ▸
+     "Connect to Server", or Ctrl-L). The phone also auto-appears in Nautilus ▸
+     Network as "<host> — music sync", but opening that entry needs the LAPTOP to
+     resolve <host>.local over mDNS: install nss-mdns and ensure /etc/nsswitch.conf
+     has it on the hosts line, e.g.
+         hosts: ... mdns_minimal [NOTFOUND=return] resolve ... dns
+     (Arch: pacman -S nss-mdns + edit the line; most GNOME distros ship this).
+     Tapping the tile off re-indexes pushed music and drops Wi-Fi.
 
 EOF
 exit 0

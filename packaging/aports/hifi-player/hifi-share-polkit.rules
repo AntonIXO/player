@@ -1,0 +1,16 @@
+// Polkit rule for the one-touch music-sync share.
+//
+// Let the ACTIVE LOCAL session user start/stop ONLY hifi-share.service, so the
+// unprivileged Phosh quick-settings button can bring the SFTP share up and down
+// without a password prompt. Scoped to that single unit — every other systemd
+// unit and every other action still goes through normal admin authentication.
+//
+// Installed to /usr/share/polkit-1/rules.d/10-hifi-share.rules (JS rules backend,
+// as used by modern polkit on systemd postmarketOS).
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "hifi-share.service" &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

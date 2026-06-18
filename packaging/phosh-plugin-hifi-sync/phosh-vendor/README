@@ -1,0 +1,33 @@
+Vendored Phosh quick-setting SDK headers
+========================================
+
+These three headers declare the GObject types this plugin subclasses/calls:
+PhoshQuickSetting (our tile's base class), PhoshStatusIcon and PhoshStatusPage.
+
+They are vendored because postmarketOS / Alpine's `phosh-dev` package ships only
+the plugin *entry-point* header (`/usr/include/phosh/phosh-plugin.h`, the
+extension-point name macros) and the `phosh-plugins.pc` directory variables — it
+does NOT install the libphosh widget API headers, and there is no linkable
+`libphosh` dev library. The widget types exist only inside the running `phosh`
+process, which provides the symbols at dlopen time; out-of-tree plugins therefore
+must carry their own declarations. (In-tree plugins get these from phosh's `src/`.)
+
+Provenance — copied byte-for-byte from upstream Phosh, tag **v0.55.0**:
+  src/quick-setting.h   src/status-icon.h   src/status-page.h
+  https://gitlab.gnome.org/World/Phosh/phosh/-/tree/v0.55.0/src
+
+Why this is ABI-safe across point releases (not just exact-version):
+  * We never touch any phosh type's fields — every call goes through accessor
+    functions (phosh_quick_setting_set_active, phosh_status_icon_set_info, …)
+    that resolve by name from the phosh process. No struct offsets are baked in.
+  * The only type we subclass is PhoshQuickSetting, whose class struct is
+    GtkBoxClass + 10 reserved vfunc slots — phosh keeps it intentionally
+    ABI-stable. GObject also takes the parent's real class/instance sizes from
+    the runtime type, not from these headers.
+  * GtkBox/GtkBin/GObject (GTK3) are frozen ABI.
+
+When to re-vendor: only on a phosh **major/toolkit** change (e.g. the GTK4 port,
+or if the QS class struct ever changes). Re-copy the three files from the matching
+phosh tag and bump the version note in ../meson.build. The package build is
+best-effort (APKBUILD build() skips the tile if the SDK/toolkit no longer matches),
+so a mismatch degrades to "no curtain tile" — the share still works via hifi-share.

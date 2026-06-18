@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use player_core::{
-    is_dsd_path, open_dsd, play_queue_blocking, run_playback, AlsaFmt, Decoder, Event, Flow,
-    DEFAULT_PERIOD, DEFAULT_PERIODS,
+    is_dsd_path, open_dsd, play_queue_blocking, run_playback, AlsaFmt, Decoder, DsdSource, Event,
+    Flow, DEFAULT_PERIOD, DEFAULT_PERIODS,
 };
 
 use crate::cmd::max_frames;
@@ -117,7 +117,13 @@ fn play_dsd(file: &Path, device: &str) -> player_core::Result<()> {
     Ok(())
 }
 
-pub fn dump(file: &Path, out: Option<&Path>, start: f64, seconds: f64) -> player_core::Result<()> {
+pub fn dump(
+    file: &Path,
+    out: Option<&Path>,
+    start: f64,
+    seconds: f64,
+    rewind: Option<f64>,
+) -> player_core::Result<()> {
     let mut sink: Box<dyn Write> = match out {
         Some(p) => Box::new(io::BufWriter::new(std::fs::File::create(p)?)),
         None => Box::new(io::BufWriter::new(io::stdout().lock())),
@@ -130,42 +136,77 @@ pub fn dump(file: &Path, out: Option<&Path>, start: f64, seconds: f64) -> player
         let mut src = open_dsd(file, None)?;
         let dspec = src.spec();
         let dop_rate = f64::from(dspec.dsd_rate / 16); // DoP PCM frame rate
+        // 1 DoP frame carries 16 DSD bits/ch = 2 bytes/ch of native DSD.
+        let cap_bytes = (seconds > 0.0)
+            .then(|| (seconds * dop_rate) as u64 * 2 * u64::from(dspec.channels.max(1)));
         if start > 0.0 {
             // Seek is best-effort: sources that can't seek return None — then we
             // just stream from the top (still bounded by `--seconds`).
             let _ = src.seek((start * dop_rate) as u64)?;
         }
-        // 1 DoP frame carries 16 DSD bits/ch = 2 bytes/ch of native DSD.
-        let cap_bytes = (seconds > 0.0)
-            .then(|| (seconds * dop_rate) as u64 * 2 * u64::from(dspec.channels.max(1)));
-        let mut buf: Vec<u8> = Vec::new();
-        let mut written: u64 = 0;
-        while src.next(&mut buf)? {
-            let mut chunk: &[u8] = &buf;
-            if let Some(cap) = cap_bytes {
-                let remaining = cap.saturating_sub(written) as usize;
-                if remaining == 0 {
-                    break;
-                }
-                if chunk.len() > remaining {
-                    chunk = &chunk[..remaining];
-                }
-            }
-            sink.write_all(chunk)?;
-            written += chunk.len() as u64;
+        dsd_pass(&mut *src, &mut *sink, cap_bytes)?;
+        // Optional rewind: seek BACK and decode again — exercises the SACD .iso
+        // sparse frame→sector backward-seek index (or the .dsf/.dff byte rewind).
+        if let Some(r) = rewind {
+            let _ = src.seek((r * dop_rate) as u64)?;
+            dsd_pass(&mut *src, &mut *sink, cap_bytes)?;
         }
         sink.flush()?;
         return Ok(());
     }
     let mut dec = Decoder::open(file)?;
+    let limit = (seconds > 0.0).then(|| (seconds * f64::from(dec.spec.rate)) as u64);
     // Seek first (resets decoder + sample buffer), then arm the frame limit so
     // `next()` stops after exactly `seconds` of audio from the seek point.
     if start > 0.0 {
         dec.seek(Duration::from_secs_f64(start))?;
     }
-    if seconds > 0.0 {
-        dec.set_limit((seconds * f64::from(dec.spec.rate)) as u64);
+    if let Some(l) = limit {
+        dec.set_limit(l);
     }
+    pcm_pass(&mut dec, &mut *sink)?;
+    if let Some(r) = rewind {
+        dec.seek(Duration::from_secs_f64(r))?;
+        if let Some(l) = limit {
+            dec.set_limit(l); // re-arm: set_limit resets the per-pass frame counter
+        }
+        pcm_pass(&mut dec, &mut *sink)?;
+    }
+    sink.flush()?;
+    Ok(())
+}
+
+/// One bounded DSD decode pass from the source's current position. `cap_bytes`
+/// limits native-DSD bytes written (None = to EOF). Pure: writes only what it
+/// decodes, so a `--start`/`--rewind` pass never alters a sample.
+fn dsd_pass(
+    src: &mut dyn DsdSource,
+    sink: &mut dyn Write,
+    cap_bytes: Option<u64>,
+) -> player_core::Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut written: u64 = 0;
+    while src.next(&mut buf)? {
+        let mut chunk: &[u8] = &buf;
+        if let Some(cap) = cap_bytes {
+            let remaining = cap.saturating_sub(written) as usize;
+            if remaining == 0 {
+                break;
+            }
+            if chunk.len() > remaining {
+                chunk = &chunk[..remaining];
+            }
+        }
+        sink.write_all(chunk)?;
+        written += chunk.len() as u64;
+    }
+    Ok(())
+}
+
+/// One PCM decode pass from the decoder's current position (re-arm the frame
+/// limit via `set_limit` before calling for a bounded pass). Writes interleaved
+/// full-scale s32le.
+fn pcm_pass(dec: &mut Decoder, sink: &mut dyn Write) -> player_core::Result<()> {
     let mut block: Vec<i32> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     while dec.next(&mut block)? {
@@ -175,7 +216,6 @@ pub fn dump(file: &Path, out: Option<&Path>, start: f64, seconds: f64) -> player
         }
         sink.write_all(&buf)?;
     }
-    sink.flush()?;
     Ok(())
 }
 

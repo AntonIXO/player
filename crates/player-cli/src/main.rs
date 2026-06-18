@@ -57,6 +57,13 @@ enum Cmd {
         /// decodes — e.g. a large SACD .iso — without altering any sample.
         #[arg(long, default_value_t = 0.0)]
         seconds: f64,
+        /// After the first (bounded) decode, seek BACK to this offset (seconds)
+        /// and decode again. Exercises the backward-seek / rewind path — e.g. the
+        /// SACD .iso sparse frame→sector index or the .dsf/.dff byte-offset rewind.
+        /// Off by default; like --start/--seconds it only changes where we decode,
+        /// never a sample.
+        #[arg(long)]
+        rewind: Option<f64>,
     },
 
     /// Play through snd-aloop and capture it back, then byte-compare.
@@ -144,7 +151,8 @@ fn main() -> ExitCode {
             out,
             start,
             seconds,
-        } => cmd::audio::dump(&file, out.as_deref(), start, seconds),
+            rewind,
+        } => cmd::audio::dump(&file, out.as_deref(), start, seconds, rewind),
         Cmd::LoopbackVerify {
             file,
             out,

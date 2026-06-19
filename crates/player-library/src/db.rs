@@ -177,10 +177,12 @@ pub const TRACK_COLS: &str = "track.id, track.path, track.folder, track.title, t
 /// Build a `Track` from a row selected with [`TRACK_COLS`] (in order).
 pub fn row_to_track(r: &rusqlite::Row) -> rusqlite::Result<crate::model::Track> {
     let path: String = r.get(1)?;
+
+
     // Whole-file tracks store NULL source_path; fall back to `path` so the engine
     // always has a real file to decode.
     let source_path = r
-        .get::<_, Option<String>>(18)?.map_or_else(|| path.clone().into(), Into::into);
+        .get::<_, Option<String>>(18)?.map(Into::into);
     Ok(crate::model::Track {
         id: r.get(0)?,
         path: path.into(),

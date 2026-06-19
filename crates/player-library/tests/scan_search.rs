@@ -109,7 +109,7 @@ fn cue_sheet_splits_into_tracks() {
     assert_eq!(second.start_ms, Some(1000));
     assert!(second.duration_ms.unwrap() >= 1500, "track 2 runs to file end");
     assert!(
-        first.source_path.ends_with("album.flac") && second.source_path.ends_with("album.flac"),
+        first.source_path.as_ref().unwrap_or(&first.path).ends_with("album.flac") && second.source_path.as_ref().unwrap_or(&second.path).ends_with("album.flac"),
         "cue tracks decode the referenced file"
     );
     assert!(first.cue_range().is_some(), "cue track exposes a decode range");

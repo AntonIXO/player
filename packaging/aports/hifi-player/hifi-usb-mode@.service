@@ -1,0 +1,10 @@
+[Unit]
+Description=Switch USB port mode (%i = audio|charge|sync) for the bit-perfect player
+# Runs the privileged role / VBUS / gadget work as root. Triggered on demand by the
+# Phosh "USB mode" curtain tile via a scoped polkit rule (10-hifi-usb-mode.rules) —
+# never enabled at boot. hifi-player-audio-setup owns the boot default (audio/host).
+After=hifi-player-audio-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hifi-usb-mode %i

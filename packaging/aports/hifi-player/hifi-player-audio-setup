@@ -10,16 +10,22 @@
 set -u
 
 start() {
-	# 1. Force DWC3 into USB host mode. USB OTG is officially "Broken" on
-	#    beryllium; this is the community workaround that lets the Mojo 2
-	#    enumerate. Try debugfs first, then the sysfs role interfaces.
-	for f in /sys/kernel/debug/usb/*/mode; do
-		[ -e "$f" ] && echo host > "$f" 2>/dev/null
-	done
-	for r in /sys/bus/platform/devices/a600000.dwc3/usb_role \
-	         /sys/class/usb_role/*/role; do
-		[ -e "$r" ] && echo host > "$r" 2>/dev/null
-	done
+	# 1. Enter USB host mode + power the OTG VBUS so the Mojo 2 enumerates. The
+	#    controller is dual-role (dr_mode=otg + dwc3 role-switch, kernel patch
+	#    0002) with host as the boot default; host is re-asserted here, and the
+	#    PMI8998 VBUS boost (patch 0005) is switched on. The shared hifi-usb-mode
+	#    helper owns that (role=host + enable the VBUS regulator-output); fall back
+	#    to a bare role write so this script still works standalone.
+	if [ -x /usr/bin/hifi-usb-mode ]; then
+		/usr/bin/hifi-usb-mode usb-host 2>/dev/null || true
+	else
+		for r in /sys/class/usb_role/*/role; do
+			[ -e "$r" ] && echo host > "$r" 2>/dev/null
+		done
+		for f in /sys/kernel/debug/usb/*/mode; do
+			[ -e "$f" ] && echo host > "$f" 2>/dev/null
+		done
+	fi
 
 	# 2. Performance governor on the Kryo 385 Gold cores (CPUs 4-7) so DVFS
 	#    ramp-up never starves the SCHED_FIFO audio thread; little cores stay

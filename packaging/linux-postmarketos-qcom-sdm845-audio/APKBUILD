@@ -10,8 +10,8 @@ maintainer="Casey Connolly <kcxt@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm845"
 pkgname=linux-$_flavor-audio
 pkgver=7.1_rc1
-pkgrel=7
-pkgdesc="Mainline SDM845 kernel for beryllium audio player (forced USB host + PMI8998 VBUS + RT/USB-audio tuning)"
+pkgrel=8
+pkgdesc="Mainline SDM845 kernel for beryllium audio player (switchable USB DRD host-first + PMI8998 VBUS + RT/USB-audio tuning)"
 provides="linux-$_flavor=$pkgver-r$pkgrel"
 replaces="linux-$_flavor"
 arch="aarch64"
@@ -96,10 +96,10 @@ package() {
 
 sha512sums="
 94da173aaf74dd33ef8ff9015e92759481cd0da5bd8a1e52c8664fd372d48a1155655001ad2e9d26557733c71ae8bc448e4ebdf1372b8f32159907a35f0306a9  linux-sdm845-7.1-rc1-r0.tar.gz
-1213b238969ee9d64e90a5ee3bcca8e309993aefe91b4feb4d5399f3bcdd155c12cfe6112f815975fbf9d4ddde7003f2bf361a779794a2d9069b682731d38213  config-postmarketos-qcom-sdm845.aarch64
-1675f923a444d47899d0848cd1280433166323ff0243e47b54e82634e83e040240b1de0d6b1a40a8669d1c9a66bfd8f00940807222856de116595e0e1ba92b3d  0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
+4b233ca896d2f055f979f657c623edf0f94300a5261aa28dfe4d77dcb4fb8ca9e1d0f08379f65a39b385dcef32cb03df7ac27a6bf087f13712431f95f57e8baa  config-postmarketos-qcom-sdm845.aarch64
+72394d24413387ade6f2cf497228d4d11d0683a1012cba321306c808f63d45fb42988c0b6ce19575d2880f58c15e5c405e9c6616df465f34dd8c3c54f421cb42  0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
 8232c4f7a428310426f020cd372a7821711e0407cf09951cd3ccc0f4a83a8236332af2d88bf0708f320ce28fb2585f9a5e5c29785d6e756a904336caa43425f9  0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
 b7ae73767e18ae0d5da0f06cf541697a3e0d586864c20ed8f0c36dea61401030c56179bcd10486bd5f56a624d7c66d6f592822560302d4970071f50bf89be480  0004-regulator-qcom_usb_vbus-regulator-add-pmi8998-support.patch
-15358e6f5f069987e076b05def18c52be85e261b6d6bdad50f222c18b17bd23ecddf46148a20c891e738b8bb5cf25159ef7adef73e5004eb85704799051f7757  0005-arm64-dts-qcom-sdm845-xiaomi-beryllium-self-power-usb-host-vbus.patch
+c83af906eed5cedb19f47122926b9f4988e0605f0e4062ea6d6a8433c095565fe45cf3dde86b8b754cc20a6e777c1fcc34f576852b247a06e2c3169b084c0f44  0005-arm64-dts-qcom-sdm845-xiaomi-beryllium-self-power-usb-host-vbus.patch
 77a298d7480fb1cc584f69c99726131204eb346fafa56155aec459a59b6066722a7b85493311d745873f5fe55128420d607d3db52989bdb43f9d27b37d5537e4  0006-sound-usb-tune-usb-audio-compiler-flags.patch
 "

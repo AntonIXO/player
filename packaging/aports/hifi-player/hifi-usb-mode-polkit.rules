@@ -1,0 +1,19 @@
+// Polkit rule for the runtime USB port-mode switch.
+//
+// Let the ACTIVE LOCAL session user start the templated hifi-usb-mode@<mode>.service
+// units (audio / charge / sync), so the unprivileged Phosh "USB mode" curtain tile can
+// flip the USB port between powering the DAC, charging, and wired sync without a
+// password prompt. Scoped to that one template — every other systemd unit and every
+// other action still goes through normal admin authentication.
+//
+// Installed to /usr/share/polkit-1/rules.d/10-hifi-usb-mode.rules (JS rules backend,
+// as used by modern polkit on systemd postmarketOS).
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.local && subject.active) {
+        var unit = action.lookup("unit");
+        if (unit && unit.indexOf("hifi-usb-mode@") === 0 && /\.service$/.test(unit)) {
+            return polkit.Result.YES;
+        }
+    }
+});

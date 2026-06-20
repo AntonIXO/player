@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=11
+pkgrel=13
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -89,6 +89,9 @@ source="
 	hifi-share-avahi.service
 	hifi-share-sshd.conf
 	hifi-share-polkit.rules
+	hifi-usb-mode
+	hifi-usb-mode@.service
+	hifi-usb-mode-polkit.rules
 	zz-hifi-sync.gschema.override
 "
 builddir="$srcdir/$pkgname-$pkgver"
@@ -499,15 +502,18 @@ build() {
 
 	_bitperfect_gate || return 1
 
-	# --- Phosh quick-settings plugin (the system-curtain "Music sync" button) ----
-	# Out-of-tree GModule under packaging/phosh-plugin-hifi-sync/ (GTK3 + libhandy).
-	# pmOS phosh-dev ships only the entry-point header + the phosh-plugins.pc dir
-	# vars; the widget headers (quick-setting.h …) are vendored in phosh-vendor/ and
-	# the symbols resolve from the running phosh at dlopen time. BEST-EFFORT: skipped
-	# (tile absent, share still works headless via `hifi-share`) if the SDK is missing
-	# or phosh is outside the vendored ABI range. package() installs the built tree.
-	_plugin_build="$builddir/target/phosh-plugin"
-	rm -rf "$_plugin_build"
+	# --- Phosh quick-settings plugins (the system-curtain tiles) -----------------
+	# Out-of-tree GModules under packaging/phosh-plugin-*/ (GTK3 + libhandy): hifi-sync
+	# (the "Music sync" share button) and hifi-usb (the Audio/Charging/Sync USB-mode
+	# switch). pmOS phosh-dev ships only the entry-point header + the phosh-plugins.pc
+	# dir vars; the widget headers (quick-setting.h …) are vendored per-plugin in
+	# phosh-vendor/ and the symbols resolve from the running phosh at dlopen time.
+	# BEST-EFFORT: a plugin that can't build is skipped (its tile absent, the share +
+	# USB switch still work headless via hifi-share / hifi-usb-mode) and the whole
+	# block is skipped if the SDK is missing or phosh is outside the vendored ABI band.
+	# package() installs whichever plugin trees built.
+	_plugin_out="$builddir/target/phosh-plugin"
+	rm -rf "$_plugin_out"
 	if command -v meson >/dev/null 2>&1 && pkg-config --exists phosh-plugins 2>/dev/null; then
 		_phosh_ver=$(pkg-config --modversion phosh-plugins 2>/dev/null || echo '?')
 		# Vendored headers (phosh-vendor/) track phosh 0.55.0's GTK3 QS ABI. The QS
@@ -515,19 +521,21 @@ build() {
 		# the whole 0.4x–0.x band; a 1.x / GTK4 phosh needs re-vendored headers.
 		if pkg-config --atleast-version=0.40 phosh-plugins 2>/dev/null \
 		   && ! pkg-config --atleast-version=1.0 phosh-plugins 2>/dev/null; then
-			msg "Building Phosh quick-settings plugin (hifi-sync) against phosh $_phosh_ver"
-			if meson setup "$_plugin_build" packaging/phosh-plugin-hifi-sync \
-				--prefix=/usr --libdir=lib && meson compile -C "$_plugin_build"; then
-				msg "Phosh plugin built"
-			else
-				warning "Phosh plugin build failed — skipping curtain tile (share still works via hifi-share)"
-				rm -rf "$_plugin_build"
-			fi
+			for _plug in hifi-sync hifi-usb; do
+				msg "Building Phosh quick-settings plugin ($_plug) against phosh $_phosh_ver"
+				if meson setup "$_plugin_out/$_plug" "packaging/phosh-plugin-$_plug" \
+					--prefix=/usr --libdir=lib && meson compile -C "$_plugin_out/$_plug"; then
+					msg "Phosh plugin $_plug built"
+				else
+					warning "Phosh plugin $_plug build failed — skipping that curtain tile (headless control still works)"
+					rm -rf "$_plugin_out/$_plug"
+				fi
+			done
 		else
-			warning "phosh $_phosh_ver is outside the vendored QS ABI range (phosh-vendor/ targets 0.55.0) — skipping curtain tile; re-vendor headers for this release. Share still works via hifi-share."
+			warning "phosh $_phosh_ver is outside the vendored QS ABI range (phosh-vendor/ targets 0.55.0) — skipping curtain tiles; re-vendor headers for this release. Share/USB switch still work headless."
 		fi
 	else
-		warning "phosh-plugins SDK not found — skipping curtain tile (install phosh-dev or build against the Phosh source); share still works via hifi-share"
+		warning "phosh-plugins SDK not found — skipping curtain tiles (install phosh-dev or build against the Phosh source); share/USB switch still work headless"
 	fi
 }
 
@@ -577,10 +585,27 @@ package() {
 	install -Dm644 "$srcdir"/hifi-share-polkit.rules \
 		"$pkgdir"/usr/share/polkit-1/rules.d/10-hifi-share.rules
 
-	# Phosh quick-settings plugin (.so + .plugin), only when build() produced it.
-	# The gschema override (which makes the tile appear by default) ships with it.
-	if [ -d "$builddir/target/phosh-plugin" ]; then
-		DESTDIR="$pkgdir" meson install --no-rebuild -C "$builddir/target/phosh-plugin"
+	# Runtime USB port-mode switch (Audio / Charging / Sync): the control script,
+	# the templated on-demand unit the curtain tile triggers, and the scoped polkit
+	# rule that lets the session user start ONLY hifi-usb-mode@<mode>.service.
+	install -Dm755 "$srcdir"/hifi-usb-mode \
+		"$pkgdir"/usr/bin/hifi-usb-mode
+	install -Dm644 "$srcdir"/hifi-usb-mode@.service \
+		"$pkgdir"/usr/lib/systemd/system/hifi-usb-mode@.service
+	install -Dm644 "$srcdir"/hifi-usb-mode-polkit.rules \
+		"$pkgdir"/usr/share/polkit-1/rules.d/10-hifi-usb-mode.rules
+
+	# Phosh quick-settings plugins (.so + .plugin), each only when build() produced it.
+	# The gschema override (which makes the tiles appear by default) ships if any built.
+	_plugin_out="$builddir/target/phosh-plugin"
+	_have_plugin=
+	for _plug in hifi-sync hifi-usb; do
+		if [ -d "$_plugin_out/$_plug" ]; then
+			DESTDIR="$pkgdir" meson install --no-rebuild -C "$_plugin_out/$_plug"
+			_have_plugin=1
+		fi
+	done
+	if [ -n "$_have_plugin" ]; then
 		install -Dm644 "$srcdir"/zz-hifi-sync.gschema.override \
 			"$pkgdir"/usr/share/glib-2.0/schemas/zz-hifi-sync.gschema.override
 	fi
@@ -609,11 +634,11 @@ package() {
 # Generated with `sha512sum` over the source= files (regenerate after any edit
 # with `pmbootstrap checksum hifi-player` or `abuild checksum`).
 sha512sums="
-ec9d3b95ff0338601729ac8a305ae80a32dc40042cc5d316f2fea4a3379f29c9e9f3bba1bc11ea59fd69fd0591451cab42ab8f61cbebe7935e4bb36cd2d57bbc  hifi-player-audio-setup
+6513ee08009b3feef1e06acd93673d0371769206a39ee0c303928e33e50694a35a81aa155becb8d63eb070efd97809623a490c7c7eb894ce2712ccfb820c4d76  hifi-player-audio-setup
 faff1c8006f71863df0f2efc0ad2a7392e4bf045f531a9a17cdfcb8f1997f23f460b6f62d24fc7e0efa6a621a7e2e9031924549448550d0eb41ac6cf71504f03  hifi-player-audio-setup.service
-1c1a6eff0162ddbf21ef9db450307b81086867197e7b613075d92dbe59112c0a530827334dc0cd798c8c173c6509bbb6ae15fb746c51920ae70ee1203b834a0b  hifi-player-sleep-hook
+e9c7f0f347ff58c8b41400e8fc3c4c0953e9dd72d1618a2aa09aac0dd5775fc6d28f84f4040eb8dc31466ea60361bd03c747aae277a642e828ed0371cd7f395a  hifi-player-sleep-hook
 640b1c10c767e9972250338743eeb49164edcdde0b11d19fc299d39daa262df4de5922d7e31a20b2c25e4d62a45973d07a49e4e95990b0cca9887da5600a4d91  hifi-player.preset
-021da27d848da5d7405ed03d0ba711448ff04f6b4c2847ca8e7bd819b2195bd0372bc946e1dd98a43f3bbfc4d279783fb60033d239a92288d6311b4ec769bfff  hifi-player.desktop
+7db076b36c21b7ff385a808a7c60755bdd94b092088ac67b5f853d98fa517039e41433fd6b0e90d9c36cf4d4bd16490dfd4688b5421214bcf5fa0860e7d582b8  hifi-player.desktop
 07e2281d300d92ef337eca966b7c20f55174c21f100f877c1b74ac9fe2ac9f0f0f2be51c2694716c4258311b0a8e742751b12f21bae802b309ec0073f605560a  hifi-player.svg
 4818d2539c8af4246e4672d2ab93fa13a8bc9548870fa06bcc30a38ded52232c36aff08ba01a55bf21692137f730a230f673d8579533e5cc02548cf3955d3cc3  99-mojo2-nopulse.rules
 3928ceae0a348105d6595d624284f6e3e4acff589a49c65cfb2fe33cba00253d39805b84192bb40def6d6219abe114514eece9c228d5dd0efcfc50aeea1669b4  99-cpu-dma-latency.rules
@@ -622,11 +647,14 @@ c1b4bb607f324b34004a36df2cc3a3cfd8e2509767dcb08f0393bd4977986943e73c95fa606572d3
 6fbb68c10725124c2fa2fc699afea3b641af3fd1f6e849c8766766126176915e4f4ded5e53c47412fe6a1ac00918680a5ba92aaeb801c2333960a356da0fc735  audio.conf
 25cd112f526c6ddaf8b48b0e5786e643b7b1ae66b4425b7db97db8b501245bdf1f769e913aa22bdd7718f2742ec2eedf81e9be24fd30b8d1a7645eb07c0e4af0  99-audio-sysctl.conf
 57b152060e7b17b69201dda2ce81de76a5acac26b6132f1823f3eb95512bb7f56145ac5a63650213a3261ed3152dd341d96f211822b337811a8bfc16fcab496b  90-audio-cmdline.conf
-90f943b51d78e71a3a4e51ef7bcb48b6c181996d4a236dd8684bed4c6b97afe3f17b492ad2d784351d342b6446ff94958cbe8251a4ba07c5fc0794275f47bd14  hifi-share
+56030ddecae77b64956e9374404fcf12f692f1d2dd5a0128447ac138d1b1ce16a55e702338dc9d04261487bd636e4ec2de1d1d4f12655a85770c79b2650f8b17  hifi-share
 9b56e6941b00aff186bf67c51aa541a2fd5d7c8bbee89c100c5d72bfe1821a904a793b918cd4c906aea5144f1861b34b42648477582e4ece143f450a78a194e5  hifi-share.service
 7c4bca0302f974e9340f09ebc1891880cc92bfa4f323a1bd15d1332053039f53d76c723892268fc4b82dabe422de93cea0a13e2ba4993fb4ac8acb4010725718  hifi-share.conf
 073fb919320c1bfad914f4c1b4b9e6f770147f42f91e93f6c48267ef2fedbb70fc0bf60401f57556bb7d0ada2271db891093f534c498c4887ec61d89fd82634b  hifi-share-avahi.service
 2e9f1377dc55765aa454dcef792fe5c698b4d07c601c0c13b3e53a7495a3ce92da88d62f6e042b40eebf732f981709817c21fac5571d3771b3c65081a7547ad1  hifi-share-sshd.conf
 e4f3754207a1b1bacfd921c87bad4b8ebf11df5a72ad9aa9f7d27c40c67219981c94c24fc5b03f642182e1b129e00c52d5871a2c9adba655187394eb8c042abd  hifi-share-polkit.rules
-97df1dc6bf8929fe2f2f8e902bcd403ee58b1f019437a26b3b6a585130bbf8e8e4726f5b00e7c47d28cfed75483d3163ea8ab7e7094689c74218b711409e2e16  zz-hifi-sync.gschema.override
+4c26028cd1d443a49e0f303dbbc45dd404834277755467ddcc2e32d9602e4af3c8712e20dcd1cd4391ca22fd9fc0eadc250ee66be1eb235fabc5c950405b85db  hifi-usb-mode
+547e8a5c554d2e8709c77807723955b7fd3320ef113e936165003fd009962d751cf61185addf4c044f7689f8b0b41c56834034f39e9549429b3e3c0627f4d898  hifi-usb-mode@.service
+d5c7d79ebe875abb92081e0b5d0b9a168d6a1b9a4560b04f91179fa1a807754c5357150951369aa042253461a801c22f4397e613c460f495e3cef520ed35fb2f  hifi-usb-mode-polkit.rules
+6ac4398ef8bea35dd75542ee21b76e5716040996d0a8bfef25445b69a2678e70a3e50c50d5cbf7bc3fd8659112b308180f29cfa7197bd9918af762bf9c6aa369  zz-hifi-sync.gschema.override
 "

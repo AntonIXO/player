@@ -1,7 +1,9 @@
-# Make the "Music sync" quick-setting plugin appear in the Phosh system-curtain by
-# default. `quick-settings` lists CUSTOM plugin tiles only (the built-in Wi-Fi /
-# Bluetooth / torch toggles are unaffected), so adding ours doesn't remove anything.
-# Named zz- so it applies after any other override; a user choosing plugins in
-# Settings writes dconf, which still wins over this default.
+# Make the player's quick-setting plugins appear in the Phosh system-curtain by
+# default: "Music sync" (hifi-sync) and "USB mode" (hifi-usb). `quick-settings` lists
+# CUSTOM plugin tiles only (the built-in Wi-Fi / Bluetooth / torch toggles are
+# unaffected), so adding ours doesn't remove anything. Named zz- so it applies after
+# any other override; a user choosing plugins in Settings writes dconf, which still
+# wins over this default. A listed tile whose plugin failed to build is simply absent
+# (phosh logs "not found"), never fatal.
 [sm.puri.phosh.plugins]
-quick-settings=['hifi-sync']
+quick-settings=['hifi-sync', 'hifi-usb']

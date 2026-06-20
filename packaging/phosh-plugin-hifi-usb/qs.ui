@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Phosh is GTK3 + libhandy. The tile opens its status page (on_clicked) which
+     holds three buttons to pick the USB port mode; the bindings match the base class. -->
+<interface>
+  <requires lib="gtk+" version="3.24"/>
+  <template class="PhoshHifiUsbQuickSetting" parent="PhoshQuickSetting">
+    <property name="status-icon">info</property>
+    <property name="status-page">status_page</property>
+    <signal name="clicked" handler="on_clicked" object="PhoshHifiUsbQuickSetting" swapped="yes"/>
+  </template>
+  <object class="PhoshStatusIcon" id="info">
+    <property name="visible">1</property>
+    <property name="pixel-size">16</property>
+  </object>
+  <object class="PhoshStatusPage" id="status_page">
+    <property name="visible">1</property>
+    <property name="title" translatable="yes">USB port mode</property>
+    <property name="content">content</property>
+  </object>
+  <object class="GtkBox" id="content">
+    <property name="visible">1</property>
+    <property name="orientation">vertical</property>
+    <property name="spacing">6</property>
+    <property name="margin-start">12</property>
+    <property name="margin-end">12</property>
+    <property name="margin-top">6</property>
+    <property name="margin-bottom">6</property>
+    <child>
+      <object class="GtkButton" id="btn_audio">
+        <property name="visible">1</property>
+        <property name="label" translatable="yes">Audio — power the DAC</property>
+        <signal name="clicked" handler="on_mode_audio" object="PhoshHifiUsbQuickSetting" swapped="yes"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkButton" id="btn_charge">
+        <property name="visible">1</property>
+        <property name="label" translatable="yes">Charging</property>
+        <signal name="clicked" handler="on_mode_charge" object="PhoshHifiUsbQuickSetting" swapped="yes"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkButton" id="btn_sync">
+        <property name="visible">1</property>
+        <property name="label" translatable="yes">Sync over USB</property>
+        <signal name="clicked" handler="on_mode_sync" object="PhoshHifiUsbQuickSetting" swapped="yes"/>
+      </object>
+    </child>
+    <child>
+      <object class="GtkLabel" id="label">
+        <property name="visible">1</property>
+        <property name="justify">center</property>
+        <property name="wrap">1</property>
+        <property name="margin-top">6</property>
+        <property name="label" translatable="yes">Choose what the USB-C port does. Stop playback before leaving Audio.</property>
+      </object>
+    </child>
+  </object>
+</interface>

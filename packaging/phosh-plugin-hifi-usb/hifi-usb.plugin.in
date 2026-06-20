@@ -1,0 +1,7 @@
+[Plugin]
+# Translators: This is an internal id, no need to translate it
+Id=@name@
+Name=USB Mode
+Types=quick-setting;
+Comment=Switch the USB-C port between powering the DAC, charging, and wired sync
+Plugin=@plugins_dir@/libphosh-plugin-@name@.so

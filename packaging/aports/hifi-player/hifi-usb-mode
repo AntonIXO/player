@@ -1,0 +1,260 @@
+#!/bin/sh
+# Runtime USB port-mode switch for the bit-perfect player (Poco F1 / beryllium).
+#
+# The USB-C port is one of three mutually-exclusive things at a time:
+#
+#   audio   host role  + OTG VBUS on   -> powers + enumerates the USB DAC (default)
+#   charge  device role + VBUS off     -> a wall charger charges the phone
+#   sync    device role + VBUS off     -> USB-networking gadget + the music-sync SFTP
+#                                          share over the cable (fast wired push to
+#                                          internal ~/Music AND the SD card ~/sdcard)
+#
+# How it works (see kernel patches 0002/0005 and CLAUDE.md):
+#   * role: dr_mode=otg + the dwc3 USB role-switch (patch 0002, host-first default)
+#     expose /sys/class/usb_role/<dev>/role; we write host|device manually (beryllium
+#     has no working Type-C controller, so the *manual* DRD path is the one that works).
+#   * VBUS: the PMI8998 OTG boost (patch 0005) is a plain regulator whose sole consumer
+#     is a regulator-output userspace node, so VBUS is switched by writing its sysfs
+#     "state" (enabled|disabled). (Bind/unbind can't do it: an always-on rail can't be
+#     disabled and unbinding leaves OTG_EN set.) The boost MUST be off in device mode or
+#     it would fight the wall charger's 5 V.
+#   * charge: the PMI8998 charger + fuel gauge are already enabled in the beryllium DT;
+#     once the port is a device with VBUS off, charging just works.
+#
+# Privilege: the privileged work (role / VBUS / gadget) runs as root via
+# hifi-usb-mode@<mode>.service; the Phosh curtain tile triggers that through a scoped
+# polkit rule and reads state with the unprivileged `status` (sysfs reads only). The
+# sleep hook re-applies the saved mode (/run/hifi-usb-mode) on resume. Every step
+# degrades quietly so a missing node never aborts the switch.
+#
+# Bit-perfect / burst safety: leaving audio tears the DAC's stream down, so charge/sync
+# REFUSE while a USB-audio substream is open (playing or held by the keep-alive pause) —
+# stop playback first. No sample path is ever touched.
+set -u
+
+CONF=/etc/hifi-share.conf
+STATE=/run/hifi-usb-mode                 # tmpfs: survives s2idle, cleared on reboot
+GADGET=/sys/kernel/config/usb_gadget/hifi
+SYNC_IP=172.16.42.1
+
+[ -r "$CONF" ] && . "$CONF"
+
+log() { logger -t hifi-usb-mode "$@" 2>/dev/null || true; }
+
+share_user() {
+	_u="${SHARE_USER:-}"
+	[ -n "$_u" ] || _u=$(awk -F: '$3>=1000 && $3<65000 {print $1; exit}' /etc/passwd 2>/dev/null)
+	echo "${_u:-user}"
+}
+
+# --- USB role (manual DRD via the dwc3 role-switch) ---------------------------
+
+role_set() {
+	for r in /sys/class/usb_role/*/role; do
+		[ -e "$r" ] && echo "$1" > "$r" 2>/dev/null
+	done
+	# Legacy debugfs fallback (older trees expose .../mode for host).
+	if [ "$1" = host ]; then
+		for f in /sys/kernel/debug/usb/*/mode; do
+			[ -e "$f" ] && echo host > "$f" 2>/dev/null
+		done
+	fi
+}
+
+role_get() {
+	for r in /sys/class/usb_role/*/role; do
+		[ -r "$r" ] && { cat "$r" 2>/dev/null; return; }
+	done
+}
+
+# --- OTG VBUS boost (regulator-output userspace consumer; kernel patch 0005) --
+# The boost is a plain regulator whose only consumer is a regulator-output node;
+# its sysfs "state" file (reg-userspace-consumer driver) takes enabled|disabled.
+
+vbus_state_file() {
+	for s in /sys/bus/platform/drivers/reg-userspace-consumer/*/state \
+	         /sys/devices/platform/*vbus-output*/state; do
+		[ -w "$s" ] && { echo "$s"; return; }
+	done
+}
+
+vbus_on() {
+	_s=$(vbus_state_file)
+	[ -n "$_s" ] || { log "VBUS control (regulator-output) not found"; return 1; }
+	echo enabled > "$_s" 2>/dev/null && log "VBUS on" || { log "VBUS enable failed"; return 1; }
+}
+
+vbus_off() {
+	_s=$(vbus_state_file)
+	[ -n "$_s" ] || return 0
+	echo disabled > "$_s" 2>/dev/null && log "VBUS off" || log "VBUS disable failed"
+}
+
+# --- USB-networking gadget (sync mode) ----------------------------------------
+
+gadget_up() {
+	modprobe libcomposite 2>/dev/null || true
+	[ -d /sys/kernel/config/usb_gadget ] \
+		|| mount -t configfs none /sys/kernel/config 2>/dev/null || true
+	[ -d /sys/kernel/config/usb_gadget ] || { log "configfs/usb_gadget unavailable"; return 1; }
+	[ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ] && return 0  # already bound/up
+
+	mkdir -p "$GADGET" 2>/dev/null || return 1
+	echo 0x1d6b > "$GADGET/idVendor"     2>/dev/null || true  # Linux Foundation
+	echo 0x0104 > "$GADGET/idProduct"    2>/dev/null || true  # Multifunction Composite
+	echo 0x0200 > "$GADGET/bcdUSB"       2>/dev/null || true
+	echo 0x0100 > "$GADGET/bcdDevice"    2>/dev/null || true
+	mkdir -p "$GADGET/strings/0x409" 2>/dev/null || true
+	_sn=$(cut -c1-16 /etc/machine-id 2>/dev/null); : "${_sn:=0123456789abcdef}"
+	echo "hifi-player"        > "$GADGET/strings/0x409/manufacturer"  2>/dev/null || true
+	echo "Poco F1 music sync" > "$GADGET/strings/0x409/product"       2>/dev/null || true
+	echo "$_sn"               > "$GADGET/strings/0x409/serialnumber"  2>/dev/null || true
+	mkdir -p "$GADGET/configs/c.1/strings/0x409" 2>/dev/null || true
+	echo "NCM" > "$GADGET/configs/c.1/strings/0x409/configuration" 2>/dev/null || true
+	echo 250   > "$GADGET/configs/c.1/MaxPower"                    2>/dev/null || true
+	# NCM works out of the box on Linux/macOS hosts (the music-sync laptop). A Windows
+	# host would want rndis.usb0 instead; add it as a second function if ever needed.
+	mkdir -p "$GADGET/functions/ncm.usb0" 2>/dev/null || true
+	ln -sf "$GADGET/functions/ncm.usb0" "$GADGET/configs/c.1/" 2>/dev/null || true
+
+	_udc=$(ls /sys/class/udc 2>/dev/null | head -n1)
+	[ -n "$_udc" ] || { log "no UDC available for the gadget"; return 1; }
+	echo "$_udc" > "$GADGET/UDC" 2>/dev/null || { log "gadget UDC bind failed"; return 1; }
+
+	_ifn=$(cat "$GADGET/functions/ncm.usb0/ifname" 2>/dev/null); : "${_ifn:=usb0}"
+	ip addr add "$SYNC_IP/24" dev "$_ifn" 2>/dev/null || true
+	ip link set "$_ifn" up 2>/dev/null || true
+	log "USB-net gadget up on $_ifn ($SYNC_IP)"
+}
+
+# --- host DHCP for the sync link ----------------------------------------------
+# pmOS ships unudhcpd, a tiny single-client DHCP server pre-wired for the USB link
+# (its unit defaults to server 172.16.42.1 == SYNC_IP, client 172.16.42.2, iface
+# usb0 — matching our gadget). WITHOUT it the host enumerates the gadget but never
+# gets an address, so it can never reach the SFTP share — the gadget alone is not
+# enough. Start it in sync, stop it on teardown. Degrades quietly if absent.
+# (Note: usb-moded is broken on this mainline kernel — it tries a downstream
+# rndis_bam g1 gadget and fails — so we must NOT rely on it to start DHCP.)
+dhcp_up()   { systemctl start unudhcpd.service 2>/dev/null || true; }
+dhcp_down() { systemctl stop  unudhcpd.service 2>/dev/null || true; }
+
+gadget_down() {
+	dhcp_down
+	[ -d "$GADGET" ] || return 0
+	echo "" > "$GADGET/UDC" 2>/dev/null || true            # unbind from the controller first
+	rm -f  "$GADGET"/configs/c.1/ncm.usb0          2>/dev/null || true
+	rmdir  "$GADGET"/configs/c.1/strings/0x409     2>/dev/null || true
+	rmdir  "$GADGET"/configs/c.1                   2>/dev/null || true
+	rmdir  "$GADGET"/functions/ncm.usb0            2>/dev/null || true
+	rmdir  "$GADGET"/strings/0x409                 2>/dev/null || true
+	rmdir  "$GADGET"                                2>/dev/null || true
+	log "USB-net gadget down"
+}
+
+# True if the USB-net gadget is up. Uses the gadget netdev (world-readable, so the
+# unprivileged tile's `status` sees it too); falls back to the configfs UDC (root only).
+sync_active() {
+	for n in /sys/class/net/usb*; do [ -e "$n" ] && return 0; done
+	[ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]
+}
+
+# --- safety: is the DAC stream live? (playing, or held open by keep-alive pause) ---
+
+dac_busy() {
+	for s in /proc/asound/card*/pcm*p/sub*/status; do
+		[ -r "$s" ] || continue
+		grep -q '^state: RUNNING' "$s" 2>/dev/null && return 0
+	done
+	return 1
+}
+
+# Battery status line for the `charge` status detail.
+charge_detail() {
+	for p in /sys/class/power_supply/*/status; do
+		[ -r "$p" ] || continue
+		case "$(cat "$p" 2>/dev/null)" in
+			Charging)        echo "charging"; return ;;
+			Full)            echo "battery full"; return ;;
+			"Not charging")  echo "plug in a charger"; return ;;
+			Discharging)     echo "no charger detected"; return ;;
+		esac
+	done
+	echo "plug in a charger to charge"
+}
+
+save_mode() { echo "$1" > "$STATE" 2>/dev/null || true; }
+
+# --- composite entry points (host-first leaves, then the three modes) ---------
+
+# Leaf used by both `audio` here and hifi-player-audio-setup (no recursion).
+usb_host()   { role_set host; vbus_on; }
+usb_device() { vbus_off; role_set device; }
+
+audio() {
+	gadget_down
+	systemctl stop hifi-share.service 2>/dev/null || true
+	usb_host
+	# Re-assert governors / IRQ-RT pinning / host (idempotent) for glitch-free output.
+	[ -x /usr/bin/hifi-player-audio-setup ] \
+		&& /usr/bin/hifi-player-audio-setup start 2>/dev/null || true
+	save_mode audio
+	log "mode: audio (host + VBUS, DAC powered)"
+}
+
+charge() {
+	if dac_busy; then
+		log "refusing 'charge': a USB-audio stream is open — stop playback first"
+		return 3
+	fi
+	gadget_down
+	systemctl stop hifi-share.service 2>/dev/null || true
+	usb_device
+	# Charger + fuel gauge are DT-enabled; nudge the modules in case udev didn't autoload.
+	modprobe qcom_smb2 2>/dev/null || true
+	modprobe qcom_pmi8998_fg 2>/dev/null || true
+	save_mode charge
+	log "mode: charge (device, VBUS off — wall charger charges the phone)"
+}
+
+sync() {
+	if dac_busy; then
+		log "refusing 'sync': a USB-audio stream is open — stop playback first"
+		return 3
+	fi
+	usb_device
+	gadget_up || { log "sync: USB-net gadget setup failed"; return 1; }
+	dhcp_up   # hand the host 172.16.42.2 so it can actually reach the share
+	# Reuse the music-sync share over the cable: SD mount + ~/sdcard symlink + sshd/avahi.
+	# Root here, so start the unit directly (the WiFi half is simply not used).
+	[ -x /usr/bin/hifi-share ] && systemctl start hifi-share.service 2>/dev/null || true
+	save_mode sync
+	log "mode: sync (device, USB-net + SFTP at $SYNC_IP)"
+}
+
+# One line the curtain tile parses: "<audio|charge|sync> <human detail>". Derived from
+# the actual hardware so it always reflects reality, not just the saved intent.
+status() {
+	_role=$(role_get); : "${_role:=unknown}"
+	if [ "$_role" = host ]; then
+		if dac_busy; then
+			echo "audio host + VBUS on; DAC playing"
+		else
+			echo "audio host + VBUS on; DAC ready"
+		fi
+	elif sync_active; then
+		echo "sync USB-net up — sftp://$(share_user)@$SYNC_IP/ (internal + ~/sdcard)"
+	else
+		echo "charge device, VBUS off; $(charge_detail)"
+	fi
+}
+
+case "${1:-status}" in
+	audio)      audio ;;
+	charge)     charge ;;
+	sync)       sync ;;
+	usb-host)   usb_host ;;       # leaf for hifi-player-audio-setup (no recursion)
+	usb-device) usb_device ;;
+	status)     status ;;
+	*) echo "usage: $0 {audio|charge|sync|usb-host|usb-device|status}" >&2; exit 2 ;;
+esac
+exit $?

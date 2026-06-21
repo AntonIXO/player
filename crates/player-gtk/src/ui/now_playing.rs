@@ -221,11 +221,18 @@ pub(crate) fn update_mini(state: &SharedState, ui: &SharedUi) {
     ui.mini.set_reveal_child(has && !on_playing);
 }
 
-/// Hero-art edge length for a given window width. Scales with the screen (minus
-/// the column's side margins plus extra breathing room) but is clamped so it never
-/// overflows a true-360 device and never grows too large on a wide desktop window.
-pub(crate) fn hero_art_px(window_w: i32) -> i32 {
-    (window_w - 72).clamp(160, 300)
+/// Hero-art edge length, bounded by **both** the window width and height. Width
+/// gives side breathing room; the height bound is load-bearing: the Now Playing
+/// page never scrolls, so its cluster must fit between the header and the bottom
+/// switcher — the rest of the column (titles + toggles + seek + transport + chip)
+/// plus that chrome is ≈478 px below the hero. Without the height cap, on a shorter
+/// screen (e.g. the Poco F1 at scale 3 ≈ 749 px tall) the hero pushes the page past
+/// the window height and the **bottom nav drops off the bottom of the screen**.
+/// Clamped so it never gets unusably small or oversized on a wide desktop window.
+pub(crate) fn hero_art_px(window_w: i32, window_h: i32) -> i32 {
+    let by_width = window_w - 72;
+    let by_height = window_h - 478;
+    by_width.min(by_height).clamp(140, 300)
 }
 
 /// Recompute the Now-Playing hero size from the current window width and, if it
@@ -233,7 +240,12 @@ pub(crate) fn hero_art_px(window_w: i32) -> i32 {
 /// the new size. Cheap no-op when the size is unchanged, so it's safe to call on
 /// every resize/poll tick.
 pub(crate) fn resize_hero(state: &SharedState, ui: &SharedUi, window_w: i32) {
-    let hero = hero_art_px(window_w);
+    let window_h = if ui.window.height() > 0 {
+        ui.window.height()
+    } else {
+        ui.window.default_height()
+    };
+    let hero = hero_art_px(window_w, window_h);
     if hero == ui.hero_px.get() {
         return;
     }

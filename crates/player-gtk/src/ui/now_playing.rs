@@ -68,23 +68,23 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
 
     // secondary toggle row — shuffle / repeat as pills, above the seek bar
     // (Poweramp-Adwaita design: the transport row is reserved for playback).
-    let shuffle = circle("media-playlist-shuffle-symbolic", 40, "Shuffle");
+    let shuffle = circle("media-playlist-shuffle-symbolic", 32, "Shuffle");
     shuffle.add_css_class("pill-toggle");
-    let repeat = circle("media-playlist-repeat-symbolic", 40, "Repeat");
+    let repeat = circle("media-playlist-repeat-symbolic", 32, "Repeat");
     repeat.add_css_class("pill-toggle");
     // Heart the current track (filled/accented when loved). Disabled until a
     // library-indexed track is playing.
-    let love = circle("emblem-favorite-symbolic", 40, "Love this track");
+    let love = circle("emblem-favorite-symbolic", 32, "Love this track");
     love.add_css_class("pill-toggle");
     love.set_sensitive(false);
     // Jump to the current track's artist / album detail page.
-    let goto_artist = circle("avatar-default-symbolic", 40, "Go to artist");
+    let goto_artist = circle("avatar-default-symbolic", 32, "Go to artist");
     goto_artist.add_css_class("pill-toggle");
     goto_artist.set_sensitive(false);
-    let goto_album = circle("media-optical-symbolic", 40, "Go to album");
+    let goto_album = circle("media-optical-symbolic", 32, "Go to album");
     goto_album.add_css_class("pill-toggle");
     goto_album.set_sensitive(false);
-    let toggles = gtk::Box::new(Orientation::Horizontal, 9);
+    let toggles = gtk::Box::new(Orientation::Horizontal, 7);
     toggles.set_halign(gtk::Align::Center);
     toggles.append(&shuffle);
     toggles.append(&repeat);
@@ -93,13 +93,13 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     toggles.append(&goto_album);
 
     // transport: prev · −10s · play · +10s · next
-    let prev = circle("media-skip-backward-symbolic", 48, "Previous");
-    let rewind = circle("media-seek-backward-symbolic", 48, "Back 10 seconds");
-    let play = circle("media-playback-start-symbolic", 72, "Play");
+    let prev = circle("media-skip-backward-symbolic", 38, "Previous");
+    let rewind = circle("media-seek-backward-symbolic", 38, "Back 10 seconds");
+    let play = circle("media-playback-start-symbolic", 56, "Play");
     play.add_css_class("play-hero");
     play.remove_css_class("flat");
-    let fwd = circle("media-seek-forward-symbolic", 48, "Forward 10 seconds");
-    let next = circle("media-skip-forward-symbolic", 48, "Next");
+    let fwd = circle("media-seek-forward-symbolic", 38, "Forward 10 seconds");
+    let next = circle("media-skip-forward-symbolic", 38, "Next");
     let transport = gtk::Box::new(Orientation::Horizontal, 4);
     transport.set_halign(gtk::Align::Center);
     for b in [&prev, &rewind, &play, &fwd, &next] {
@@ -114,18 +114,18 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     // and centred vertically in the page (see the `clamp` valign below). No
     // dock-to-bottom spacer: the device screen is tall, so a spacer just left a
     // big empty gap with a lonely chip at the bottom.
-    let content = gtk::Box::new(Orientation::Vertical, 14);
-    content.set_margin_top(16);
-    content.set_margin_bottom(16);
-    content.set_margin_start(20);
-    content.set_margin_end(20);
+    let content = gtk::Box::new(Orientation::Vertical, 11);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
     content.append(&art);
     let titles = gtk::Box::new(Orientation::Vertical, 3);
     titles.append(&title);
     titles.append(&subtitle);
     content.append(&titles);
     content.append(&toggles);
-    let seekbox = gtk::Box::new(Orientation::Vertical, 4);
+    let seekbox = gtk::Box::new(Orientation::Vertical, 3);
     seekbox.append(&seek);
     seekbox.append(&times);
     content.append(&seekbox);
@@ -144,7 +144,7 @@ pub(crate) fn build_now_playing() -> (gtk::Widget, Np) {
     // Centre the cluster vertically in the page (`valign: Center`, no vexpand) so it
     // sits balanced on the tall phone screen. The `clamp` caps the width so the seek
     // bar/hero stay readable on a wide desktop window. **No scroller** — the device
-    // screen is tall enough for the cluster (hero ≤300 + transport ≈ 645 px, well
+    // screen is tall enough for the cluster (hero ≤176 + the rest ≈ 360 px, well
     // under the height budget), and the page must never scroll.
     let content_page = clamp(&content);
     content_page.set_valign(gtk::Align::Center);
@@ -225,14 +225,14 @@ pub(crate) fn update_mini(state: &SharedState, ui: &SharedUi) {
 /// gives side breathing room; the height bound is load-bearing: the Now Playing
 /// page never scrolls, so its cluster must fit between the header and the bottom
 /// switcher — the rest of the column (titles + toggles + seek + transport + chip)
-/// plus that chrome is ≈478 px below the hero. Without the height cap, on a shorter
+/// plus that chrome is ≈360 px below the hero (after the 0.7× size pass). Without the height cap, on a shorter
 /// screen (e.g. the Poco F1 at scale 3 ≈ 749 px tall) the hero pushes the page past
 /// the window height and the **bottom nav drops off the bottom of the screen**.
 /// Clamped so it never gets unusably small or oversized on a wide desktop window.
 pub(crate) fn hero_art_px(window_w: i32, window_h: i32) -> i32 {
-    let by_width = window_w - 72;
-    let by_height = window_h - 478;
-    by_width.min(by_height).clamp(140, 300)
+    let by_width = window_w - 64;
+    let by_height = window_h - 360;
+    by_width.min(by_height).clamp(90, 210)
 }
 
 /// Recompute the Now-Playing hero size from the current window width and, if it

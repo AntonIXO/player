@@ -16,11 +16,11 @@ use player_library::Album;
 use crate::art::{ArtCache, ArtSlot};
 
 /// Album-art sizes used across the shell (list row · mini-player · hero).
-pub(crate) const ART_ROW: i32 = 46;
-pub(crate) const ART_MINI: i32 = 40;
+pub(crate) const ART_ROW: i32 = 36;
+pub(crate) const ART_MINI: i32 = 32;
 /// Initial/fallback Now-Playing hero size; the real size is computed from the
 /// window width at runtime (`ui::now_playing::hero_art_px`, stored in `Ui::hero_px`).
-pub(crate) const ART_HERO: i32 = 240;
+pub(crate) const ART_HERO: i32 = 176;
 
 pub(crate) fn add_page(
     stack: &adw::ViewStack,
@@ -69,7 +69,7 @@ fn style_heart(b: &gtk::Button, loved: bool) {
 /// Build a heart toggle that flips its own style on click and reports the new
 /// state to `on_toggle` (which persists it).
 fn heart_button(loved: bool, on_toggle: Box<dyn Fn(bool)>) -> gtk::Button {
-    let b = circle("emblem-favorite-symbolic", 32, "");
+    let b = circle("emblem-favorite-symbolic", 26, "");
     style_heart(&b, loved);
     let bw = b.clone();
     b.connect_clicked(move |_| {
@@ -125,11 +125,11 @@ pub(crate) fn row_inner(
     trailing: Option<(&str, &str)>,
     on_trailing: impl Fn() + 'static,
 ) -> gtk::Box {
-    let row = gtk::Box::new(Orientation::Horizontal, 13);
-    row.set_margin_top(8);
-    row.set_margin_bottom(8);
-    row.set_margin_start(12);
-    row.set_margin_end(8);
+    let row = gtk::Box::new(Orientation::Horizontal, 10);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(10);
+    row.set_margin_end(6);
     row.append(&art_widget(cache, art_hash, ART_ROW, false));
 
     let texts = gtk::Box::new(Orientation::Vertical, 1);
@@ -163,7 +163,7 @@ pub(crate) fn row_inner(
     }
 
     if let Some((icon, tip)) = trailing {
-        let b = circle(icon, 32, tip);
+        let b = circle(icon, 26, tip);
         b.connect_clicked(move |_| on_trailing());
         row.append(&b);
     }
@@ -223,11 +223,11 @@ pub(crate) struct RowHandle {
 /// Build one reusable list row for a list factory's `setup`. All optional bits
 /// (meta · heart · trailing) start hidden and are revealed per bind.
 pub(crate) fn row_setup() -> (gtk::Widget, Rc<RowHandle>) {
-    let row = gtk::Box::new(Orientation::Horizontal, 13);
-    row.set_margin_top(8);
-    row.set_margin_bottom(8);
-    row.set_margin_start(12);
-    row.set_margin_end(8);
+    let row = gtk::Box::new(Orientation::Horizontal, 10);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(10);
+    row.set_margin_end(6);
 
     let art = ArtSlot::new(ART_ROW, false);
     row.append(&art.widget());
@@ -257,7 +257,7 @@ pub(crate) fn row_setup() -> (gtk::Widget, Rc<RowHandle>) {
     meta.set_visible(false);
     row.append(&meta);
 
-    let heart = circle("emblem-favorite-symbolic", 32, "");
+    let heart = circle("emblem-favorite-symbolic", 26, "");
     heart.set_visible(false);
     let heart_cb: HeartCb = Rc::new(RefCell::new(None));
     {
@@ -272,7 +272,7 @@ pub(crate) fn row_setup() -> (gtk::Widget, Rc<RowHandle>) {
     }
     row.append(&heart);
 
-    let trailing = circle("media-playback-start-symbolic", 32, "");
+    let trailing = circle("media-playback-start-symbolic", 26, "");
     trailing.set_visible(false);
     let trailing_cb: ActionCb = Rc::new(RefCell::new(None));
     {
@@ -357,7 +357,7 @@ pub(crate) struct AlbumCellHandle {
 /// Build one reusable album cell at `art_px` (square cover). Returns the cell
 /// widget and its handle for the grid factory's `setup`.
 pub(crate) fn album_cell_setup(art_px: i32) -> (gtk::Widget, Rc<AlbumCellHandle>) {
-    let cell = gtk::Box::new(Orientation::Vertical, 6);
+    let cell = gtk::Box::new(Orientation::Vertical, 4);
     cell.add_css_class("album-cell");
     let art = ArtSlot::new(art_px, false);
     cell.append(&art.widget());
@@ -400,7 +400,7 @@ pub(crate) fn format_chip(spec: &str) -> gtk::Box {
     chip.add_css_class("format-chip");
     chip.set_halign(gtk::Align::Center);
     let check = gtk::Image::from_icon_name("emblem-ok-symbolic");
-    check.set_pixel_size(15);
+    check.set_pixel_size(12);
     let label = gtk::Label::new(Some("Bit-perfect"));
     let specl = gtk::Label::new(Some(spec));
     specl.add_css_class("spec");

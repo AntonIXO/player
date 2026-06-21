@@ -67,9 +67,30 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("org.player.BitPerfect")
         .build();
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|_| {
+        load_css();
+        scale_fonts(UI_FONT_SCALE);
+    });
     app.connect_activate(build_ui);
     app.run()
+}
+
+/// App-wide font shrink. The phone-tuned layout read as oversized on the device, so
+/// we render *all* text at a fraction of the system size — uniformly and crisply.
+/// This only changes the pt→px DPI used for font *layout* (Adwaita's type is in pt,
+/// so titles/body/captions all scale); the Wayland surface scale still renders sharp,
+/// so nothing is bitmap-blurred. It is app-scoped (our process's `GtkSettings`), so it
+/// never touches the system/shell scaling — unlike a compositor scale or GDK_SCALE.
+const UI_FONT_SCALE: f64 = 0.82;
+
+fn scale_fonts(factor: f64) {
+    if let Some(settings) = gtk::Settings::default() {
+        // gtk-xft-dpi is in 1/1024 of a point; <=0 means "unset", i.e. the 96 dpi
+        // default. Multiply the live baseline so we respect any system text scaling.
+        let cur = settings.gtk_xft_dpi();
+        let base = if cur > 0 { cur } else { 96 * 1024 };
+        settings.set_gtk_xft_dpi((base as f64 * factor).round() as i32);
+    }
 }
 
 /// Apply a theme: explicit "light"/"dark" force a scheme, "system" follows the
@@ -311,7 +332,7 @@ fn build_ui(app: &adw::Application) {
         loved_scroller: lib.loved_scroller.clone(),
         sort: Cell::new(player_library::Sort::Title),
         sort_label: lib.sort_label.clone(),
-        cover_px: Cell::new(110),
+        cover_px: Cell::new(96),
         hero_px: Cell::new(widgets::ART_HERO),
         search_entry: search_entry.clone(),
         search_results,

@@ -54,14 +54,14 @@ cmdline. See `aports/hifi-player/hifi-player.post-install` for the full checklis
 > **No USB charging or MTP while booted.** The custom kernel pins the USB-C port to host
 > mode and sources its own 5 V, so the port can't take charge in or act as a peripheral.
 > Charge with the phone **powered off** (or in fastboot); transfer files over Wi-Fi
-> (SSH/SFTP/`rsync`) or via the microSD card. See `kernel/README.md`.
+> (SSH/SFTP/`rsync`) or via the microSD card. See the APKBUILD and patches in `linux-postmarketos-qcom-sdm845-audio/`.
 
 > **USB OTG is officially "Broken" on beryllium.** The whole Mojo-2-over-USB path
 > depends on the custom kernel: patch `0002` forces host mode and patches `0004`/`0005`
 > make the phone source its own 5 V VBUS (PMI8998 OTG boost), so the DAC enumerates over
 > a **plain** OTG cable — no powered Y-cable, and do **not** also enable the Mojo 2's own
 > power-output mode (two 5 V sources must not fight on the bus). Verify
-> `lsusb | grep -i chord` enumerates the DAC before anything else. See `kernel/README.md`.
+> `lsusb | grep -i chord` enumerates the DAC before anything else. See the patches in `linux-postmarketos-qcom-sdm845-audio/`.
 
 ## Source of truth & `pmbootstrap pull`
 
@@ -86,9 +86,3 @@ is clean.**
   The renamed pkgname is what lets it coexist in pmaports (pmbootstrap rejects two aports
   with the same `pkgname`, so a same-named `custom-*` override is impossible).
 
-  `kernel/` keeps the standalone patches + the annotated `audiophile.kconfig` as the
-  *why*-reference; the buildable copies live in the `-audio` package. After a fresh
-  `pmbootstrap init`, just re-run `sh packaging/link-kernel-into-pmaports.sh`. If you ever
-  spliced patches into the in-tree `device/community/linux-postmarketos-qcom-sdm845/`, revert
-  it so `pmbootstrap pull` stays clean:
-  `git -C ~/.local/var/pmbootstrap/cache_git/pmaports checkout -- device/community/linux-postmarketos-qcom-sdm845/`.

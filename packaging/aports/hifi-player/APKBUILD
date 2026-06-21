@@ -35,11 +35,14 @@ depends="alsa-utils adwaita-icon-theme openssh-server avahi iw"
 #         runtime INTO the target, so it must match the TARGET arch even though the
 #         tool itself can be x86_64. `scripts/pmb-build-pgo.sh --bolt` wires both up:
 #         it RO-binds, at /mnt/x86-bolt in a bin/lib layout, the x86_64 llvm-bolt +
-#         merge-fdata (run NATIVELY via their loader — fast) under bin/, and the
-#         aarch64 libbolt_rt_instr.a (lifted from a downloaded aarch64 LLVM,
-#         LLVM-*-Linux-ARM64) under lib/, where BOLT resolves it. The host tool
-#         rewrites by ELF arch; only the instrumented binary's training run is
-#         emulated. Missing tools OR runtime => BOLT auto-skips and PGO still applies.
+#         merge-fdata (run NATIVELY via their loader — fast) under bin/, from a pinned
+#         LLVM-*-Linux-X64 tarball (or the system tools), and the aarch64
+#         libbolt_rt_instr.a (from a downloaded LLVM-*-Linux-ARM64) under lib/, where
+#         BOLT resolves it — so the x86_64 tool links the *aarch64* runtime into the
+#         target (the X64 tarball's own x86_64 runtime would give "linking object with
+#         arch x86_64 into context with arch aarch64"). Tools+runtime must share the LLVM
+#         major (fdata schema). The host tool rewrites by ELF arch; only the instrumented
+#         binary's training run is emulated. Missing tools OR runtime => BOLT auto-skips.
 #         (Alt: BOLT a host/on-device build: scripts/pgo-bolt-build.sh --bolt)
 # meson + phosh-dev/gtk+3.0-dev/libhandy1-dev/glib-dev: the Phosh quick-settings
 # plugin (the system-curtain "Music sync" button) is an out-of-tree GModule built
@@ -387,7 +390,20 @@ EOF
 	"$_train" "$_wrap" || true
 	[ -f "$_fdata" ] && mv -f "$_fdata" "$_fdata.final" 2>/dev/null
 	[ -n "$(find "$_bd" -name "$_tag.fdata.*" 2>/dev/null)" ] || { rm -f "$_bin.inst"; return 1; }
-	$_MERGE_FDATA "$_bd/$_tag".fdata.* > "$_bd/merged.fdata" || return 1
+	# Validate each snapshot before merging. The sleep-time watcher rewrites the fdata
+	# in place (non-atomic O_TRUNC+write), so a training process that exits mid-flush
+	# leaves a TRUNCATED snapshot — and merge-fdata aborts hard on the first bad file
+	# ("Malformed / corrupted entry type"), failing the whole BOLT pass over one casualty
+	# among hundreds of per-track runs. Parse each file alone and keep only the good ones;
+	# --instrumentation-no-counters-clear makes every snapshot a full cumulative profile,
+	# so dropping a corrupt one loses ~nothing. (mktemp suffixes never contain spaces, so
+	# the unquoted $_good expansion is safe.)
+	_good=""
+	for _f in "$_bd/$_tag".fdata.*; do
+		$_MERGE_FDATA "$_f" >/dev/null 2>&1 && _good="$_good $_f"
+	done
+	[ -n "$_good" ] || { warning "BOLT $_tag: every fdata snapshot was corrupt"; rm -f "$_bin.inst"; return 1; }
+	$_MERGE_FDATA $_good > "$_bd/merged.fdata" || return 1
 	$_LLVM_BOLT "$_bin" -o "$_bin.bolt" -data="$_bd/merged.fdata" \
 		-reorder-blocks=ext-tsp -reorder-functions=hfsort \
 		-split-functions -split-all-cold -icf=1 || return 1

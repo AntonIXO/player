@@ -118,6 +118,9 @@ pub(crate) fn build_album_detail(
     header.append(&art);
     let titles = gtk::Box::new(Orientation::Vertical, 4);
     titles.set_valign(gtk::Align::Center);
+    // hexpand + ellipsize so a long artist/meta can't pin the header (and thus this
+    // pushed nav page) wider than the phone screen — the title wraps, the rest trims.
+    titles.set_hexpand(true);
     let t = gtk::Label::new(Some(&album.album));
     t.add_css_class("title-2");
     t.set_xalign(0.0);
@@ -125,10 +128,12 @@ pub(crate) fn build_album_detail(
     let a = gtk::Label::new(Some(album.album_artist.as_deref().unwrap_or("Unknown Artist")));
     a.add_css_class("dim-label");
     a.set_xalign(0.0);
+    a.set_ellipsize(gtk::pango::EllipsizeMode::End);
     let m = gtk::Label::new(Some(&album.meta()));
     m.add_css_class("dim-label");
     m.add_css_class("caption");
     m.set_xalign(0.0);
+    m.set_ellipsize(gtk::pango::EllipsizeMode::End);
     titles.append(&t);
     titles.append(&a);
     titles.append(&m);
@@ -267,6 +272,7 @@ fn build_artist_detail(
 
     let titles = gtk::Box::new(Orientation::Vertical, 4);
     titles.set_valign(gtk::Align::Center);
+    titles.set_hexpand(true);
     let t = gtk::Label::new(Some(artist));
     t.add_css_class("title-2");
     t.set_xalign(0.0);
@@ -282,6 +288,7 @@ fn build_artist_detail(
     m.add_css_class("dim-label");
     m.add_css_class("caption");
     m.set_xalign(0.0);
+    m.set_ellipsize(gtk::pango::EllipsizeMode::End);
     titles.append(&t);
     titles.append(&m);
     header.append(&titles);

@@ -62,10 +62,18 @@ pub(crate) fn build_library() -> LibUi {
     az.add_css_class("az-index");
     az.set_valign(gtk::Align::Center);
     az.set_margin_end(2);
+    // The A–Z index has one button per first-letter; a Cyrillic+Latin library yields
+    // ~60+ letters (~900 px tall), which would pin the Library page's min-height past
+    // a phone screen — growing the window taller than the display and pushing the
+    // bottom nav off the bottom. Wrap it in a vertical scroller (External policy = no
+    // visible scrollbar, swipe) so it scrolls instead of pinning the page tall.
+    let az_scroll = gtk::ScrolledWindow::new();
+    az_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::External);
+    az_scroll.set_child(Some(&az));
 
     let albums_row = gtk::Box::new(Orientation::Horizontal, 0);
     albums_row.append(&albums_scroller);
-    albums_row.append(&az);
+    albums_row.append(&az_scroll);
 
     // --- Artists / Folders / Tracks list tabs (virtualised, set on demand) ---
     let artists_scroller = browse_scroller();

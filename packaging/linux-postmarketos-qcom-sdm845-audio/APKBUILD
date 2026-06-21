@@ -10,7 +10,7 @@ maintainer="Casey Connolly <kcxt@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm845"
 pkgname=linux-$_flavor-audio
 pkgver=7.1_rc1
-pkgrel=9
+pkgrel=10
 pkgdesc="Mainline SDM845 kernel for beryllium audio player (switchable USB DRD host-first + PMI8998 VBUS + RT/USB-audio tuning)"
 provides="linux-$_flavor=$pkgver-r$pkgrel"
 replaces="linux-$_flavor"

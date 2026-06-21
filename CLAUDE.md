@@ -314,10 +314,22 @@ pin a large minimum width:
   fit the surface and **scales the entire window down** (everything looks smaller/blurry on
   Search). Setting `stack.set_vhomogeneous(false)` (in `main.rs`) makes the min height track
   the *visible* page instead — Search scrolls, so its min is ~148 px and the window shrinks
-  cleanly for the keyboard with no scaling. **Keep `hhomogeneous` TRUE**: the ≤360 width
-  discipline (every page must fit the narrowest device) depends on it. (Measured with the
-  `measure(Vertical,-1)` probe: visible=Search reports 645 px with vhom=true, 148 px with
-  vhom=false.)
+  cleanly for the keyboard with no scaling. (Measured with the `measure(Vertical,-1)` probe:
+  visible=Search reports 645 px with vhom=true, 148 px with vhom=false.)
+- **The `ViewStack` is ALSO set `hhomogeneous(false)`** (2026-06-21). This *reverses* the
+  earlier "keep hhomogeneous TRUE" rule — that rule was wrong. With `hhomogeneous=TRUE` the
+  stack's *natural width* tracks its **widest** page: the Now Playing centred column's
+  `clamp(620)` gives it a **~631 px natural**, which propagates to **every** page and forces
+  even the **maximised** 360 px phone window out to 631 px — the whole UI spills off the right /
+  "shifts left" on Search/Queue (probe shows `maximized=true` yet `width=631`, `visible=search`).
+  `stack.set_hhomogeneous(false)` lets each page size to *its own* width (Search ~302, Queue
+  ~241, Library ~326, all ≤360), so the maximised window settles at the screen width and every
+  page fits. The per-page ≤360 budget is still enforced — chiefly by the album-cover
+  **monitor-width cap** in `ui::library::window_width` (covers are fixed-size, so an over-wide
+  window-width read — e.g. a pre-maximise allocation, or a runtime output-scale change — would
+  otherwise pin the Albums grid's min past the screen). Diagnose with the per-page
+  `measure(Horizontal,-1)` probe **plus** a post-page-switch `window.width()`/`is_maximized()`
+  log; the on-device build/screenshot loop lives in `scripts/phone-{shot,deploy,launch,tap}.sh`.
 - **Do NOT add a height-keyed `AdwBreakpoint` to hide the switcher for the OSK.** It seems
   tidy ("steps the switcher aside for the keyboard") but on Phosh it *flickers the keyboard
   open/closed*: the OSK resizes the window, the `max-height` breakpoint crosses its

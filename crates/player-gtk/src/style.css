@@ -80,7 +80,6 @@ button.loved image { color: @error_color; }
   font-size: 9.5px;
   min-height: 0;
   min-width: 14px;
-  max-width: 18px;
   padding: 1px 0;
   background: none;
   box-shadow: none;

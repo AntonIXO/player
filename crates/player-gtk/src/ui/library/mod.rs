@@ -262,15 +262,30 @@ pub(crate) fn album_cover_px(window_w: i32) -> i32 {
     (raw / 8) * 8
 }
 
-/// Current window content width (allocated, falling back to the default before the
-/// first allocation).
+/// Current window content width for sizing the width-derived art, **capped to the
+/// monitor's logical width**. The cap is load-bearing: the album covers are
+/// fixed-size, so they pin the Albums page's *minimum* width to `3 × cover`. If a
+/// transient pre-maximize (or a non-maximized) allocation reported the content's
+/// natural width (wider than the screen), the covers would size up, pinning the
+/// Albums min-width past the screen — and because `AdwViewStack` is hhomogeneous,
+/// that over-wide page drags *every* page wider than the window, overflowing it
+/// (the whole UI shifts left / spills off the right). Capping to the monitor keeps
+/// `3 × cover + reserve ≤ screen`, so the grid never pins the window wider than the
+/// display and the window can always settle at the screen width.
 pub(crate) fn window_width(ui: &SharedUi) -> i32 {
     let w = ui.window.width();
-    if w > 0 {
-        w
-    } else {
-        ui.window.default_width()
+    let w = if w > 0 { w } else { ui.window.default_width() };
+    if let Some(surface) = ui.window.surface() {
+        if let Some(mon) = gtk::gdk::Display::default()
+            .and_then(|d| d.monitor_at_surface(&surface))
+        {
+            let mw = mon.geometry().width();
+            if mw > 0 {
+                return w.min(mw);
+            }
+        }
     }
+    w
 }
 
 /// (Re)build the albums `GridView` at the current cover size (`ui.cover_px`) and

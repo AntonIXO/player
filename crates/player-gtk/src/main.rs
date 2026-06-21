@@ -237,9 +237,17 @@ fn build_ui(app: &adw::Application) {
     // ("everything gets smaller" on the Search page). Making the stack
     // vertically NON-homogeneous lets its min height track the *visible* page —
     // Search scrolls (AdwToolbarView + scroller), so its min is small and the
-    // window can shrink for the keyboard without phoc scaling it. Keep
-    // hhomogeneous TRUE: the ≤360 width discipline relies on it.
+    // window can shrink for the keyboard without phoc scaling it.
     stack.set_vhomogeneous(false);
+    // Also NON-homogeneous horizontally: the Now Playing page's centred-column
+    // clamp gives it a ~631 px *natural* width, and with hhomogeneous=TRUE that
+    // natural propagates to every page — so the maximised phone window is forced to
+    // 631 px (wider than the 360 px screen) and the whole UI spills off the right /
+    // "shifts left" on Search/Queue. With hhomogeneous=FALSE each page sizes to its
+    // own width (Search ~302, Queue ~241, Library ~326 — all ≤360), so the window
+    // settles at the screen width. (The ≤360 budget per page is still enforced by
+    // the album-cover monitor-width cap in `ui::library::window_width`.)
+    stack.set_hhomogeneous(false);
 
     // --- mini player ---
     let (mini, mp_art, mp_title, mp_artist, mp_play, mp_progress) = build_mini();

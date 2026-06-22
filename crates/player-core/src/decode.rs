@@ -34,7 +34,11 @@ pub struct Decoder {
 impl Decoder {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        // Drop already-decoded pages from the cache as we stream the file once,
+        // front-to-back (memory hygiene on a small-RAM phone; sample-safe — see
+        // `fadvise`). Transparent: a byte-for-byte pass-through reader.
+        let src = crate::fadvise::FadviseReader::new(file);
+        let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {

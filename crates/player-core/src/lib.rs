@@ -8,6 +8,7 @@ pub mod dop;
 pub mod dsd;
 pub mod engine;
 pub mod error;
+pub mod fadvise;
 pub mod format;
 pub mod rt;
 pub mod sink;

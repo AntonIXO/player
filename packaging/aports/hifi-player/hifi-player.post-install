@@ -24,6 +24,11 @@ hifi-player installed. Four manual follow-ups (one-time):
   3. If a sound server still grabs the DAC, set its vendor:product in
      /etc/udev/rules.d/99-mojo2-nopulse.rules from:  lsusb | grep -i chord
 
+  3b. (Optional) Mount the rootfs with 'noatime' to stop read-access-time writes
+      to flash during playback. Edit /etc/fstab — add 'noatime' to the '/' line's
+      options — then reboot. (/var/log is already volatile tmpfs via var-log.mount;
+      see docs/ARCHQ.md for why these are reliability, not "sound-quality", tweaks.)
+
   4. Music sync (the "Music sync" tile in the system curtain): authorize your
      laptop and pick your Wi-Fi so it's truly one-touch:
        a. Put your laptop's SSH public key in ~/.ssh/authorized_keys on the phone.

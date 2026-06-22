@@ -86,6 +86,7 @@ source="
 	audio.conf
 	99-audio-sysctl.conf
 	90-audio-cmdline.conf
+	var-log.mount
 	hifi-share
 	hifi-share.service
 	hifi-share.conf
@@ -645,6 +646,14 @@ package() {
 	# Kernel cmdline additions (applied on the next boot-image rebuild).
 	install -Dm644 "$srcdir"/90-audio-cmdline.conf \
 		"$pkgdir"/etc/kernel-cmdline.d/90-audio.conf
+
+	# Volatile /var/log on tmpfs: cut routine log writeback to flash (a real, if
+	# small, source of block-layer stalls that can delay a USB URB → rare xrun →
+	# guarded-but-real PCM re-init; see docs/ARCHQ.md). The ArchQ `/var/log tmpfs`
+	# idea, scoped to the one place it has a defensible mechanism. Enabled via the
+	# preset below; degrades safely to "logs on flash" if the mount ever fails.
+	install -Dm644 "$srcdir"/var-log.mount \
+		"$pkgdir"/usr/lib/systemd/system/var-log.mount
 }
 
 # Generated with `sha512sum` over the source= files (regenerate after any edit
@@ -663,6 +672,7 @@ c1b4bb607f324b34004a36df2cc3a3cfd8e2509767dcb08f0393bd4977986943e73c95fa606572d3
 6fbb68c10725124c2fa2fc699afea3b641af3fd1f6e849c8766766126176915e4f4ded5e53c47412fe6a1ac00918680a5ba92aaeb801c2333960a356da0fc735  audio.conf
 25cd112f526c6ddaf8b48b0e5786e643b7b1ae66b4425b7db97db8b501245bdf1f769e913aa22bdd7718f2742ec2eedf81e9be24fd30b8d1a7645eb07c0e4af0  99-audio-sysctl.conf
 57b152060e7b17b69201dda2ce81de76a5acac26b6132f1823f3eb95512bb7f56145ac5a63650213a3261ed3152dd341d96f211822b337811a8bfc16fcab496b  90-audio-cmdline.conf
+384b29322c3ca6887b8c3243cc9a5b616557de57654aceefef49d46864ae432d0e59ef4734c18809c855f4ba7e9a4c4ac6b6a73c8e2b209e2f151174c0994e15  var-log.mount
 56030ddecae77b64956e9374404fcf12f692f1d2dd5a0128447ac138d1b1ce16a55e702338dc9d04261487bd636e4ec2de1d1d4f12655a85770c79b2650f8b17  hifi-share
 9b56e6941b00aff186bf67c51aa541a2fd5d7c8bbee89c100c5d72bfe1821a904a793b918cd4c906aea5144f1861b34b42648477582e4ece143f450a78a194e5  hifi-share.service
 7c4bca0302f974e9340f09ebc1891880cc92bfa4f323a1bd15d1332053039f53d76c723892268fc4b82dabe422de93cea0a13e2ba4993fb4ac8acb4010725718  hifi-share.conf

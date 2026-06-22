@@ -1,1 +1,2 @@
 enable hifi-player-audio-setup.service
+enable var-log.mount

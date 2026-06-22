@@ -1,0 +1,40 @@
+# Mount /var/log on tmpfs so routine log writeback never hits the eMMC/flash.
+#
+# Why this helps the audio path (and only this much): background writeback of log
+# files to flash can momentarily stall the block layer, and on this device that
+# *can* delay USB URB submission enough to risk a rare xrun (and each xrun is a
+# guarded-but-real PCM re-init — the full-scale-burst hazard; see CLAUDE.md
+# "Output safety"). Keeping volatile log churn in RAM removes that source of
+# background writeback. This is the ArchQ `/var/log tmpfs` idea, scoped to the one
+# place it has a defensible mechanism. It does NOT touch the digital audio samples
+# (the Mojo 2 is an async DAC that reclocks; host timing is not audible jitter) —
+# it is a *reliability* tweak, not a "sound quality" one. See docs/ARCHQ.md.
+#
+# Trade-off (intentional, documented): /var/log becomes volatile — its contents are
+# lost on every reboot, and the systemd journal falls back to a volatile store in
+# /run (Storage=auto with no on-disk /var/log/journal). That is acceptable for an
+# audio appliance. To keep persistent logs for debugging, disable this unit:
+#     sudo systemctl disable --now var-log.mount      # then reboot
+# The size is capped (16M) so a runaway logger can never exhaust RAM; journald
+# rotates/drops within the cap.
+#
+# Hardened: nodev,nosuid,noexec — nothing legitimately creates device nodes,
+# setuid binaries, or executables under /var/log.
+#
+# Ordering/safety: a plain .mount unit gets systemd's default dependencies
+# automatically (Before=local-fs.target, ordered after its parent /var mount), and
+# it is only Wanted by local-fs.target — so a (near-impossible) tmpfs mount failure
+# degrades to "no tmpfs, logs on flash" and never blocks boot.
+
+[Unit]
+Description=Volatile /var/log on tmpfs (cut flash writeback, reduce URB-stall risk)
+Documentation=https://github.com/AntonIXO/player
+
+[Mount]
+What=tmpfs
+Where=/var/log
+Type=tmpfs
+Options=nodev,nosuid,noexec,size=16M,mode=0755
+
+[Install]
+WantedBy=local-fs.target

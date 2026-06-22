@@ -23,6 +23,7 @@ whole GTK4 workspace links against Alpine's musl libraries.
 | `/etc/modprobe.d/audio.conf` | `snd-usb-audio nrpacks=1 low_latency=1` |
 | `/etc/sysctl.d/99-audio-sysctl.conf` | swappiness / dirty ratios |
 | `/etc/kernel-cmdline.d/90-audio.conf` | `threadirqs usbcore.autosuspend=-1 processor.max_cstate=1 snd-usb-audio.nrpacks=1` |
+| `/usr/lib/systemd/system/var-log.mount` | volatile `/var/log` on tmpfs (16M cap) — cut flash writeback; see `docs/ARCHQ.md` |
 
 ## Build & ship
 

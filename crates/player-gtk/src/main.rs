@@ -136,6 +136,17 @@ fn build_ui(app: &adw::Application) {
         .or_else(|| player_core::auto_pick().map(|d| d.id))
         .unwrap_or_else(|| "hw:0,0".into());
 
+    // Output buffer depth (periods of DEFAULT_PERIOD frames): persisted choice,
+    // else the robust default. Clamped to the engine's safe range so a stale or
+    // tampered value can never open a dropout-prone tiny buffer.
+    let buffer_periods = library
+        .get_meta("audio_periods")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(player_core::DEFAULT_PERIODS)
+        .clamp(player_core::MIN_PERIODS, player_core::MAX_PERIODS);
+
     // Library root: a persisted choice, else the XDG Music dir.
     let music_dir = library
         .get_meta("music_dir")
@@ -161,9 +172,14 @@ fn build_ui(app: &adw::Application) {
     let (ev_tx, ev_rx) = async_channel::unbounded::<Event>();
     let player = {
         let ev_tx = ev_tx.clone();
-        Player::spawn(device.clone(), move |ev| {
-            let _ = ev_tx.send_blocking(ev);
-        })
+        Player::spawn_with(
+            device.clone(),
+            player_core::DEFAULT_PERIOD,
+            buffer_periods,
+            move |ev| {
+                let _ = ev_tx.send_blocking(ev);
+            },
+        )
     };
 
     let state: SharedState = Rc::new(RefCell::new(State {
@@ -180,6 +196,7 @@ fn build_ui(app: &adw::Application) {
         repeat: false,
         shuffle: false,
         device,
+        buffer_periods,
         ev_tx,
         last_pos_ms: 0,
         resume_to: None,

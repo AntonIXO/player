@@ -33,6 +33,11 @@ pub(crate) struct State {
     pub(crate) repeat: bool,
     pub(crate) shuffle: bool,
     pub(crate) device: String,
+    /// ALSA buffer depth (number of `DEFAULT_PERIOD`-frame periods) the engine
+    /// opens with — user-tunable in Settings, persisted as the `audio_periods`
+    /// meta key. Larger = more robust against xruns (we favour robustness; an
+    /// xrun is a guarded PCM re-init = the burst hazard). Read on every re-spawn.
+    pub(crate) buffer_periods: i64,
     /// Sender the engine's `emit` closure feeds; cloned when re-spawning the
     /// player (device change) so the existing event pump keeps working.
     pub(crate) ev_tx: async_channel::Sender<Event>,

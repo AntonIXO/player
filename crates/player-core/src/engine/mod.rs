@@ -48,6 +48,16 @@ pub enum Flow {
 pub const DEFAULT_PERIOD: i64 = 1024;
 pub const DEFAULT_PERIODS: i64 = 8;
 
+/// Safe bounds on the user-tunable buffer (see `Player::spawn_with`). The lower
+/// bound deliberately keeps the buffer from shrinking toward dropout-prone
+/// depths: each xrun is a guarded-but-real PCM re-init = the full-scale-burst
+/// hazard (see `CLAUDE.md` "Output safety"), so we favour robustness and never
+/// let a persisted/hostile value produce a dangerously tiny buffer.
+pub const MIN_PERIODS: i64 = 4;
+pub const MAX_PERIODS: i64 = 64;
+pub const MIN_PERIOD: i64 = 256;
+pub const MAX_PERIOD: i64 = 8192;
+
 /// Decode `path` and play it bit-perfect to `device`.
 ///
 /// * `max_frames` — optional cap (for short test runs).
@@ -276,12 +286,28 @@ pub struct Player {
 }
 
 impl Player {
-    /// Spawn the engine for `device`. `emit` is called (from engine threads) for
-    /// every [`Event`].
+    /// Spawn the engine for `device` with the default ALSA buffering. `emit` is
+    /// called (from engine threads) for every [`Event`].
     pub fn spawn<E>(device: String, emit: E) -> Self
     where
         E: Fn(Event) + Send + Sync + 'static,
     {
+        Self::spawn_with(device, DEFAULT_PERIOD, DEFAULT_PERIODS, emit)
+    }
+
+    /// Like [`Player::spawn`] but with an explicit ALSA `period` (frames) and
+    /// `periods` (buffer depth = `period * periods` frames). Both are clamped to
+    /// the safe range (`MIN_PERIODS..=MAX_PERIODS`, `MIN_PERIOD..=MAX_PERIOD`) so a
+    /// stored/hostile setting can never produce a dropout-prone tiny buffer (an
+    /// xrun is a guarded-but-real PCM re-init = the burst hazard). Buffer depth
+    /// changes only ALSA framing/latency, never the bytes written — bit-perfect
+    /// output is unaffected.
+    pub fn spawn_with<E>(device: String, period: i64, periods: i64, emit: E) -> Self
+    where
+        E: Fn(Event) + Send + Sync + 'static,
+    {
+        let period = period.clamp(MIN_PERIOD, MAX_PERIOD);
+        let periods = periods.clamp(MIN_PERIODS, MAX_PERIODS);
         let emit: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(emit);
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(64);
         let (ctl_tx, ctl_rx) = unbounded::<Ctl>();
@@ -292,9 +318,7 @@ impl Player {
             let emit = emit.clone();
             thread::Builder::new()
                 .name("player-audio".into())
-                .spawn(move || {
-                    audio_thread::run(device, ctl_rx, DEFAULT_PERIOD, DEFAULT_PERIODS, emit)
-                })
+                .spawn(move || audio_thread::run(device, ctl_rx, period, periods, emit))
                 .expect("spawn audio thread")
         };
         let decode = {

@@ -20,7 +20,7 @@ pub use dop::DopPacker;
 pub use dsd::{is_dsd_path, open_dsd, DsdSource, DsdSpec};
 pub use engine::{
     play_queue_blocking, run_playback, Cmd, Event, Flow, Player, Stats, DEFAULT_PERIOD,
-    DEFAULT_PERIODS,
+    DEFAULT_PERIODS, MAX_PERIOD, MAX_PERIODS, MIN_PERIOD, MIN_PERIODS,
 };
 pub use rt::{CpuLatencyGuard, Sched};
 pub use error::{Error, Result};

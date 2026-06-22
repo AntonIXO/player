@@ -1,5 +1,5 @@
-//! The preferences dialog (output device · library folder + live watch · theme)
-//! and the engine re-spawn used when the output device changes.
+//! The preferences dialog (output device · buffer · library folder + live watch
+//! · theme) and the engine re-spawn used when the output device or buffer changes.
 
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -12,16 +12,22 @@ use crate::apply_theme;
 use crate::events::{set_watch, start_scan};
 use crate::state::{SharedState, SharedUi};
 
-/// Replace the running engine with one bound to `device`, reusing the existing
-/// event channel so the event pump keeps working. Persists the choice.
+/// Replace the running engine with one bound to `device` and the current
+/// `buffer_periods`, reusing the existing event channel so the event pump keeps
+/// working. Persists the device choice. Used for both device and buffer changes.
 pub(crate) fn respawn_player(state: &SharedState, device: String) {
-    let ev_tx = state.borrow().ev_tx.clone();
-    let new_player = {
-        let ev_tx = ev_tx.clone();
-        Player::spawn(device.clone(), move |ev| {
-            let _ = ev_tx.send_blocking(ev);
-        })
+    let (ev_tx, periods) = {
+        let s = state.borrow();
+        (s.ev_tx.clone(), s.buffer_periods)
     };
+    let new_player = Player::spawn_with(
+        device.clone(),
+        player_core::DEFAULT_PERIOD,
+        periods,
+        move |ev| {
+            let _ = ev_tx.send_blocking(ev);
+        },
+    );
     let mut s = state.borrow_mut();
     s.player = new_player; // dropping the old player joins its threads
     let _ = s.library.set_meta("device", &device);
@@ -70,6 +76,46 @@ pub(crate) fn open_settings(state: &SharedState, ui: &SharedUi) {
         });
     }
     out.add(&dev_row);
+
+    // --- Output buffer (ALSA depth) ---
+    // Buffer = DEFAULT_PERIOD * periods. Larger = more robust against xruns; we
+    // favour robustness (an xrun is a guarded PCM re-init = the full-scale-burst
+    // hazard, see CLAUDE.md), so the presets bias upward and the one smaller
+    // option is flagged. period stays DEFAULT_PERIOD; only the depth varies.
+    let buf_periods: [i64; 4] = [4, 8, 16, 32];
+    let buf_row = adw::ComboRow::new();
+    buf_row.set_title("Output buffer");
+    buf_row.set_subtitle("Larger = fewer dropouts (xruns); changing it restarts playback");
+    let buf_model = gtk::StringList::new(&[
+        "Low latency · 4096 frames (more dropout risk)",
+        "Default · 8192 frames",
+        "Large · 16384 frames",
+        "Largest · 32768 frames",
+    ]);
+    buf_row.set_model(Some(&buf_model));
+    let cur_periods = state.borrow().buffer_periods;
+    let cur_idx = buf_periods.iter().position(|&p| p == cur_periods).unwrap_or(1) as u32;
+    buf_row.set_selected(cur_idx);
+    {
+        let (state, ui) = (state.clone(), ui.clone());
+        buf_row.connect_selected_notify(move |r| {
+            let periods = buf_periods[r.selected() as usize];
+            if periods != state.borrow().buffer_periods {
+                {
+                    let mut s = state.borrow_mut();
+                    s.buffer_periods = periods;
+                    let _ = s.library.set_meta("audio_periods", &periods.to_string());
+                }
+                let device = state.borrow().device.clone();
+                respawn_player(&state, device);
+                ui.toast(&format!(
+                    "Output buffer → {} frames",
+                    periods * player_core::DEFAULT_PERIOD
+                ));
+            }
+        });
+    }
+    out.add(&buf_row);
     page.add(&out);
 
     // --- Library ---

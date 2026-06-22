@@ -29,6 +29,16 @@ hifi-player installed. Four manual follow-ups (one-time):
       options — then reboot. (/var/log is already volatile tmpfs via var-log.mount;
       see docs/ARCHQ.md for why these are reliability, not "sound-quality", tweaks.)
 
+  3c. (Optional, EXPERIMENTAL — unproven, OFF by default) An A/B kernel-cmdline
+      knob (skew_tick=1 rcu.blimit=64) is shipped inert. To try it:
+         sudo cp /usr/share/hifi-player/cmdline-experimental.conf \
+                 /etc/kernel-cmdline.d/91-audio-experimental.conf
+         sudo apk fix linux-postmarketos-qcom-sdm845   # rebuild boot image
+      then reboot. MEASURE before keeping it: compare the player's "[alsa] xrun #N"
+      log and 'cat /proc/interrupts | grep -iE "arch_timer|tick"' deltas with vs
+      without it; revert (rm the file + apk fix) if there's no measured xrun drop.
+      It cannot affect the Mojo 2's analog output (async DAC). See docs/ARCHQ.md §9.
+
   4. Music sync (the "Music sync" tile in the system curtain): authorize your
      laptop and pick your Wi-Fi so it's truly one-touch:
        a. Put your laptop's SSH public key in ~/.ssh/authorized_keys on the phone.

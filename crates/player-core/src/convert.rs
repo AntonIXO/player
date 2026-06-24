@@ -43,14 +43,16 @@ impl Packer {
                 OutFrames::S16(&self.s16)
             }
             AlsaFmt::S24_3 => {
-                self.s24.clear();
-                // Optimization: extend from an iterator eliminates bounds checks on every push
-                // and helps LLVM optimize better.
-                self.s24.reserve(full.len() * 3);
-                self.s24.extend(full.iter().flat_map(|&s| {
+                let req = full.len() * 3;
+                self.s24.resize(req, 0);
+                // Optimization: pre-resize and chunks_exact_mut avoids flat_map overhead
+                // and lets LLVM fully vectorise the assignments without bounds checks.
+                for (chunk, &s) in self.s24.chunks_exact_mut(3).zip(full.iter()) {
                     let v = s >> 8; // full-scale i32 -> native 24-bit value
-                    [v as u8, (v >> 8) as u8, (v >> 16) as u8]
-                }));
+                    chunk[0] = v as u8;
+                    chunk[1] = (v >> 8) as u8;
+                    chunk[2] = (v >> 16) as u8;
+                }
                 OutFrames::S24(&self.s24)
             }
             // S32: the input already is the wire format; no copy needed.

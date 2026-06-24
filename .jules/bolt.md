@@ -9,3 +9,7 @@
 ## 2024-06-15 - Fast byte-wise mutations over `extend_from_slice` in DoP packing loops
 **Learning:** `extend_from_slice` calls within tight inner loops building PCM frames per channel can incur overhead from iterator adapters, bounds checking or slice copying that LLVM struggles to fully elide when sizes are dynamic or branching exists per channel. Doing a single `resize` of the destination buffer and directly assigning bytes via a `chunks_exact_mut` iterator is significantly faster (~30% reduction in pack time) because LLVM sees the non-overlapping slice and avoids bounds checks per element.
 **Action:** When manually assembling output byte structures across multiple channels from parallel structures, pre-`resize` the destination and iterate over it with `chunks_exact_mut` rather than pushing or extending slice by slice.
+
+## 2025-06-15 - Fast byte-wise mutations over `flat_map` in Packer::pack
+**Learning:** In `Packer::pack`, `extend` combined with a `flat_map` iterator creates bounds checking or slice copying overhead that LLVM struggles to elide when sizes are dynamic or branching exists per channel. Doing a single `resize` of the destination buffer and directly assigning bytes via a `chunks_exact_mut` iterator avoids bounds checks per element and is faster.
+**Action:** Pre-`resize` the destination and iterate over it with `chunks_exact_mut` rather than `flat_map` and `extend` in `Packer::pack`.

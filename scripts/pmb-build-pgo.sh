@@ -9,7 +9,9 @@
 # bind-mounts the library READ-ONLY into the buildroot chroot at /mnt/pgo-music
 # (which the APKBUILD auto-detects and trains PGO on: varied FLAC/MP3/ALAC decode
 # + seek, the bounded SACD .iso DST decoder, a real Cyrillic-tagged library scan,
-# and fuzzy/FTS search), runs `pmbootstrap build`, then unmounts on exit.
+# and fuzzy/FTS search), runs `pmbootstrap build --lax`, then unmounts on exit.
+# `--lax` is required because strict pmbootstrap builds zap the buildroot before
+# and after package builds, which would remove the bind mounts created here.
 #
 # With --bolt it ALSO stages a BOLT toolchain READ-ONLY at /mnt/x86-bolt in a bin/lib
 # layout. The two arches are SPLIT on purpose:
@@ -186,6 +188,6 @@ else
 	echo "→ --no-bolt: PGO only (pass --bolt to also BOLT player-cli + player-gtk)"
 fi
 
-echo "→ pmbootstrap build --src=$SRC $PKG ${EXTRA[*]:-}"
+echo "→ pmbootstrap build --lax --src=$SRC $PKG ${EXTRA[*]:-}"
 echo "  (watch for 'PGO: real-corpus workload …' — that confirms the library is in use)"
-pmbootstrap --details-to-stdout build --src="$SRC" "$PKG" ${EXTRA[@]+"${EXTRA[@]}"}
+pmbootstrap --details-to-stdout build --lax --src="$SRC" "$PKG" ${EXTRA[@]+"${EXTRA[@]}"}

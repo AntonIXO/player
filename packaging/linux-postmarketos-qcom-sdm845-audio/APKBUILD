@@ -3,14 +3,19 @@
 # Kernel config based on: arch/arm64/configs/defconfig and sdm845.config
 maintainer="Casey Connolly <kcxt@postmarketos.org>"
 # Audiophile/host-VBUS variant of linux-postmarketos-qcom-sdm845 for the Poco F1
-# (beryllium) bit-perfect player. Same kernel + _flavor as upstream (so it produces
-# identical boot/dtb/module artifacts), plus the 0002-0005 DTS/driver patches and the
+# (beryllium) bit-perfect player. Same _flavor as upstream (so it produces identical
+# boot/dtb/module artifacts), plus the 0002-0006 DTS/driver patches and the
 # REGULATOR_QCOM_USB_VBUS=y config delta. Renamed pkgname so it can live alongside the
 # upstream package in pmaports (custom-* overlay); provides/replaces let it substitute.
+#
+# Base: mainline stable v7.1.6 from kernel.org + the sdm845-mainline device delta as
+# 0001 (see that patch's header). Upstream pmaports still ships the fork's own
+# sdm845-7.1-rc1-r0 tarball, i.e. 7.1.0-rc1; the fork has not been rebased since
+# 2026-05-08, so tracking 7.1.y directly is how this package gets stable fixes.
 _flavor="postmarketos-qcom-sdm845"
 pkgname=linux-$_flavor-audio
-pkgver=7.1_rc1
-pkgrel=10
+pkgver=7.1.6
+pkgrel=0
 pkgdesc="Mainline SDM845 kernel for beryllium audio player (switchable USB DRD host-first + PMI8998 VBUS + RT/USB-audio tuning)"
 provides="linux-$_flavor=$pkgver-r$pkgrel"
 replaces="linux-$_flavor"
@@ -35,20 +40,21 @@ makedepends="
 	zstd
 "
 
-_tag="sdm845-7.1-rc1-r0"
 _defconfig="defconfig"
 
 # Source
 source="
-	linux-$_tag.tar.gz::https://gitlab.com/sdm845-mainline/linux/-/archive/$_tag/linux-$_tag.tar.gz
+	https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-$pkgver.tar.xz
 	config-postmarketos-qcom-sdm845.aarch64
+	0001-sdm845-mainline-device-support-on-v7.1.6.patch
 	0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
 	0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
 	0004-regulator-qcom_usb_vbus-regulator-add-pmi8998-support.patch
 	0005-arm64-dts-qcom-sdm845-xiaomi-beryllium-self-power-usb-host-vbus.patch
 	0006-sound-usb-tune-usb-audio-compiler-flags.patch
+	enable-dynamic-ftrace.patch
 "
-builddir="$srcdir/linux-$_tag"
+builddir="$srcdir/linux-$pkgver"
 
 prepare() {
 	default_prepare
@@ -96,11 +102,13 @@ package() {
 }
 
 sha512sums="
-94da173aaf74dd33ef8ff9015e92759481cd0da5bd8a1e52c8664fd372d48a1155655001ad2e9d26557733c71ae8bc448e4ebdf1372b8f32159907a35f0306a9  linux-sdm845-7.1-rc1-r0.tar.gz
-4b233ca896d2f055f979f657c623edf0f94300a5261aa28dfe4d77dcb4fb8ca9e1d0f08379f65a39b385dcef32cb03df7ac27a6bf087f13712431f95f57e8baa  config-postmarketos-qcom-sdm845.aarch64
+5a6222e363653ef52adaeed37a1f2ad1a343214e0a5501d70c9170c963d15187b1e2016e72306d96efe5a2a71218a097d8368f7db3b5e48367365be3cb3cea94  linux-7.1.6.tar.xz
+6ea024000604cf1f83a9ad5aa87a2d377152e0299170bf78ad92767b45c441baa05699bdc6e41c07523b09b65de76cea0bbb200a1849d8e7b728dfc3085dc9f7  config-postmarketos-qcom-sdm845.aarch64
+c72a6930844329667bfdd91a63424f1a11c31deb40f08557e165ad69e99aba30ce3eeddec9192eb1d6c1098becc4fbc3b82d8185f42be6a5b075fff925423e4c  0001-sdm845-mainline-device-support-on-v7.1.6.patch
 72394d24413387ade6f2cf497228d4d11d0683a1012cba321306c808f63d45fb42988c0b6ce19575d2880f58c15e5c405e9c6616df465f34dd8c3c54f421cb42  0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
 8232c4f7a428310426f020cd372a7821711e0407cf09951cd3ccc0f4a83a8236332af2d88bf0708f320ce28fb2585f9a5e5c29785d6e756a904336caa43425f9  0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
 b7ae73767e18ae0d5da0f06cf541697a3e0d586864c20ed8f0c36dea61401030c56179bcd10486bd5f56a624d7c66d6f592822560302d4970071f50bf89be480  0004-regulator-qcom_usb_vbus-regulator-add-pmi8998-support.patch
 c83af906eed5cedb19f47122926b9f4988e0605f0e4062ea6d6a8433c095565fe45cf3dde86b8b754cc20a6e777c1fcc34f576852b247a06e2c3169b084c0f44  0005-arm64-dts-qcom-sdm845-xiaomi-beryllium-self-power-usb-host-vbus.patch
 77a298d7480fb1cc584f69c99726131204eb346fafa56155aec459a59b6066722a7b85493311d745873f5fe55128420d607d3db52989bdb43f9d27b37d5537e4  0006-sound-usb-tune-usb-audio-compiler-flags.patch
+e8b595f3e076896dc38f249c8908d58e2e6a858eaa77fe1e680f27db0e76d3d74c0b5dfebb7a4c57d546fee0b0f6eb81a38b20dfd72f985c9d02f28d79a5eceb  enable-dynamic-ftrace.patch
 "

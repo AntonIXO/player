@@ -1,0 +1,5 @@
+# Re-apply the threshold when the battery power-supply device is registered.
+# The helper is deliberately a no-op on kernels without the standard writable
+# charge_control_* properties.
+ACTION=="add", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", \
+	TAG+="systemd", ENV{SYSTEMD_WANTS}+="hifi-player-charge-limit.service"

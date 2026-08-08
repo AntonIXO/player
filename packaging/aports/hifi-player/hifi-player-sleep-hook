@@ -100,6 +100,12 @@ case "${1:-}" in
 		elif [ -x /usr/bin/hifi-player-audio-setup ]; then
 			/usr/bin/hifi-player-audio-setup start 2>/dev/null
 		fi
+		# Charger state can be reset while the PMIC resumes. Re-apply the
+		# standard threshold if this kernel exposes it; the helper is a no-op
+		# on older kernels.
+		if [ -x /usr/libexec/hifi-player-charge-limit ]; then
+			/usr/libexec/hifi-player-charge-limit >/dev/null 2>&1 || true
+		fi
 		rfkill unblock wifi 2>/dev/null
 		rfkill unblock bluetooth 2>/dev/null
 		log "post-resume complete (mode=$MODE)"

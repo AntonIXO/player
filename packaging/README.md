@@ -4,8 +4,9 @@ Builds the player as an Alpine **`.apk`** for the **Poco F1 (beryllium / SDM845,
 aarch64)** running postmarketOS, bundling the bit-perfect player (`player-gtk` +
 `player-cli`) with the audio-optimization config from the install guide.
 
-`aports/hifi-player/` is the package source (APKBUILD + systemd service + udev / limits
-/ modprobe / sysctl / kernel-cmdline files + Phosh launcher). It targets the
+`aports/hifi-player/` is the package source (APKBUILD + systemd services + greetd/Phosh
+autologin + user-session autostart + udev / limits / modprobe / sysctl / kernel-cmdline
+files + Phosh launcher). It targets the
 postmarketOS **systemd** variant. It is built **natively
 inside pmbootstrap's aarch64 chroot** (qemu-emulated) — no host cross-compile, so the
 whole GTK4 workspace links against Alpine's musl libraries.
@@ -16,7 +17,11 @@ whole GTK4 workspace links against Alpine's musl libraries.
 |---|---|
 | `/usr/bin/player-gtk`, `/usr/bin/player-cli` | the player + CLI |
 | `/usr/share/applications/hifi-player.desktop` + icon | Phosh app-grid entry |
+| `/etc/xdg/autostart/hifi-player-autostart.desktop` | launch `player-gtk` inside the authenticated Phosh user session |
+| `greetd.service.d/90-hifi-player-autologin.conf` + `/usr/libexec/hifi-player-greetd-config` | greetd `initial_session` for the non-root `/etc/default_user`, with phrog retained as the fallback greeter |
+| `/etc/default/hifi-player` | reversible boot policy plus battery thresholds (`HIFI_PLAYER_AUTOLOGIN` / `HIFI_PLAYER_AUTOSTART` / `HIFI_PLAYER_CHARGE_LIMIT`) |
 | `/usr/bin/hifi-player-audio-setup` + `…/systemd/system/hifi-player-audio-setup.service` (+ preset) | systemd oneshot: USB host mode (OTG workaround), perf governor on CPUs 4-7, SCHED_FIFO on USB IRQ threads |
+| `/usr/libexec/hifi-player-charge-limit` + `hifi-player-charge-limit.service` + udev rule | restore the standard PMI8998 battery threshold at boot, battery registration, and resume; no-op on unsupported kernels |
 | `/etc/udev/rules.d/99-mojo2-nopulse.rules` | keep the sound server off the DAC |
 | `/etc/udev/rules.d/99-cpu-dma-latency.rules` | audio-group access to `/dev/cpu_dma_latency` |
 | `/etc/security/limits.d/99-audio.conf` | `@audio` rtprio/memlock/nice |
@@ -25,6 +30,42 @@ whole GTK4 workspace links against Alpine's musl libraries.
 | `/etc/kernel-cmdline.d/90-audio.conf` | `threadirqs usbcore.autosuspend=-1 processor.max_cstate=1 snd-usb-audio.nrpacks=1` |
 | `/usr/lib/systemd/system/var-log.mount` | volatile `/var/log` on tmpfs (16M cap) — cut flash writeback; see `docs/ARCHQ.md` |
 | `/usr/share/hifi-player/cmdline-experimental.conf` | inert (OFF) A/B knob `skew_tick=1 rcu.blimit=64` — opt-in only; see `docs/ARCHQ.md` §9 |
+
+### Fast Phosh boot
+
+The image uses the current postmarketOS `systemd + greetd + phrog + Phosh` path.
+The package does not auto-login root or bypass PAM: greetd starts a non-root
+`initial_session` using `/usr/bin/phosh-session`, and `player-gtk` is launched by
+Phosh's user-session autostart once Wayland and the user D-Bus are ready. The normal
+phrog greeter remains in the generated config as the recovery path. Set
+`HIFI_PLAYER_AUTOLOGIN=0` or `HIFI_PLAYER_AUTOSTART=0` in `/etc/default/hifi-player`
+to opt out and reboot.
+
+The audio setup unit no longer waits for `sound.target`; it only waits for udev and
+is ordered before greetd. This lets it assert USB host mode before the graphical
+session without introducing a fixed sleep or making the player depend on a slow
+sound-device enumeration.
+
+### Battery charge limit
+
+The stock 7.1.6 qcom_smbx/pmi8998 drivers expose capacity and charger enable, but
+not a percentage threshold. The bundled kernel patch connects those existing
+controls through Linux's standard `charge_control_end_threshold` and
+`charge_control_start_threshold` battery properties. The fuel-gauge SOC interrupt
+enforces the end value in-kernel and resumes at the start value, avoiding a polling
+daemon and keeping the USB power path available while battery charging is inhibited.
+
+The package applies 90% with 85% resume hysteresis by default. Verify on the device:
+
+```sh
+cat /sys/class/power_supply/qcom-battery/charge_control_end_threshold
+cat /sys/class/power_supply/qcom-battery/charge_control_start_threshold
+```
+
+Set `HIFI_PLAYER_CHARGE_LIMIT=0` in `/etc/default/hifi-player` and restart
+`hifi-player-charge-limit.service` to restore full charging. If the files are
+absent, install/rebuild the bundled `linux-postmarketos-qcom-sdm845-audio` kernel;
+the helper intentionally does not guess at vendor-specific sysfs nodes.
 
 ## Build & ship
 
@@ -99,4 +140,3 @@ is clean.**
   diff, bump `pkgver`, then re-run `make ARCH=arm64 LLVM=1 olddefconfig` **with the whole patch
   series applied** (the `enable-dynamic-ftrace.patch` unlocks symbols like `HID_BPF`, so a
   config generated without it makes `syncconfig` prompt mid-build) and refresh `sha512sums`.
-

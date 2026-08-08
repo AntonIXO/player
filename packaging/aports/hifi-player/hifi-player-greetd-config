@@ -1,0 +1,84 @@
+#!/bin/sh
+# Generate the greetd configuration used by the systemd Phosh image.
+#
+# postmarketOS chooses the login user at image-install time, so the username
+# cannot be hard-coded in an APK source file. Read the canonical /etc/default_user
+# first and fall back to pmOS's UID 10000. The generated file lives in /run and
+# is recreated by the greetd service before every start.
+set -u
+
+out=${1:-/run/hifi-player-greetd/config.toml}
+out_dir=$(dirname "$out")
+mkdir -p "$out_dir"
+chmod 0755 "$out_dir"
+
+if [ -r /etc/default/hifi-player ]; then
+	. /etc/default/hifi-player
+fi
+
+write_phrog_fallback() {
+	if [ -r /etc/phrog/greetd-config.toml ]; then
+		cp /etc/phrog/greetd-config.toml "$out"
+	else
+		cat >"$out" <<'EOF'
+[terminal]
+vt = 7
+
+[default_session]
+command = "/usr/libexec/phrog-greetd-session"
+user = "greetd"
+EOF
+	fi
+	chmod 0644 "$out"
+}
+
+[ "${HIFI_PLAYER_AUTOLOGIN:-1}" = 1 ] || {
+	write_phrog_fallback
+	exit 0
+}
+
+user=
+if [ -r /etc/default_user ]; then
+	user=$(sed -n '1p' /etc/default_user | tr -d '[:space:]')
+fi
+
+# Only pass a validated local account to TOML. This also prevents an accidental
+# config injection if a damaged default_user file contains punctuation.
+case "$user" in
+	''|*[!A-Za-z0-9._-]*) user= ;;
+esac
+if [ -n "$user" ] && ! getent passwd "$user" >/dev/null 2>&1; then
+	user=
+fi
+
+if [ -z "$user" ]; then
+	user=$(getent passwd 10000 2>/dev/null | cut -d: -f1)
+fi
+
+case "$user" in
+	''|*[!A-Za-z0-9._-]*)
+		# A missing account must leave the regular greeter usable rather than
+		# making greetd fail to start.
+		write_phrog_fallback
+		exit 0
+		;;
+esac
+
+if [ ! -x /usr/bin/phosh-session ] || [ ! -x /usr/libexec/phrog-greetd-session ]; then
+	write_phrog_fallback
+	exit 0
+fi
+
+cat >"$out" <<EOF
+[terminal]
+vt = 7
+
+[default_session]
+command = "/usr/libexec/phrog-greetd-session"
+user = "greetd"
+
+[initial_session]
+command = "/usr/bin/phosh-session"
+user = "$user"
+EOF
+chmod 0644 "$out"

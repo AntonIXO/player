@@ -1,0 +1,17 @@
+#!/bin/sh
+# Start the player inside the authenticated Phosh user session.
+#
+# This is deliberately a small wrapper instead of a system service: it inherits
+# the Wayland and user-bus environment created by greetd/PAM/gnome-session.
+set -u
+
+if [ -r /etc/default/hifi-player ]; then
+	. /etc/default/hifi-player
+fi
+
+[ "${HIFI_PLAYER_AUTOSTART:-1}" = 1 ] || exit 0
+
+exec env \
+	PLAYER_AUDIO_CPU="${PLAYER_AUDIO_CPU:-7}" \
+	GSK_RENDERER="${GSK_RENDERER:-vulkan}" \
+	/usr/bin/player-gtk

@@ -1,0 +1,7 @@
+[Unit]
+Description=Apply the hifi-player battery charge threshold
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/hifi-player-charge-limit

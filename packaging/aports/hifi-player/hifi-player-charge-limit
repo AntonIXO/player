@@ -1,0 +1,91 @@
+#!/bin/sh
+# Apply the battery charge threshold exposed by the PMI8998 fuel-gauge driver.
+#
+# The kernel-side policy is event-driven: this helper only restores the
+# configured values at boot and after resume.  If the active kernel does not
+# expose the standard writable power-supply property, leave charging alone and
+# report that fact instead of guessing at a vendor sysfs node.
+set -u
+
+if [ -r /etc/default/hifi-player ]; then
+	. /etc/default/hifi-player
+fi
+
+log() {
+	logger -t hifi-charge-limit "$@" 2>/dev/null || true
+}
+
+limit=${HIFI_PLAYER_CHARGE_LIMIT:-90}
+start=${HIFI_PLAYER_CHARGE_START:-85}
+sysfs_root=${HIFI_PLAYER_SYSFS_ROOT:-/sys}
+
+case "$limit" in
+	0)
+		# 0 is the package-level opt-out: restore full charging.
+		limit=100
+		start=0
+		;;
+	''|*[!0-9]*)
+		log "invalid HIFI_PLAYER_CHARGE_LIMIT=$limit; leaving charging unchanged"
+		exit 0
+		;;
+esac
+
+case "$start" in
+	''|*[!0-9]*)
+		log "invalid HIFI_PLAYER_CHARGE_START=$start; deriving hysteresis"
+		start=0
+		;;
+esac
+
+if [ "$limit" -lt 1 ] || [ "$limit" -gt 100 ]; then
+	log "HIFI_PLAYER_CHARGE_LIMIT=$limit is outside 1..100; leaving charging unchanged"
+	exit 0
+fi
+
+if [ "$start" -ge "$limit" ]; then
+	if [ "$limit" -gt 5 ]; then
+		start=$((limit - 5))
+	else
+		start=0
+	fi
+fi
+
+applied=0
+for supply in "$sysfs_root"/class/power_supply/*; do
+	[ -r "$supply/type" ] || continue
+	[ "$(cat "$supply/type" 2>/dev/null)" = Battery ] || continue
+
+	end_attr="$supply/charge_control_end_threshold"
+	start_attr="$supply/charge_control_start_threshold"
+	[ -w "$end_attr" ] || continue
+
+	# Keep the start threshold below the end threshold while changing values.
+	current_end=$(cat "$end_attr" 2>/dev/null || true)
+	if [ -w "$start_attr" ] && [ "$current_end" -ge 0 ] 2>/dev/null &&
+		[ "$start" -ge "$current_end" ]; then
+		# Raising an already-lowered cap requires the end threshold first;
+		# otherwise the kernel correctly rejects start >= current end.
+		printf '%s\n' "$limit" > "$end_attr" 2>/dev/null || continue
+		printf '%s\n' "$start" > "$start_attr" 2>/dev/null || continue
+	else
+		if [ -w "$start_attr" ]; then
+			printf '%s\n' "$start" > "$start_attr" 2>/dev/null || continue
+		fi
+		printf '%s\n' "$limit" > "$end_attr" 2>/dev/null || continue
+	fi
+
+	applied=1
+	actual=$(cat "$end_attr" 2>/dev/null || true)
+	if [ "$actual" = "$limit" ]; then
+		log "applied charge threshold ${limit}% (resume ${start}%) to ${supply##*/}"
+	else
+		log "charge threshold request ${limit}% read back as ${actual:-unavailable} on ${supply##*/}"
+	fi
+done
+
+if [ "$applied" -eq 0 ]; then
+	log "active kernel exposes no writable battery charge threshold; charging unchanged"
+fi
+
+exit 0

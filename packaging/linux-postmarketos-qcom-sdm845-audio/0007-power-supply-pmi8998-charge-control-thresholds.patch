@@ -1,0 +1,280 @@
+From 2a8b0c70a5f5c4f0f9a7f2b4e3d1c6a8b9e0f123 Mon Sep 17 00:00:00 2001
+From: Anton Ivanov <fourth@devpins.org>
+Date: Sat, 8 Aug 2026 00:00:00 +0300
+Subject: [PATCH] power: supply: add PMI8998 charge control thresholds
+
+The mainline PMI8998 fuel-gauge driver reports state of charge, while the
+SMB2 charger already has a software charge-enable bit. Connect it to the
+standard power-supply charge threshold properties. The fuel gauge's SOC
+interrupt drives a small work item, so userspace does not need to poll; the
+charger is re-evaluated after a cable event.
+
+This is a software threshold implemented with the documented charger enable
+control; it is deliberately not a raw PMIC register interface. The start
+threshold provides hysteresis. The default end threshold of 100 keeps
+the feature disabled until userspace selects a lower value.
+
+Signed-off-by: Anton Ivanov <fourth@devpins.org>
+---
+--- a/drivers/power/supply/qcom_smbx.c
++++ b/drivers/power/supply/qcom_smbx.c
+@@ -638,8 +638,25 @@
+ 
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+-		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+-					  USBIN_SUSPEND_BIT, !val->intval);
++		/*
++		 * STATUS is writable for this charger.  Use the charger enable
++		 * command rather than USB input suspend so the phone can keep
++		 * using power from an attached adapter while battery charging is
++		 * inhibited by the battery charge-control policy.
++		 */
++		switch (val->intval) {
++		case POWER_SUPPLY_STATUS_CHARGING:
++			return regmap_update_bits(chip->regmap,
++						 chip->base + CHARGING_ENABLE_CMD,
++						 CHARGING_ENABLE_CMD_BIT,
++						 CHARGING_ENABLE_CMD_BIT);
++		case POWER_SUPPLY_STATUS_NOT_CHARGING:
++			return regmap_update_bits(chip->regmap,
++						 chip->base + CHARGING_ENABLE_CMD,
++						 CHARGING_ENABLE_CMD_BIT, 0);
++		default:
++			return -EINVAL;
++		}
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 		return smb_set_current_limit(chip, val->intval);
+ 	default:
+--- a/drivers/power/supply/pmi8998_fg.c
++++ b/drivers/power/supply/pmi8998_fg.c
+@@ -6,6 +6,7 @@
+ #include <linux/kernel.h>
+ #include <linux/math64.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+ #include <linux/of_irq.h>
+@@ -51,6 +52,11 @@
+ 	struct power_supply *chg_psy;
+ 	int status;
+ 	struct delayed_work status_changed_work;
++	struct work_struct charge_control_work;
++	/* Protect threshold values and charge-enable transitions. */
++	struct mutex charge_control_lock;
++	int charge_control_start_threshold;
++	int charge_control_end_threshold;
+ };
+ 
+ /*
+@@ -162,6 +167,70 @@
+ 	return 0;
+ }
+ 
++static int pmi8998_fg_set_charging(struct pmi8998_fg_chip *chip, bool enable)
++{
++	union power_supply_propval value = {
++		.intval = enable ? POWER_SUPPLY_STATUS_CHARGING :
++				   POWER_SUPPLY_STATUS_NOT_CHARGING,
++	};
++
++	if (!chip->chg_psy)
++		return -ENODEV;
++
++	return power_supply_set_property(chip->chg_psy,
++					 POWER_SUPPLY_PROP_STATUS, &value);
++}
++
++static void pmi8998_fg_charge_control_worker(struct work_struct *work)
++{
++	struct pmi8998_fg_chip *chip = container_of(work,
++							struct pmi8998_fg_chip,
++							charge_control_work);
++	union power_supply_propval value;
++	int capacity, ret;
++
++	mutex_lock(&chip->charge_control_lock);
++
++	if (!chip->chg_psy)
++		goto out_unlock;
++
++	ret = power_supply_get_property(chip->chg_psy,
++					POWER_SUPPLY_PROP_ONLINE, &value);
++	if (ret || !value.intval)
++		goto out_unlock;
++
++	ret = power_supply_get_property(chip->chg_psy,
++					POWER_SUPPLY_PROP_STATUS, &value);
++	if (ret)
++		goto out_unlock;
++
++	if (chip->charge_control_end_threshold >= 100) {
++		if (value.intval == POWER_SUPPLY_STATUS_NOT_CHARGING)
++			pmi8998_fg_set_charging(chip, true);
++		goto out_unlock;
++	}
++
++	ret = pmi8998_fg_get_capacity(chip, &capacity);
++	if (ret)
++		goto out_unlock;
++
++	if (capacity >= chip->charge_control_end_threshold &&
++	    value.intval == POWER_SUPPLY_STATUS_CHARGING) {
++		ret = pmi8998_fg_set_charging(chip, false);
++		if (ret)
++			dev_warn(chip->dev, "failed to suspend charging: %d\n", ret);
++	} else if (capacity <= chip->charge_control_start_threshold &&
++		   (value.intval == POWER_SUPPLY_STATUS_NOT_CHARGING ||
++		    value.intval == POWER_SUPPLY_STATUS_FULL)) {
++		ret = pmi8998_fg_set_charging(chip, true);
++		if (ret)
++			dev_warn(chip->dev, "failed to resume charging: %d\n", ret);
++	}
++
++out_unlock:
++	mutex_unlock(&chip->charge_control_lock);
++}
++
+ /**
+  * @brief pmi8998_fg_get_temperature() - Get temperature of battery
+  *
+@@ -307,6 +376,8 @@
+ 	POWER_SUPPLY_PROP_TEMP_MAX,
+ 	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
+ 	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+ };
+ 
+ static int pmi8998_fg_get_property(struct power_supply *psy,
+@@ -377,6 +448,15 @@
+ 	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
+ 		ret = pmi8998_fg_get_temp_threshold(chip, psp, &val->intval);
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		mutex_lock(&chip->charge_control_lock);
++		if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD)
++			val->intval = chip->charge_control_start_threshold;
++		else
++			val->intval = chip->charge_control_end_threshold;
++		mutex_unlock(&chip->charge_control_lock);
++		break;
+ 	default:
+ 		dev_err(chip->dev, "invalid property: %d\n", psp);
+ 		return -EINVAL;
+@@ -385,12 +465,65 @@
+ 	return ret;
+ }
+ 
++static int pmi8998_fg_set_property(struct power_supply *psy,
++				   enum power_supply_property psp,
++				   const union power_supply_propval *val)
++{
++	struct pmi8998_fg_chip *chip = power_supply_get_drvdata(psy);
++	int start, end;
++
++	mutex_lock(&chip->charge_control_lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		if (val->intval < 0 || val->intval >=
++				chip->charge_control_end_threshold) {
++			mutex_unlock(&chip->charge_control_lock);
++			return -EINVAL;
++		}
++		chip->charge_control_start_threshold = val->intval;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		if (val->intval < 1 || val->intval > 100) {
++			mutex_unlock(&chip->charge_control_lock);
++			return -EINVAL;
++		}
++		chip->charge_control_end_threshold = val->intval;
++		if (chip->charge_control_start_threshold >= val->intval) {
++			start = val->intval > 5 ? val->intval - 5 : 0;
++			chip->charge_control_start_threshold = start;
++		}
++		break;
++	default:
++		mutex_unlock(&chip->charge_control_lock);
++		return -EINVAL;
++	}
++
++	start = chip->charge_control_start_threshold;
++	end = chip->charge_control_end_threshold;
++	mutex_unlock(&chip->charge_control_lock);
++
++	dev_info(chip->dev, "charge threshold %d%%-%d%%\n", start, end);
++	schedule_work(&chip->charge_control_work);
++
++	return 0;
++}
++
++static int pmi8998_fg_property_is_writeable(struct power_supply *psy,
++					    enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++		psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
+ static const struct power_supply_desc batt_psy_desc = {
+ 	.name = "qcom-battery",
+ 	.type = POWER_SUPPLY_TYPE_BATTERY,
+ 	.properties = pmi8998_fg_props,
+ 	.num_properties = ARRAY_SIZE(pmi8998_fg_props),
+ 	.get_property = pmi8998_fg_get_property,
++	.set_property = pmi8998_fg_set_property,
++	.property_is_writeable = pmi8998_fg_property_is_writeable,
+ };
+ 
+ /*
+@@ -497,6 +630,7 @@
+ 
+ 	/* Signal change in state of charge */
+ 	power_supply_changed(chip->batt_psy);
++	schedule_work(&chip->charge_control_work);
+ 	dev_dbg(chip->dev, "SOC changed");
+ 
+ 	return IRQ_HANDLED;
+@@ -520,12 +654,16 @@
+ 	if (psy == chip->chg_psy) {
+ 		ret = power_supply_get_property(psy,
+ 						POWER_SUPPLY_PROP_STATUS, &propval);
+-		if (ret)
++		if (ret) {
+ 			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
++			schedule_work(&chip->charge_control_work);
++			return NOTIFY_OK;
++		}
+ 
+ 		chip->status = propval.intval;
+ 
+ 		power_supply_changed(chip->batt_psy);
++		schedule_work(&chip->charge_control_work);
+ 
+ 		if (chip->status == POWER_SUPPLY_STATUS_UNKNOWN) {
+ 			/*
+@@ -560,6 +698,12 @@
+ 	if (!chip)
+ 		return -ENOMEM;
+ 
++	mutex_init(&chip->charge_control_lock);
++	INIT_WORK(&chip->charge_control_work,
++		  pmi8998_fg_charge_control_worker);
++	chip->charge_control_start_threshold = 85;
++	chip->charge_control_end_threshold = 100;
++
+ 	chip->dev = &pdev->dev;
+ 
+ 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+@@ -661,6 +805,8 @@
+ 		}
+ 	}
+ 
++	schedule_work(&chip->charge_control_work);
++
+ 	return 0;
+ }
+ 

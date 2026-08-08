@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Bit-Perfect Player (autostart)
+Comment=Start the bit-perfect player in the Phosh user session
+Exec=/usr/bin/hifi-player-autostart
+TryExec=/usr/bin/hifi-player-autostart
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-Phase=Application

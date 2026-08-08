@@ -1,7 +1,7 @@
 [Unit]
 Description=Bit-perfect player audio environment (USB host mode, RT, governors)
-After=sound.target systemd-udevd.service
-Wants=sound.target
+After=systemd-udevd.service
+Before=greetd.service
 
 [Service]
 Type=oneshot

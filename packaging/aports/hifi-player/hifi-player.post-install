@@ -11,14 +11,34 @@ glib-compile-schemas /usr/share/glib-2.0/schemas >/dev/null 2>&1 || true
 
 cat >&2 <<'EOF'
 
-hifi-player installed. Four manual follow-ups (one-time):
+hifi-player installed. Automatic login is enabled for the configured non-root
+postmarketOS user: greetd/PAM still creates the session, but the Phosh greeter
+is skipped and player-gtk starts from the user session.
+
+To restore the greeter, set HIFI_PLAYER_AUTOLOGIN=0 in /etc/default/hifi-player
+and reboot. To keep the automatic login but stop player-gtk from starting, set
+HIFI_PLAYER_AUTOSTART=0 and reboot.
+
+Battery charging is capped at 90% by default. The bundled PMI8998 kernel driver
+implements the standard power-supply threshold with 85% resume hysteresis; verify
+it with:
+
+  cat /sys/class/power_supply/qcom-battery/charge_control_end_threshold
+  cat /sys/class/power_supply/qcom-battery/charge_control_start_threshold
+
+To restore full charging, set HIFI_PLAYER_CHARGE_LIMIT=0 in
+/etc/default/hifi-player and restart hifi-player-charge-limit.service. If the
+threshold files are absent, the running kernel is older than the bundled charge
+control patch and charging is left unchanged.
+
+Four manual follow-ups (one-time):
 
   1. Add your login user to the 'audio' group (RT scheduling + DAC access):
          sudo adduser <user> audio          # then log out and back in
      (PAM applies /etc/security/limits.d/99-audio.conf to the graphical session.)
 
   2. Apply the kernel cmdline audio tuning in /etc/kernel-cmdline.d/90-audio.conf:
-         sudo apk fix linux-postmarketos-qcom-sdm845   # rebuilds the boot image
+         sudo apk fix linux-postmarketos-qcom-sdm845-audio # rebuilds the boot image
      then reflash the kernel / reboot.
 
   3. If a sound server still grabs the DAC, set its vendor:product in
@@ -33,7 +53,7 @@ hifi-player installed. Four manual follow-ups (one-time):
       knob (skew_tick=1 rcu.blimit=64) is shipped inert. To try it:
          sudo cp /usr/share/hifi-player/cmdline-experimental.conf \
                  /etc/kernel-cmdline.d/91-audio-experimental.conf
-         sudo apk fix linux-postmarketos-qcom-sdm845   # rebuild boot image
+         sudo apk fix linux-postmarketos-qcom-sdm845-audio # rebuild boot image
       then reboot. MEASURE before keeping it: compare the player's "[alsa] xrun #N"
       log and 'cat /proc/interrupts | grep -iE "arch_timer|tick"' deltas with vs
       without it; revert (rm the file + apk fix) if there's no measured xrun drop.

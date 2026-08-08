@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=13
+pkgrel=15
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -75,6 +75,13 @@ options="net !check"
 source="
 	hifi-player-audio-setup
 	hifi-player-audio-setup.service
+	hifi-player-charge-limit
+	hifi-player-charge-limit.service
+	hifi-player-autostart
+	hifi-player-autostart.desktop
+	hifi-player.conf
+	hifi-player-greetd-autologin.conf
+	hifi-player-greetd-config
 	hifi-player-sleep-hook
 	hifi-player.preset
 	hifi-player.desktop
@@ -82,6 +89,7 @@ source="
 	99-mojo2-nopulse.rules
 	99-cpu-dma-latency.rules
 	99-volume-keys.rules
+	99-hifi-player-charge-limit.rules
 	99-audio.conf
 	audio.conf
 	99-audio-sysctl.conf
@@ -570,6 +578,21 @@ package() {
 	install -Dm644 "$srcdir"/hifi-player.svg \
 		"$pkgdir"/usr/share/icons/hicolor/scalable/apps/hifi-player.svg
 
+	# Fast Phosh appliance boot: greetd still creates the PAM/logind session,
+	# but its greeter is skipped for the configured non-root initial session.
+	# The player itself starts from XDG autostart so it inherits Wayland and the
+	# user D-Bus environment instead of guessing those values in a system unit.
+	install -Dm755 "$srcdir"/hifi-player-autostart \
+		"$pkgdir"/usr/bin/hifi-player-autostart
+	install -Dm644 "$srcdir"/hifi-player-autostart.desktop \
+		"$pkgdir"/etc/xdg/autostart/hifi-player-autostart.desktop
+	install -Dm644 "$srcdir"/hifi-player.conf \
+		"$pkgdir"/etc/default/hifi-player
+	install -Dm755 "$srcdir"/hifi-player-greetd-config \
+		"$pkgdir"/usr/libexec/hifi-player-greetd-config
+	install -Dm644 "$srcdir"/hifi-player-greetd-autologin.conf \
+		"$pkgdir"/usr/lib/systemd/system/greetd.service.d/90-hifi-player-autologin.conf
+
 	# systemd service: USB host mode (OTG workaround) + governors + IRQ RT.
 	# Shared imperative setup script (also runnable by hand), unit, and the
 	# preset that enables it at image build (`systemctl preset-all`).
@@ -577,6 +600,10 @@ package() {
 		"$pkgdir"/usr/bin/hifi-player-audio-setup
 	install -Dm644 "$srcdir"/hifi-player-audio-setup.service \
 		"$pkgdir"/usr/lib/systemd/system/hifi-player-audio-setup.service
+	install -Dm755 "$srcdir"/hifi-player-charge-limit \
+		"$pkgdir"/usr/libexec/hifi-player-charge-limit
+	install -Dm644 "$srcdir"/hifi-player-charge-limit.service \
+		"$pkgdir"/usr/lib/systemd/system/hifi-player-charge-limit.service
 	install -Dm644 "$srcdir"/hifi-player.preset \
 		"$pkgdir"/usr/lib/systemd/system-preset/80-hifi-player.preset
 
@@ -635,6 +662,8 @@ package() {
 		"$pkgdir"/etc/udev/rules.d/99-cpu-dma-latency.rules
 	install -Dm644 "$srcdir"/99-volume-keys.rules \
 		"$pkgdir"/etc/udev/rules.d/99-volume-keys.rules
+	install -Dm644 "$srcdir"/99-hifi-player-charge-limit.rules \
+		"$pkgdir"/etc/udev/rules.d/99-hifi-player-charge-limit.rules
 
 	# RT limits, snd-usb-audio module options, swap/dirty tuning.
 	install -Dm644 "$srcdir"/99-audio.conf \
@@ -669,14 +698,22 @@ package() {
 # with `pmbootstrap checksum hifi-player` or `abuild checksum`).
 sha512sums="
 6513ee08009b3feef1e06acd93673d0371769206a39ee0c303928e33e50694a35a81aa155becb8d63eb070efd97809623a490c7c7eb894ce2712ccfb820c4d76  hifi-player-audio-setup
-faff1c8006f71863df0f2efc0ad2a7392e4bf045f531a9a17cdfcb8f1997f23f460b6f62d24fc7e0efa6a621a7e2e9031924549448550d0eb41ac6cf71504f03  hifi-player-audio-setup.service
-e9c7f0f347ff58c8b41400e8fc3c4c0953e9dd72d1618a2aa09aac0dd5775fc6d28f84f4040eb8dc31466ea60361bd03c747aae277a642e828ed0371cd7f395a  hifi-player-sleep-hook
-640b1c10c767e9972250338743eeb49164edcdde0b11d19fc299d39daa262df4de5922d7e31a20b2c25e4d62a45973d07a49e4e95990b0cca9887da5600a4d91  hifi-player.preset
+dd41f75dbb37559674bef5a69b24440bda818eb921da1a25e6c0070da33a97a7a2c50cbbfff730ddac3499e10968a27473583e656f9575cebcf9b8baf2b2ee3f  hifi-player-audio-setup.service
+ef00483aa28eb4c8df87d617742aed8c77b98bf772e7dc2e255f9caba8866df83fa42f59535a99dbdd245b2c9d348b2de4633dc1d72ec8de9a7ad59c6647403b  hifi-player-charge-limit
+4095d7071475b09eafd3c36f18b9d658e39fede2306f176080eb50d31d13e5fd114714fcb0043b29d5dc211090b7c5599f391d54c8ac3bff5417561d0214acba  hifi-player-charge-limit.service
+9bc537658378516a210f77f337ffa324acb85977a35b498756e265b9e4dc0bf6a3870c9de3d619aa12b5681ea8dced4fac9bf69534ea7439df65f79ad7e07f36  hifi-player-autostart
+880f596aa0a48a0aeb57325c6b5565efafbcfddc908dd63641ec6a82f157c86b91af638fbe4a7fdc886bd2e71ab18e7b09ce972a88043b2ddfd1750c326d53a4  hifi-player-autostart.desktop
+350d27a41a13fba37ed946f19cf1eb8bbb27e74617e3216e259b53513c0c664b4a415b845cf4fe664d00499eb987dd71748d1ce557fda44d97b21d058380b5da  hifi-player.conf
+a3df06f6631a2dd11a202d025e491cacd14a6a31ea2c2668c680804b9a3c04584a9608d05d97a955f1ded3bd839fef986c0679487634561d78576e0fc2075c8b  hifi-player-greetd-autologin.conf
+6e9727311f37a0aa1f4a893a77e41cd78820254ec0a73986757eade3c35b9f28efb4059c95089c324d703f02eae4708fbcd6f1db45754716a5e94b7ee19b0836  hifi-player-greetd-config
+98e4f9faba26fb3b9ca1828b1e6d9f500ea9e4afc4b52f0a481d999d660e0d08db64848718db68bc6a5dd76998f335336fa91a8ea9245bb9eb308f1f42240785  hifi-player-sleep-hook
+b2b6d6f27782eec0e2452b1a089fe66d300c42a7f18d8c33289317f63aaa4211f2b6a941401fe10151d375a2a52ac47479e6d618601e5e1c94bf7d5789b39155  hifi-player.preset
 7db076b36c21b7ff385a808a7c60755bdd94b092088ac67b5f853d98fa517039e41433fd6b0e90d9c36cf4d4bd16490dfd4688b5421214bcf5fa0860e7d582b8  hifi-player.desktop
 07e2281d300d92ef337eca966b7c20f55174c21f100f877c1b74ac9fe2ac9f0f0f2be51c2694716c4258311b0a8e742751b12f21bae802b309ec0073f605560a  hifi-player.svg
 4818d2539c8af4246e4672d2ab93fa13a8bc9548870fa06bcc30a38ded52232c36aff08ba01a55bf21692137f730a230f673d8579533e5cc02548cf3955d3cc3  99-mojo2-nopulse.rules
 3928ceae0a348105d6595d624284f6e3e4acff589a49c65cfb2fe33cba00253d39805b84192bb40def6d6219abe114514eece9c228d5dd0efcfc50aeea1669b4  99-cpu-dma-latency.rules
 c1b4bb607f324b34004a36df2cc3a3cfd8e2509767dcb08f0393bd4977986943e73c95fa606572d3863f72c63272bfe0f97abf58a26c3ec5adadbeca0142e4b7  99-volume-keys.rules
+9c500d0534822ef86cf173c5c39247d7d7f7399a62e7823f2cd914066a712842e4fe9fa537be348f6ff5c2512f909a491b726e488b5d8ea6cc5f74e4683330cc  99-hifi-player-charge-limit.rules
 8f0eeeae79ed4d6ed8e5b7c203802fa53b56e3668ffb0795762fd6540ae4c9bc9d0d15b16690e6b8b10465bcfeb865b8aa1ed5932e38db5786fd2ff075cfa47d  99-audio.conf
 6fbb68c10725124c2fa2fc699afea3b641af3fd1f6e849c8766766126176915e4f4ded5e53c47412fe6a1ac00918680a5ba92aaeb801c2333960a356da0fc735  audio.conf
 25cd112f526c6ddaf8b48b0e5786e643b7b1ae66b4425b7db97db8b501245bdf1f769e913aa22bdd7718f2742ec2eedf81e9be24fd30b8d1a7645eb07c0e4af0  99-audio-sysctl.conf

@@ -1,0 +1,96 @@
+From b61cacae77ae6bbef420953234025da6e230721a Mon Sep 17 00:00:00 2001
+From: Anton Ivanov <fourth@devpins.org>
+Date: Sat, 8 Aug 2026 00:10:00 +0300
+Subject: [PATCH] power: supply: qcom_smbx: fix status register handling
+
+Test the value read from the overvoltage status register.
+
+Decode SMB2 health as a bitmask and use the based watchdog address.
+
+Program the SMB5 VCONN source bit on SMB5 hardware.
+
+Signed-off-by: Anton Ivanov <fourth@devpins.org>
+---
+ drivers/power/supply/qcom_smbx.c | 34 +++++++++++++-------------------
+ 1 file changed, 14 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/power/supply/qcom_smbx.c b/drivers/power/supply/qcom_smbx.c
+index 2a5941a..8bf598e 100644
+--- a/drivers/power/supply/qcom_smbx.c
++++ b/drivers/power/supply/qcom_smbx.c
+@@ -336,7 +336,7 @@ static int smbx_ov_status(struct smb_chip *chip)
+ 	u16 reg;
+ 	u8 mask;
+ 	int rc;
+-	u32 val;
++	unsigned int val;
+ 
+ 	switch (chip->gen) {
+ 	case SMB2:
+@@ -353,7 +353,7 @@ static int smbx_ov_status(struct smb_chip *chip)
+ 	if (rc)
+ 		return rc;
+ 
+-	return !!(reg & mask);
++	return !!(val & mask);
+ }
+ 
+ static int smb_get_prop_status(struct smb_chip *chip, int *val)
+@@ -593,26 +593,20 @@ static int smb2_get_prop_health(struct smb_chip *chip, int *val)
+ 		return rc;
+ 	}
+ 
+-	switch (stat) {
+-	case SMB2_CHARGER_ERROR_STATUS_BAT_OV_BIT:
++	if (stat & SMB2_CHARGER_ERROR_STATUS_BAT_OV_BIT)
+ 		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+-		return 0;
+-	case SMB2_BAT_TEMP_STATUS_TOO_COLD_BIT:
+-		*val = POWER_SUPPLY_HEALTH_COLD;
+-		return 0;
+-	case SMB2_BAT_TEMP_STATUS_TOO_HOT_BIT:
++	else if (stat & SMB2_BAT_TEMP_STATUS_TOO_HOT_BIT)
+ 		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
+-		return 0;
+-	case SMB2_BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT:
+-		*val = POWER_SUPPLY_HEALTH_COOL;
+-		return 0;
+-	case SMB2_BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT:
++	else if (stat & SMB2_BAT_TEMP_STATUS_TOO_COLD_BIT)
++		*val = POWER_SUPPLY_HEALTH_COLD;
++	else if (stat & SMB2_BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT)
+ 		*val = POWER_SUPPLY_HEALTH_WARM;
+-		return 0;
+-	default:
++	else if (stat & SMB2_BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT)
++		*val = POWER_SUPPLY_HEALTH_COOL;
++	else
+ 		*val = POWER_SUPPLY_HEALTH_GOOD;
+-		return 0;
+-	}
++
++	return 0;
+ }
+ 
+ static int smb_get_prop_health(struct smb_chip *chip, int *val)
+@@ -744,7 +738,7 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
+ 
+ 	power_supply_changed(chip->chg_psy);
+ 
+-	rc = regmap_write(chip->regmap, BARK_BITE_WDOG_PET,
++	rc = regmap_write(chip->regmap, chip->base + BARK_BITE_WDOG_PET,
+ 			  BARK_BITE_WDOG_PET_BIT);
+ 	if (rc < 0)
+ 		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
+@@ -781,7 +775,7 @@ static const struct smb_init_register smb5_init_seq[] = {
+ 	{ .addr = SMB5_TYPEC_TYPE_C_VCONN_CONTROL,
+ 	  .mask = SMB5_VCONN_EN_ORIENTATION_BIT | SMB5_VCONN_EN_SRC_BIT |
+ 		  SMB5_VCONN_EN_VALUE_BIT,
+-	  .val = SMB2_VCONN_EN_SRC_BIT },
++	  .val = SMB5_VCONN_EN_SRC_BIT },
+ 	{ .addr = SMB5_DEBUG_ACCESS_SRC_CFG,
+ 	  .mask = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT,
+ 	  .val = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT },
+-- 
+2.55.0
+

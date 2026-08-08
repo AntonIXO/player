@@ -51,7 +51,8 @@ if [ "$start" -ge "$limit" ]; then
 	fi
 fi
 
-applied=0
+found=0
+failed=0
 for supply in "$sysfs_root"/class/power_supply/*; do
 	[ -r "$supply/type" ] || continue
 	[ "$(cat "$supply/type" 2>/dev/null)" = Battery ] || continue
@@ -59,6 +60,7 @@ for supply in "$sysfs_root"/class/power_supply/*; do
 	end_attr="$supply/charge_control_end_threshold"
 	start_attr="$supply/charge_control_start_threshold"
 	[ -w "$end_attr" ] || continue
+	found=1
 
 	# Keep the start threshold below the end threshold while changing values.
 	current_end=$(cat "$end_attr" 2>/dev/null || true)
@@ -66,26 +68,38 @@ for supply in "$sysfs_root"/class/power_supply/*; do
 		[ "$start" -ge "$current_end" ]; then
 		# Raising an already-lowered cap requires the end threshold first;
 		# otherwise the kernel correctly rejects start >= current end.
-		printf '%s\n' "$limit" > "$end_attr" 2>/dev/null || continue
-		printf '%s\n' "$start" > "$start_attr" 2>/dev/null || continue
-	else
-		if [ -w "$start_attr" ]; then
-			printf '%s\n' "$start" > "$start_attr" 2>/dev/null || continue
+		if ! printf '%s\n' "$limit" 2>/dev/null > "$end_attr" ||
+			! printf '%s\n' "$start" 2>/dev/null > "$start_attr"; then
+			log "failed to write charge thresholds on ${supply##*/}"
+			failed=1
+			continue
 		fi
-		printf '%s\n' "$limit" > "$end_attr" 2>/dev/null || continue
+	else
+		if [ -w "$start_attr" ] &&
+			! printf '%s\n' "$start" 2>/dev/null > "$start_attr"; then
+			log "failed to write charge start threshold on ${supply##*/}"
+			failed=1
+			continue
+		fi
+		if ! printf '%s\n' "$limit" 2>/dev/null > "$end_attr"; then
+			log "failed to write charge end threshold on ${supply##*/}"
+			failed=1
+			continue
+		fi
 	fi
 
-	applied=1
-	actual=$(cat "$end_attr" 2>/dev/null || true)
-	if [ "$actual" = "$limit" ]; then
+	actual_end=$(cat "$end_attr" 2>/dev/null || true)
+	actual_start=$(cat "$start_attr" 2>/dev/null || true)
+	if [ "$actual_end" = "$limit" ] && [ "$actual_start" = "$start" ]; then
 		log "applied charge threshold ${limit}% (resume ${start}%) to ${supply##*/}"
 	else
-		log "charge threshold request ${limit}% read back as ${actual:-unavailable} on ${supply##*/}"
+		log "charge threshold ${start}-${limit}% read back as ${actual_start:-unavailable}-${actual_end:-unavailable}% on ${supply##*/}"
+		failed=1
 	fi
 done
 
-if [ "$applied" -eq 0 ]; then
+if [ "$found" -eq 0 ]; then
 	log "active kernel exposes no writable battery charge threshold; charging unchanged"
 fi
 
-exit 0
+[ "$failed" -eq 0 ]

@@ -47,8 +47,9 @@ fi
 case "$user" in
 	''|*[!A-Za-z0-9._-]*) user= ;;
 esac
-if [ -n "$user" ] && ! getent passwd "$user" >/dev/null 2>&1; then
-	user=
+if [ -n "$user" ]; then
+	uid=$(getent passwd "$user" 2>/dev/null | cut -d: -f3)
+	[ "$uid" = 10000 ] || user=
 fi
 
 if [ -z "$user" ]; then
@@ -63,6 +64,14 @@ case "$user" in
 		exit 0
 		;;
 esac
+
+# The appliance account is always the postmarketOS UID 10000 user. Never turn
+# a damaged default_user setting into an automatic root or system-account login.
+uid=$(getent passwd "$user" 2>/dev/null | cut -d: -f3)
+if [ "$uid" != 10000 ]; then
+	write_phrog_fallback
+	exit 0
+fi
 
 if [ ! -x /usr/bin/phosh-session ] || [ ! -x /usr/libexec/phrog-greetd-session ]; then
 	write_phrog_fallback

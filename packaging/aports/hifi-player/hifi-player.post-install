@@ -2,7 +2,10 @@
 # Apply the shipped preset so the audio-setup service is enabled. On image builds
 # postmarketOS runs `systemctl preset-all`; this covers live installs too. Guarded
 # so it never fails the transaction when systemd isn't running (e.g. in the chroot).
-systemctl preset hifi-player-audio-setup.service >/dev/null 2>&1 || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl preset hifi-player-audio-setup.service \
+	hifi-player-charge-limit.service >/dev/null 2>&1 || true
+systemctl start hifi-player-charge-limit.service >/dev/null 2>&1 || true
 
 # Compile the GSettings schemas so the shipped override (which adds the "Music sync"
 # tile to the Phosh curtain by default) and the plugin take effect. Guarded so it

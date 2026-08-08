@@ -1,51 +1,26 @@
-From 2a8b0c70a5f5c4f0f9a7f2b4e3d1c6a8b9e0f123 Mon Sep 17 00:00:00 2001
+From 0c68b5a0ae96d890fabb4456b13b210c85d8fba1 Mon Sep 17 00:00:00 2001
 From: Anton Ivanov <fourth@devpins.org>
 Date: Sat, 8 Aug 2026 00:00:00 +0300
-Subject: [PATCH] power: supply: add PMI8998 charge control thresholds
+Subject: [PATCH] power: supply: add safe PMI8998 charge thresholds
 
-The mainline PMI8998 fuel-gauge driver reports state of charge, while the
-SMB2 charger already has a software charge-enable bit. Connect it to the
-standard power-supply charge threshold properties. The fuel gauge's SOC
-interrupt drives a small work item, so userspace does not need to poll; the
-charger is re-evaluated after a cable event.
+Expose charge behaviour on qcom_smbx for charge-control policies.
 
-This is a software threshold implemented with the documented charger enable
-control; it is deliberately not a raw PMIC register interface. The start
-threshold provides hysteresis. The default end threshold of 100 keeps
-the feature disabled until userspace selects a lower value.
+Track policy-owned inhibits so unrelated charging controls stay intact.
+
+Require the referenced charger and defer cleanly across probe order.
+
+Quiesce notifier, IRQ, and workqueue callbacks during module removal.
+
+Release a policy-owned inhibit before the fuel-gauge module exits.
 
 Signed-off-by: Anton Ivanov <fourth@devpins.org>
 ---
---- a/drivers/power/supply/qcom_smbx.c
-+++ b/drivers/power/supply/qcom_smbx.c
-@@ -638,8 +638,25 @@
- 
- 	switch (psp) {
- 	case POWER_SUPPLY_PROP_STATUS:
--		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
--					  USBIN_SUSPEND_BIT, !val->intval);
-+		/*
-+		 * STATUS is writable for this charger.  Use the charger enable
-+		 * command rather than USB input suspend so the phone can keep
-+		 * using power from an attached adapter while battery charging is
-+		 * inhibited by the battery charge-control policy.
-+		 */
-+		switch (val->intval) {
-+		case POWER_SUPPLY_STATUS_CHARGING:
-+			return regmap_update_bits(chip->regmap,
-+						 chip->base + CHARGING_ENABLE_CMD,
-+						 CHARGING_ENABLE_CMD_BIT,
-+						 CHARGING_ENABLE_CMD_BIT);
-+		case POWER_SUPPLY_STATUS_NOT_CHARGING:
-+			return regmap_update_bits(chip->regmap,
-+						 chip->base + CHARGING_ENABLE_CMD,
-+						 CHARGING_ENABLE_CMD_BIT, 0);
-+		default:
-+			return -EINVAL;
-+		}
- 	case POWER_SUPPLY_PROP_CURRENT_MAX:
- 		return smb_set_current_limit(chip, val->intval);
- 	default:
+ drivers/power/supply/pmi8998_fg.c | 254 +++++++++++++++++++++++++++---
+ drivers/power/supply/qcom_smbx.c  |  45 ++++++
+ 2 files changed, 278 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/power/supply/pmi8998_fg.c b/drivers/power/supply/pmi8998_fg.c
+index 4bad622..54e38ca 100644
 --- a/drivers/power/supply/pmi8998_fg.c
 +++ b/drivers/power/supply/pmi8998_fg.c
 @@ -6,6 +6,7 @@
@@ -56,34 +31,50 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
  #include <linux/of_address.h>
  #include <linux/of_device.h>
  #include <linux/of_irq.h>
-@@ -51,6 +52,11 @@
+@@ -50,7 +51,15 @@ struct pmi8998_fg_chip {
+ 	struct power_supply *batt_psy;
  	struct power_supply *chg_psy;
  	int status;
++	int soc_delta_irq;
  	struct delayed_work status_changed_work;
 +	struct work_struct charge_control_work;
 +	/* Protect threshold values and charge-enable transitions. */
 +	struct mutex charge_control_lock;
 +	int charge_control_start_threshold;
 +	int charge_control_end_threshold;
++	bool charge_control_inhibited;
++	bool removing;
  };
  
  /*
-@@ -162,6 +167,70 @@
+@@ -162,6 +171,99 @@ static int pmi8998_fg_get_capacity(struct pmi8998_fg_chip *chip, int *val)
  	return 0;
  }
  
-+static int pmi8998_fg_set_charging(struct pmi8998_fg_chip *chip, bool enable)
++static int pmi8998_fg_set_charge_behaviour(struct pmi8998_fg_chip *chip,
++					   int behaviour)
 +{
 +	union power_supply_propval value = {
-+		.intval = enable ? POWER_SUPPLY_STATUS_CHARGING :
-+				   POWER_SUPPLY_STATUS_NOT_CHARGING,
++		.intval = behaviour,
 +	};
 +
-+	if (!chip->chg_psy)
-+		return -ENODEV;
-+
 +	return power_supply_set_property(chip->chg_psy,
-+					 POWER_SUPPLY_PROP_STATUS, &value);
++					 POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++					 &value);
++}
++
++static int pmi8998_fg_allow_charging(struct pmi8998_fg_chip *chip)
++{
++	int behaviour = POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++
++	return pmi8998_fg_set_charge_behaviour(chip, behaviour);
++}
++
++static int pmi8998_fg_inhibit_charging(struct pmi8998_fg_chip *chip)
++{
++	int behaviour = POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++
++	return pmi8998_fg_set_charge_behaviour(chip, behaviour);
 +}
 +
 +static void pmi8998_fg_charge_control_worker(struct work_struct *work)
@@ -91,55 +82,72 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
 +	struct pmi8998_fg_chip *chip = container_of(work,
 +							struct pmi8998_fg_chip,
 +							charge_control_work);
-+	union power_supply_propval value;
++	union power_supply_propval online, status;
 +	int capacity, ret;
 +
 +	mutex_lock(&chip->charge_control_lock);
 +
-+	if (!chip->chg_psy)
++	if (READ_ONCE(chip->removing))
 +		goto out_unlock;
-+
-+	ret = power_supply_get_property(chip->chg_psy,
-+					POWER_SUPPLY_PROP_ONLINE, &value);
-+	if (ret || !value.intval)
-+		goto out_unlock;
-+
-+	ret = power_supply_get_property(chip->chg_psy,
-+					POWER_SUPPLY_PROP_STATUS, &value);
-+	if (ret)
-+		goto out_unlock;
-+
-+	if (chip->charge_control_end_threshold >= 100) {
-+		if (value.intval == POWER_SUPPLY_STATUS_NOT_CHARGING)
-+			pmi8998_fg_set_charging(chip, true);
-+		goto out_unlock;
-+	}
 +
 +	ret = pmi8998_fg_get_capacity(chip, &capacity);
 +	if (ret)
 +		goto out_unlock;
 +
-+	if (capacity >= chip->charge_control_end_threshold &&
-+	    value.intval == POWER_SUPPLY_STATUS_CHARGING) {
-+		ret = pmi8998_fg_set_charging(chip, false);
-+		if (ret)
-+			dev_warn(chip->dev, "failed to suspend charging: %d\n", ret);
-+	} else if (capacity <= chip->charge_control_start_threshold &&
-+		   (value.intval == POWER_SUPPLY_STATUS_NOT_CHARGING ||
-+		    value.intval == POWER_SUPPLY_STATUS_FULL)) {
-+		ret = pmi8998_fg_set_charging(chip, true);
-+		if (ret)
-+			dev_warn(chip->dev, "failed to resume charging: %d\n", ret);
++	if (chip->charge_control_inhibited) {
++		if (chip->charge_control_end_threshold >= 100 ||
++		    capacity <= chip->charge_control_start_threshold) {
++			ret = pmi8998_fg_allow_charging(chip);
++			if (ret) {
++				dev_warn(chip->dev,
++					 "failed to resume charging: %d\n", ret);
++			} else {
++				chip->charge_control_inhibited = false;
++			}
++		} else {
++			ret = pmi8998_fg_inhibit_charging(chip);
++			if (ret)
++				dev_warn(chip->dev,
++					 "failed to keep charging inhibited: %d\n",
++					 ret);
++		}
++		goto out_unlock;
 +	}
++
++	if (chip->charge_control_end_threshold >= 100 ||
++	    capacity < chip->charge_control_end_threshold)
++		goto out_unlock;
++
++	ret = power_supply_get_property(chip->chg_psy,
++					POWER_SUPPLY_PROP_ONLINE, &online);
++	if (ret || !online.intval)
++		goto out_unlock;
++
++	ret = power_supply_get_property(chip->chg_psy,
++					POWER_SUPPLY_PROP_STATUS, &status);
++	if (ret || status.intval != POWER_SUPPLY_STATUS_CHARGING)
++		goto out_unlock;
++
++	ret = pmi8998_fg_inhibit_charging(chip);
++	if (ret)
++		dev_warn(chip->dev, "failed to inhibit charging: %d\n", ret);
++	else
++		chip->charge_control_inhibited = true;
 +
 +out_unlock:
 +	mutex_unlock(&chip->charge_control_lock);
 +}
 +
++static void pmi8998_fg_schedule_charge_control(struct pmi8998_fg_chip *chip)
++{
++	if (!READ_ONCE(chip->removing))
++		schedule_work(&chip->charge_control_work);
++}
++
  /**
   * @brief pmi8998_fg_get_temperature() - Get temperature of battery
   *
-@@ -307,6 +376,8 @@
+@@ -307,6 +409,8 @@ static enum power_supply_property pmi8998_fg_props[] = {
  	POWER_SUPPLY_PROP_TEMP_MAX,
  	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
  	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
@@ -148,7 +156,7 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
  };
  
  static int pmi8998_fg_get_property(struct power_supply *psy,
-@@ -377,6 +448,15 @@
+@@ -377,6 +481,15 @@ static int pmi8998_fg_get_property(struct power_supply *psy,
  	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
  		ret = pmi8998_fg_get_temp_threshold(chip, psp, &val->intval);
  		break;
@@ -164,7 +172,7 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
  	default:
  		dev_err(chip->dev, "invalid property: %d\n", psp);
  		return -EINVAL;
-@@ -385,12 +465,65 @@
+@@ -385,12 +498,69 @@ static int pmi8998_fg_get_property(struct power_supply *psy,
  	return ret;
  }
  
@@ -176,6 +184,10 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
 +	int start, end;
 +
 +	mutex_lock(&chip->charge_control_lock);
++	if (READ_ONCE(chip->removing)) {
++		mutex_unlock(&chip->charge_control_lock);
++		return -ENODEV;
++	}
 +
 +	switch (psp) {
 +	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
@@ -207,7 +219,7 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
 +	mutex_unlock(&chip->charge_control_lock);
 +
 +	dev_info(chip->dev, "charge threshold %d%%-%d%%\n", start, end);
-+	schedule_work(&chip->charge_control_work);
++	pmi8998_fg_schedule_charge_control(chip);
 +
 +	return 0;
 +}
@@ -230,51 +242,253 @@ Signed-off-by: Anton Ivanov <fourth@devpins.org>
  };
  
  /*
-@@ -497,6 +630,7 @@
+@@ -495,8 +665,12 @@ static irqreturn_t pmi8998_fg_handle_soc_delta(int irq, void *data)
+ {
+ 	struct pmi8998_fg_chip *chip = data;
  
++	if (READ_ONCE(chip->removing))
++		return IRQ_HANDLED;
++
  	/* Signal change in state of charge */
  	power_supply_changed(chip->batt_psy);
-+	schedule_work(&chip->charge_control_work);
++	pmi8998_fg_schedule_charge_control(chip);
  	dev_dbg(chip->dev, "SOC changed");
  
  	return IRQ_HANDLED;
-@@ -520,12 +654,16 @@
+@@ -507,7 +681,8 @@ static void pmi8998_fg_status_changed_worker(struct work_struct *work)
+ 	struct pmi8998_fg_chip *chip = container_of(work, struct pmi8998_fg_chip,
+ 						    status_changed_work.work);
+ 
+-	power_supply_changed(chip->batt_psy);
++	if (!READ_ONCE(chip->removing))
++		power_supply_changed(chip->batt_psy);
+ }
+ 
+ static int pmi8998_fg_notifier_call(struct notifier_block *nb, unsigned long val, void *v)
+@@ -517,15 +692,22 @@ static int pmi8998_fg_notifier_call(struct notifier_block *nb, unsigned long val
+ 	union power_supply_propval propval;
+ 	int ret;
+ 
++	if (READ_ONCE(chip->removing))
++		return NOTIFY_DONE;
++
  	if (psy == chip->chg_psy) {
  		ret = power_supply_get_property(psy,
  						POWER_SUPPLY_PROP_STATUS, &propval);
 -		if (ret)
 +		if (ret) {
  			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
-+			schedule_work(&chip->charge_control_work);
++			pmi8998_fg_schedule_charge_control(chip);
 +			return NOTIFY_OK;
 +		}
  
  		chip->status = propval.intval;
  
  		power_supply_changed(chip->batt_psy);
-+		schedule_work(&chip->charge_control_work);
++		pmi8998_fg_schedule_charge_control(chip);
  
  		if (chip->status == POWER_SUPPLY_STATUS_UNKNOWN) {
  			/*
-@@ -560,6 +698,12 @@
+@@ -560,6 +742,14 @@ static int pmi8998_fg_probe(struct platform_device *pdev)
  	if (!chip)
  		return -ENOMEM;
  
 +	mutex_init(&chip->charge_control_lock);
 +	INIT_WORK(&chip->charge_control_work,
 +		  pmi8998_fg_charge_control_worker);
++	INIT_DELAYED_WORK(&chip->status_changed_work,
++			  pmi8998_fg_status_changed_worker);
 +	chip->charge_control_start_threshold = 85;
 +	chip->charge_control_end_threshold = 100;
 +
  	chip->dev = &pdev->dev;
  
  	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
-@@ -661,6 +805,8 @@
- 		}
+@@ -610,6 +800,15 @@ static int pmi8998_fg_probe(struct platform_device *pdev)
+ 		return ret;
  	}
  
-+	schedule_work(&chip->charge_control_work);
++	chip->chg_psy = devm_power_supply_get_by_reference(chip->dev,
++							   "power-supplies");
++	if (IS_ERR(chip->chg_psy))
++		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
++				     "Failed to get charger supply\n");
++	if (!chip->chg_psy)
++		return dev_err_probe(chip->dev, -EPROBE_DEFER,
++				     "Charger supply is not registered\n");
 +
+ 	supply_config.drv_data = chip;
+ 	supply_config.fwnode = dev_fwnode(&pdev->dev);
+ 
+@@ -630,6 +829,7 @@ static int pmi8998_fg_probe(struct platform_device *pdev)
+ 			irq);
+ 		return irq;
+ 	}
++	chip->soc_delta_irq = irq;
+ 
+ 	ret = devm_request_threaded_irq(chip->dev, irq, NULL,
+ 					pmi8998_fg_handle_soc_delta,
+@@ -639,31 +839,42 @@ static int pmi8998_fg_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	/* Optional: Get charger power supply for status checking */
+-	chip->chg_psy = power_supply_get_by_reference(of_fwnode_handle(chip->dev->of_node),
+-						      "power-supplies");
+-	if (IS_ERR(chip->chg_psy)) {
+-		ret = PTR_ERR(chip->chg_psy);
+-		dev_warn(chip->dev, "Failed to get charger supply: %d\n", ret);
+-		chip->chg_psy = NULL;
++	chip->nb.notifier_call = pmi8998_fg_notifier_call;
++	ret = power_supply_reg_notifier(&chip->nb);
++	if (ret) {
++		dev_err(chip->dev, "Failed to register notifier: %d\n", ret);
++		return ret;
+ 	}
+ 
+-	if (chip->chg_psy) {
+-		INIT_DELAYED_WORK(&chip->status_changed_work,
+-				  pmi8998_fg_status_changed_worker);
+-
+-		chip->nb.notifier_call = pmi8998_fg_notifier_call;
+-		ret = power_supply_reg_notifier(&chip->nb);
+-		if (ret) {
+-			dev_err(chip->dev,
+-				"Failed to register notifier: %d\n", ret);
+-			return ret;
+-		}
+-	}
++	pmi8998_fg_schedule_charge_control(chip);
+ 
  	return 0;
  }
  
++static void pmi8998_fg_remove(struct platform_device *pdev)
++{
++	struct pmi8998_fg_chip *chip = platform_get_drvdata(pdev);
++	int ret;
++
++	WRITE_ONCE(chip->removing, true);
++	disable_irq(chip->soc_delta_irq);
++	synchronize_irq(chip->soc_delta_irq);
++	power_supply_unreg_notifier(&chip->nb);
++	cancel_work_sync(&chip->charge_control_work);
++	cancel_delayed_work_sync(&chip->status_changed_work);
++
++	mutex_lock(&chip->charge_control_lock);
++	if (chip->charge_control_inhibited) {
++		ret = pmi8998_fg_allow_charging(chip);
++		if (ret)
++			dev_warn(chip->dev,
++				 "failed to release charging inhibit: %d\n", ret);
++		else
++			chip->charge_control_inhibited = false;
++	}
++	mutex_unlock(&chip->charge_control_lock);
++}
++
+ static const struct of_device_id fg_match_id_table[] = {
+ 	{ .compatible = "qcom,pmi8998-fg" },
+ 	{ /* sentinel */ }
+@@ -672,6 +883,7 @@ MODULE_DEVICE_TABLE(of, fg_match_id_table);
+ 
+ static struct platform_driver pmi8998_fg_driver = {
+ 	.probe = pmi8998_fg_probe,
++	.remove = pmi8998_fg_remove,
+ 	.driver = {
+ 		.name = "pmi8998-fg",
+ 		.of_match_table = fg_match_id_table,
+diff --git a/drivers/power/supply/qcom_smbx.c b/drivers/power/supply/qcom_smbx.c
+index 9386adf..2a5941a 100644
+--- a/drivers/power/supply/qcom_smbx.c
++++ b/drivers/power/supply/qcom_smbx.c
+@@ -264,6 +264,7 @@ static enum power_supply_property smb_properties[] = {
+ 	POWER_SUPPLY_PROP_CURRENT_NOW,
+ 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ 	POWER_SUPPLY_PROP_HEALTH,
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_USB_TYPE,
+@@ -433,6 +434,43 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
+ 			    val_raw);
+ }
+ 
++static int smb_get_charge_behaviour(struct smb_chip *chip, int *val)
++{
++	unsigned int reg;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
++			 &reg);
++	if (rc)
++		return rc;
++
++	*val = reg & CHARGING_ENABLE_CMD_BIT ?
++		POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
++		POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++
++	return 0;
++}
++
++static int smb_set_charge_behaviour(struct smb_chip *chip, int behaviour)
++{
++	unsigned int enable;
++
++	switch (behaviour) {
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++		enable = CHARGING_ENABLE_CMD_BIT;
++		break;
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++		enable = 0;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return regmap_update_bits(chip->regmap,
++				  chip->base + CHARGING_ENABLE_CMD,
++				  CHARGING_ENABLE_CMD_BIT, enable);
++}
++
+ static void smb_status_change_work(struct work_struct *work)
+ {
+ 	unsigned int charger_type, current_ua;
+@@ -620,6 +658,8 @@ static int smb_get_property(struct power_supply *psy,
+ 		return smb_get_prop_usb_online(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		return smb_get_prop_status(chip, &val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return smb_get_charge_behaviour(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_HEALTH:
+ 		return smb_get_prop_health(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_USB_TYPE:
+@@ -640,6 +680,8 @@ static int smb_set_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+ 					  USBIN_SUSPEND_BIT, !val->intval);
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		return smb_set_charge_behaviour(chip, val->intval);
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 		return smb_set_current_limit(chip, val->intval);
+ 	default:
+@@ -653,6 +695,7 @@ static int smb_property_is_writable(struct power_supply *psy,
+ {
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 		return 1;
+ 	default:
+@@ -712,6 +755,8 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
+ static const struct power_supply_desc smb_psy_desc = {
+ 	.name = "SMB2_charger",
+ 	.type = POWER_SUPPLY_TYPE_USB,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+ 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+-- 
+2.55.0
+

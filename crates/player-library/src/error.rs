@@ -9,7 +9,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("tag error: {0}")]
-    Tag(#[from] lofty::error::LoftyError),
+    // lofty 0.25 split the monolithic `LoftyError` into per-operation error
+    // types; file reading (`read_from_path`) now yields `FileParseError`.
+    Tag(#[from] lofty::error::FileParseError),
 
     #[error("watch error: {0}")]
     Watch(#[from] notify::Error),

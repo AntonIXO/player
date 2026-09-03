@@ -86,15 +86,54 @@ if [ "$DO_VERIFY" -eq 1 ] && ! command -v ffmpeg >/dev/null; then
   exit 1
 fi
 
-if [ "$ENABLE_BOLT" -eq 1 ]; then
-  for t in llvm-bolt merge-fdata; do
-    command -v "$t" >/dev/null || {
-      echo "!! '$t' not found. BOLT needs a system LLVM built with BOLT." >&2
-      echo "   Arch/CachyOS:  sudo pacman -S llvm     (provides llvm-bolt + merge-fdata)" >&2
-      echo "   Or drop --bolt to run the PGO-only pipeline." >&2
-      exit 1
-    }
+# ---- BOLT toolchain discovery (prefer the NEWEST LLVM available) -----------
+# Distros ship both an unversioned `llvm-bolt` and versioned ones
+# (/usr/lib/llvm-<N>/bin on Debian/Ubuntu, /usr/lib/llvm<N>/bin on some others).
+# BOLT gets meaningfully better with each release (cdsort/cdsplit landed in 17/18,
+# and 19+ improved AArch64 support), so pick the highest version we can find
+# rather than whatever happens to be first on $PATH.
+BOLT=""; MERGE_FDATA=""; BOLT_VER=0
+bolt_version_of() {                     # $1 = llvm-bolt path -> major version, or 0
+  "$1" --version 2>/dev/null | sed -n 's/.*LLVM version \([0-9]\+\).*/\1/p' | head -n1
+}
+pick_bolt() {
+  local cand ver best_dir=""
+  # $ROOT/LLVM-*-Linux-{X64,ARM64} are the pinned upstream release tarballs the
+  # aarch64 packaging path (scripts/pmb-build-pgo.sh) already uses; preferring
+  # them here keeps the host and device builds on the SAME BOLT, and they're
+  # usually newer than the distro LLVM. A tarball for the wrong arch simply
+  # fails `--version` (version 0) and is skipped by the comparison below.
+  for cand in $(command -v llvm-bolt 2>/dev/null) \
+              "$ROOT"/LLVM-*-Linux-X64/bin/llvm-bolt \
+              "$ROOT"/LLVM-*-Linux-ARM64/bin/llvm-bolt \
+              /usr/lib/llvm-*/bin/llvm-bolt /usr/lib/llvm*/bin/llvm-bolt \
+              /usr/local/bin/llvm-bolt /opt/homebrew/opt/llvm*/bin/llvm-bolt; do
+    [ -x "$cand" ] || continue
+    # merge-fdata must come from the SAME LLVM as llvm-bolt (the .fdata format
+    # is not guaranteed stable across majors).
+    [ -x "$(dirname "$cand")/merge-fdata" ] || continue
+    ver="$(bolt_version_of "$cand")"; ver="${ver:-0}"
+    if [ "$ver" -gt "$BOLT_VER" ]; then BOLT_VER="$ver"; best_dir="$(dirname "$cand")"; fi
   done
+  [ -n "$best_dir" ] || return 1
+  BOLT="$best_dir/llvm-bolt"; MERGE_FDATA="$best_dir/merge-fdata"
+}
+
+if [ "$ENABLE_BOLT" -eq 1 ]; then
+  pick_bolt || {
+    echo "!! no usable llvm-bolt + merge-fdata pair found (BOLT needs an LLVM built with BOLT)." >&2
+    echo "   Arch/CachyOS:  sudo pacman -S llvm     (provides llvm-bolt + merge-fdata)" >&2
+    echo "   Debian/Ubuntu: sudo apt install llvm-<N>  (gives /usr/lib/llvm-<N>/bin/llvm-bolt)" >&2
+    echo "   Or drop --bolt to run the PGO-only pipeline." >&2
+    exit 1
+  }
+  # rustc's own LLVM only has to be the same MAJOR as BOLT's for the emitted
+  # binary to be well understood; a newer BOLT reading an older-LLVM binary is
+  # the supported direction, so we only warn if BOLT is the OLDER of the two.
+  RUSTC_LLVM="$(rustc -vV | sed -n 's/^LLVM version: \([0-9]\+\).*/\1/p')"
+  if [ -n "$RUSTC_LLVM" ] && [ "$BOLT_VER" -lt "$RUSTC_LLVM" ]; then
+    echo "   !! BOLT is LLVM $BOLT_VER but rustc emits LLVM $RUSTC_LLVM code — consider upgrading LLVM."
+  fi
 fi
 
 # crates to build/optimize
@@ -111,7 +150,7 @@ echo "== PGO/BOLT build =="
 echo "   host        : $HOST"
 echo "   profile     : $PROFILE  (strip disabled; final strip done by this script)"
 echo "   crates      : ${PKGS[*]}"
-echo "   bolt        : $([ $ENABLE_BOLT -eq 1 ] && echo on || echo off)"
+echo "   bolt        : $([ $ENABLE_BOLT -eq 1 ] && echo "on (llvm-bolt $BOLT_VER: $BOLT)" || echo off)"
 echo "   train gtk   : $([ $TRAIN_GTK -eq 1 ] && echo on || echo off)"
 echo "   music dir   : ${MUSIC_DIR:-<testfiles only>}"
 
@@ -221,15 +260,35 @@ verify_bitperfect "$TARGET_DIR/player-cli"
 if [ "$ENABLE_BOLT" -eq 1 ]; then
   echo; echo ">> [4/4] BOLT optimize"
   rm -rf "$BOLT_DIR"; mkdir -p "$BOLT_DIR"
-  # Conservative, widely-supported BOLT pass set. panic=abort means minimal
-  # unwind tables, which keeps BOLT happy; tune these if you benchmark more.
-  BOLT_OPTS=(-reorder-blocks=ext-tsp -reorder-functions=hfsort
-             -split-functions -split-all-cold -icf=1 -dyno-stats)
+  # panic=abort means minimal unwind tables, which keeps BOLT happy.
+  # Pass set tuned for a modern LLVM (>= 18) and degraded gracefully on older ones:
+  #   ext-tsp   — the extended TSP block layout (BOLT's best block orderer).
+  #   cdsort    — cache-directed function sort; supersedes hfsort/hfsort+ and is
+  #               what upstream recommends since LLVM 17. Falls back to hfsort+.
+  #   cdsplit   — 3-way hot/warm/cold function splitting (LLVM 18+), strictly
+  #               better than the old -split-all-cold 2-way split. Falls back to
+  #               -split-all-cold.
+  #   icf=safe  — identical code folding, but only where BOLT can prove function
+  #               pointers aren't compared; plain `icf=all` can merge two distinct
+  #               functions into one address, which Rust vtable/fn-pointer identity
+  #               can observe. Safety over the last fraction of a percent.
+  # (No --plt: our binaries aren't linked with -znow. No --hugify: it needs a
+  # runtime lib and buys nothing for a short-lived CLI / a phone.)
+  BOLT_OPTS=(-reorder-blocks=ext-tsp -dyno-stats)
+  BOLT_HELP="$("$BOLT" --help-list 2>&1 || true)"
+  bolt_supports() { printf '%s' "$BOLT_HELP" | grep -q -- "$1"; }
+  if bolt_supports "=cdsort"; then BOLT_OPTS+=(-reorder-functions=cdsort)
+  elif bolt_supports "=hfsort+"; then BOLT_OPTS+=(-reorder-functions=hfsort+)
+  else BOLT_OPTS+=(-reorder-functions=hfsort); fi
+  if bolt_supports "=cdsplit"; then BOLT_OPTS+=(-split-functions --split-strategy=cdsplit)
+  else BOLT_OPTS+=(-split-functions -split-all-cold); fi
+  if bolt_supports "=safe"; then BOLT_OPTS+=(-icf=safe); else BOLT_OPTS+=(-icf=1); fi
+  echo "   .. llvm-bolt $BOLT_VER: ${BOLT_OPTS[*]}"
   for bin in "${PKGS[@]}"; do
     BIN="$TARGET_DIR/$bin"
     [ -f "$BIN" ] || continue
     echo "   -- BOLT $bin: instrument"
-    llvm-bolt "$BIN" -instrument \
+    "$BOLT" "$BIN" -instrument \
       --instrumentation-file="$BOLT_DIR/$bin.fdata" \
       --instrumentation-file-append-pid \
       -o "$BIN.bolt.inst"
@@ -243,9 +302,9 @@ if [ "$ENABLE_BOLT" -eq 1 ]; then
     if [ "${#FDATA[@]}" -eq 0 ]; then
       echo "   !! no fdata for $bin — skipping its BOLT optimize"; rm -f "$BIN.bolt.inst"; continue
     fi
-    merge-fdata "${FDATA[@]}" > "$BOLT_DIR/$bin.merged.fdata"
+    "$MERGE_FDATA" "${FDATA[@]}" > "$BOLT_DIR/$bin.merged.fdata"
     echo "   -- BOLT $bin: optimize"
-    llvm-bolt "$BIN" -o "$BIN.bolted" -data="$BOLT_DIR/$bin.merged.fdata" "${BOLT_OPTS[@]}"
+    "$BOLT" "$BIN" -o "$BIN.bolted" -data="$BOLT_DIR/$bin.merged.fdata" "${BOLT_OPTS[@]}"
     mv "$BIN.bolted" "$BIN"; rm -f "$BIN.bolt.inst"
   done
   verify_bitperfect "$TARGET_DIR/player-cli"

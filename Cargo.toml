@@ -52,7 +52,7 @@ or_fun_call = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-symphonia = { version = "0.6", default-features = false, features = [
+symphonia = { version = "0.6.1", default-features = false, features = [
     "flac",
     "wav",
     "pcm",
@@ -73,7 +73,7 @@ symphonia = { version = "0.6", default-features = false, features = [
     "opt-simd-neon",
 ] }
 alsa = "0.12.1"
-rtrb = "0.3.4"
+rtrb = "0.4.0"
 crossbeam-channel = "0.5.16"
 thiserror = "2.0.20"
 libc = "0.2.189"
@@ -85,21 +85,21 @@ async-channel = "2.5.0"
 # for tag/art extraction and by player-core's tests as a bit-exact oracle. The
 # player-core audio path reads .dsf/.dff directly (dsf-meta/dff-meta below) so it
 # can seek by byte offset; the SACD .iso path is the in-tree `sacd` crate.
-dsd-reader = "0.3.1"
+dsd-reader = "0.4.0"
 # Container header parsers (the same ones dsd-reader uses): give us the audio
 # data offset / block layout needed for O(1) seeking in player-core::dsd.
-dsf-meta = "0.2.7"
-dff-meta = "0.1.5"
+dsf-meta = "0.3.0"
+dff-meta = "0.2.0"
 evdev = "0.13.2"
 id3 = "1.17.1"
-lofty = "0.24.0"
+lofty = "0.25.1"
 nucleo = "0.5.0"
 ignore = "0.4.33"
 rayon = "1.12.0"
-blake3 = "1.8.6"
+blake3 = "1.8.7"
 notify = "8.2.0"
 directories = "6.0.0"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 sacd = { path = "crates/sacd" }
 
 [profile.release]

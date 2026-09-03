@@ -414,9 +414,33 @@ EOF
 	done
 	[ -n "$_good" ] || { warning "BOLT $_tag: every fdata snapshot was corrupt"; rm -f "$_bin.inst"; return 1; }
 	$_MERGE_FDATA $_good > "$_bd/merged.fdata" || return 1
+	# Pass set, capability-probed so it also works on an older llvm-bolt:
+	#   cdsort  — cache-directed function sort, upstream's recommendation since
+	#             LLVM 17 (supersedes hfsort/hfsort+).
+	#   cdsplit — 3-way hot/warm/cold function splitting (LLVM 18+), better than
+	#             the old 2-way -split-all-cold.
+	#   icf=safe — fold identical code only where BOLT can prove no function
+	#             pointer identity is observed (Rust vtables/fn pointers can).
+	# Layout only: the bit-perfect gate below re-proves byte-equality regardless.
+	_bhelp="$($_LLVM_BOLT --help-list 2>&1 || true)"
+	_bopts="-reorder-blocks=ext-tsp -dyno-stats"
+	case "$_bhelp" in
+		*=cdsort*)  _bopts="$_bopts -reorder-functions=cdsort" ;;
+		*"=hfsort+"*) _bopts="$_bopts -reorder-functions=hfsort+" ;;
+		*)          _bopts="$_bopts -reorder-functions=hfsort" ;;
+	esac
+	case "$_bhelp" in
+		*=cdsplit*) _bopts="$_bopts -split-functions --split-strategy=cdsplit" ;;
+		*)          _bopts="$_bopts -split-functions -split-all-cold" ;;
+	esac
+	case "$_bhelp" in
+		*=safe*) _bopts="$_bopts -icf=safe" ;;
+		*)       _bopts="$_bopts -icf=1" ;;
+	esac
+	msg "BOLT $_tag: $_bopts"
+	# shellcheck disable=SC2086  # $_bopts and $_LLVM_BOLT are word lists by design
 	$_LLVM_BOLT "$_bin" -o "$_bin.bolt" -data="$_bd/merged.fdata" \
-		-reorder-blocks=ext-tsp -reorder-functions=hfsort \
-		-split-functions -split-all-cold -icf=1 || return 1
+		$_bopts || return 1
 	mv "$_bin.bolt" "$_bin"; rm -f "$_bin.inst"
 }
 

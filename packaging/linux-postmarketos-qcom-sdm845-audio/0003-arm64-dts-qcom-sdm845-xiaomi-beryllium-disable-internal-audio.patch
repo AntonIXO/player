@@ -27,7 +27,7 @@ Signed-off-by: Anton <fourth@devpins.org>
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
 --- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
-@@ -936,3 +936,9 @@
+@@ -938,3 +938,9 @@ dai@1 {
  		reg = <VOICEMMODE1>;
  	};
  };
@@ -37,5 +37,3 @@ diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch
 +&wcd9340 { status = "disabled"; };
 +&slim { status = "disabled"; };
 +&slimbam { status = "disabled"; };
---
-2.51.0

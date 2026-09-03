@@ -1,0 +1,112 @@
+From: Anton <fourth@devpins.org>
+Subject: drm/panel: port the fork's panels to the v7.2 drm_panel alloc API
+
+The sdm845-mainline device delta (patch 0001) was written against the
+pre-v7.2 drm_panel API. In v7.2 drm_panel_init() is no longer exported --
+it is static in drivers/gpu/drm/drm_panel.c and only reachable through
+__devm_drm_panel_alloc(), i.e. panels must be allocated with the
+devm_drm_panel_alloc(dev, type, member, funcs, connector_type) macro,
+which allocates the container, initialises the embedded drm_panel and
+takes the initial refcount. Three of the fork's panel drivers still call
+drm_panel_init() and fail to build:
+
+  drivers/gpu/drm/panel/panel-lg-sw49410-lh609qh1.c:472: error: call to
+    undeclared function 'drm_panel_init'
+  drivers/gpu/drm/panel/panel-novatek-nt35596s.c:479: error: call to
+    undeclared function 'drm_panel_init'
+  drivers/gpu/drm/panel/panel-samsung-ea8076.c:217: (same, the build stops
+    at the first two)
+
+sw49410 already allocates with devm_drm_panel_alloc() and merely kept a
+leftover drm_panel_init() call, so the call is simply dropped. nt35596s
+and ea8076 are converted from devm_kzalloc() to devm_drm_panel_alloc();
+the funcs/connector-type arguments move from the removed init call into
+the allocation, so behaviour is unchanged.
+
+Also silence
+
+  drivers/gpu/drm/panel/panel-lg-sw43408.c:62:12: warning: unused function
+    'sw43408_unprepare'
+
+which the fork introduces on purpose: 0001 splits sw43408's power-down
+into ->disable and ->unprepare but leaves `.unprepare` commented out in
+sw43408_funcs (the panel is not powered down on the OnePlus 6). Keep the
+helper and its intent, mark it __maybe_unused.
+
+None of these panels are used by beryllium (the Poco F1 uses
+novatek-nt36672a / ebbg-ft8719), but they are built =y by the config, so
+they must compile.
+
+--- a/drivers/gpu/drm/panel/panel-lg-sw43408.c
++++ b/drivers/gpu/drm/panel/panel-lg-sw43408.c
+@@ -59,7 +59,7 @@
+ 	return ctx.accum_err;
+ }
+ 
+-static int sw43408_unprepare(struct drm_panel *panel)
++static int __maybe_unused sw43408_unprepare(struct drm_panel *panel)
+ {
+ 	struct sw43408_panel *sw43408 = to_panel_info(panel);
+ 
+--- a/drivers/gpu/drm/panel/panel-lg-sw49410-lh609qh1.c
++++ b/drivers/gpu/drm/panel/panel-lg-sw49410-lh609qh1.c
+@@ -469,8 +469,6 @@
+ 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
+ 			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
+ 
+-	drm_panel_init(&ctx->panel, dev, &sw49410_panel_funcs,
+-		       DRM_MODE_CONNECTOR_DSI);
+ 	ctx->panel.prepare_prev_first = true;
+ 
+ 	ret = drm_panel_of_backlight(&ctx->panel);
+--- a/drivers/gpu/drm/panel/panel-novatek-nt35596s.c
++++ b/drivers/gpu/drm/panel/panel-novatek-nt35596s.c
+@@ -476,8 +476,6 @@
+ 		return dev_err_probe(dev, PTR_ERR(pinfo->reset_gpio),
+ 				     "failed to get reset gpio from DT\n");
+ 
+-	drm_panel_init(&pinfo->base, dev, &panel_funcs, DRM_MODE_CONNECTOR_DSI);
+-
+ 	drm_panel_add(&pinfo->base);
+ 
+ 	return 0;
+@@ -489,9 +487,10 @@
+ 	const struct nt35596s_panel_desc *desc;
+ 	int err;
+ 
+-	pinfo = devm_kzalloc(&dsi->dev, sizeof(*pinfo), GFP_KERNEL);
+-	if (!pinfo)
+-		return -ENOMEM;
++	pinfo = devm_drm_panel_alloc(&dsi->dev, struct nt35596s_panel, base,
++				     &panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(pinfo))
++		return PTR_ERR(pinfo);
+ 
+ 	desc = of_device_get_match_data(&dsi->dev);
+ 	dsi->mode_flags = desc->mode_flags;
+--- a/drivers/gpu/drm/panel/panel-samsung-ea8076.c
++++ b/drivers/gpu/drm/panel/panel-samsung-ea8076.c
+@@ -197,9 +197,11 @@
+ 	struct samsung_ea8076 *ctx;
+ 	int ret;
+ 
+-	ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
+-	if (!ctx)
+-		return -ENOMEM;
++	ctx = devm_drm_panel_alloc(dev, struct samsung_ea8076, panel,
++				   &samsung_ea8076_panel_funcs,
++				   DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
+ 
+ 	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ctx->reset_gpio))
+@@ -214,8 +216,6 @@
+ 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
+ 			  MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM;
+ 
+-	drm_panel_init(&ctx->panel, dev, &samsung_ea8076_panel_funcs,
+-		       DRM_MODE_CONNECTOR_DSI);
+ 	ctx->panel.prepare_prev_first = true;
+ 
+ 	ctx->panel.backlight = samsung_ea8076_create_backlight(dsi);

@@ -8,14 +8,14 @@ maintainer="Casey Connolly <kcxt@postmarketos.org>"
 # REGULATOR_QCOM_USB_VBUS=y config delta. Renamed pkgname so it can live alongside the
 # upstream package in pmaports (custom-* overlay); provides/replaces let it substitute.
 #
-# Base: mainline stable v7.1.6 from kernel.org + the sdm845-mainline device delta as
+# Base: mainline stable v7.2.3 from kernel.org + the sdm845-mainline device delta as
 # 0001 (see that patch's header). Upstream pmaports still ships the fork's own
 # sdm845-7.1-rc1-r0 tarball, i.e. 7.1.0-rc1; the fork has not been rebased since
-# 2026-05-08, so tracking 7.1.y directly is how this package gets stable fixes.
+# 2026-05-08, so tracking mainline stable directly is how this package gets fixes.
 _flavor="postmarketos-qcom-sdm845"
 pkgname=linux-$_flavor-audio
-pkgver=7.1.6
-pkgrel=2
+pkgver=7.2.3
+pkgrel=0
 pkgdesc="Mainline SDM845 kernel for beryllium audio player (switchable USB DRD host-first + PMI8998 VBUS + RT/USB-audio tuning)"
 provides="linux-$_flavor=$pkgver-r$pkgrel"
 replaces="linux-$_flavor"
@@ -46,7 +46,7 @@ _defconfig="defconfig"
 source="
 	https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-$pkgver.tar.xz
 	config-postmarketos-qcom-sdm845.aarch64
-	0001-sdm845-mainline-device-support-on-v7.1.6.patch
+	0001-sdm845-mainline-device-support-on-v7.2.3.patch
 	0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
 	0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
 	0004-regulator-qcom_usb_vbus-regulator-add-pmi8998-support.patch
@@ -54,6 +54,7 @@ source="
 	0006-sound-usb-tune-usb-audio-compiler-flags.patch
 	0007-power-supply-pmi8998-charge-control-thresholds.patch
 	0008-power-supply-qcom-smbx-correctness-fixes.patch
+	0009-drm-panel-port-fork-panels-to-the-v7.2-drm_panel-alloc-api.patch
 	enable-dynamic-ftrace.patch
 "
 builddir="$srcdir/linux-$pkgver"
@@ -104,15 +105,16 @@ package() {
 }
 
 sha512sums="
-5a6222e363653ef52adaeed37a1f2ad1a343214e0a5501d70c9170c963d15187b1e2016e72306d96efe5a2a71218a097d8368f7db3b5e48367365be3cb3cea94  linux-7.1.6.tar.xz
-6ea024000604cf1f83a9ad5aa87a2d377152e0299170bf78ad92767b45c441baa05699bdc6e41c07523b09b65de76cea0bbb200a1849d8e7b728dfc3085dc9f7  config-postmarketos-qcom-sdm845.aarch64
-c72a6930844329667bfdd91a63424f1a11c31deb40f08557e165ad69e99aba30ce3eeddec9192eb1d6c1098becc4fbc3b82d8185f42be6a5b075fff925423e4c  0001-sdm845-mainline-device-support-on-v7.1.6.patch
+efca27533433d9f0aa26f9cea5a696e04f7d7f7d509eb52613b1ce6f1618ac02a882c037875a4df527cd3341e7f9002bd02663288f53addd4bb4805a931fc8ab  linux-7.2.3.tar.xz
+2b6942b3a26552f69703bf48237b57e7471cfe7444d2df38d29bb7ce0aa3f9d975e71aab0a5b8f84c59c056854468cdf26270c14f298af7072178d90dc1e2fff  config-postmarketos-qcom-sdm845.aarch64
+6b6269f7100e9f582d1c9dd127038f3591efb7e245b6264e63841658c425939e9e641056f80880b8eb8a6b7a69bf24e3b0e0e63d78dc0e1fdfafa96adcecc04c  0001-sdm845-mainline-device-support-on-v7.2.3.patch
 72394d24413387ade6f2cf497228d4d11d0683a1012cba321306c808f63d45fb42988c0b6ce19575d2880f58c15e5c405e9c6616df465f34dd8c3c54f421cb42  0002-arm64-dts-qcom-sdm845-xiaomi-beryllium-force-usb-host-mode.patch
-8232c4f7a428310426f020cd372a7821711e0407cf09951cd3ccc0f4a83a8236332af2d88bf0708f320ce28fb2585f9a5e5c29785d6e756a904336caa43425f9  0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
+3932cba2edf2bb2d817fd74ffc8f06aab148cf3f7ba021392a8ae0a0169cb18b45e20829bfcac72fb0b3beeb3d2c09217be79942ab37de28fd3b09ebb8d3b3c9  0003-arm64-dts-qcom-sdm845-xiaomi-beryllium-disable-internal-audio.patch
 b7ae73767e18ae0d5da0f06cf541697a3e0d586864c20ed8f0c36dea61401030c56179bcd10486bd5f56a624d7c66d6f592822560302d4970071f50bf89be480  0004-regulator-qcom_usb_vbus-regulator-add-pmi8998-support.patch
 c83af906eed5cedb19f47122926b9f4988e0605f0e4062ea6d6a8433c095565fe45cf3dde86b8b754cc20a6e777c1fcc34f576852b247a06e2c3169b084c0f44  0005-arm64-dts-qcom-sdm845-xiaomi-beryllium-self-power-usb-host-vbus.patch
 77a298d7480fb1cc584f69c99726131204eb346fafa56155aec459a59b6066722a7b85493311d745873f5fe55128420d607d3db52989bdb43f9d27b37d5537e4  0006-sound-usb-tune-usb-audio-compiler-flags.patch
 62f003a6b2f31d1168d23b0b50818f1a16ee564f5d5c9f3e644d30724406e85aeb51c417bd64624e7487c42698e90fa1604d823441529a5bc40e9778f1713393  0007-power-supply-pmi8998-charge-control-thresholds.patch
 9275cefcc1c432c636abb7d17a37d773c58692169a7a290a07f11a8c2c80c5cd064cf23d072f634a6151574a90d5e95b931b512e0aa239a01cbce4bb29a09ba3  0008-power-supply-qcom-smbx-correctness-fixes.patch
-e8b595f3e076896dc38f249c8908d58e2e6a858eaa77fe1e680f27db0e76d3d74c0b5dfebb7a4c57d546fee0b0f6eb81a38b20dfd72f985c9d02f28d79a5eceb  enable-dynamic-ftrace.patch
+9368d9fd5f76f7585440e2f2a0bf926d652724487164e64e3ea35d8317d3eaf12e5227df4e5e012dc518b0c8b5dca2b420606f79202c27fff4b0fa1e2c34eaec  0009-drm-panel-port-fork-panels-to-the-v7.2-drm_panel-alloc-api.patch
+944970943938c3d9e6a7f8c2d6f66e6ad559971d9fe5cace5931689f1ee7a7192c5b9955d4e2e7ebd9a3ec1144def575c0c546c139d6c4db0b55aa0e78ca08f1  enable-dynamic-ftrace.patch
 "

@@ -28,7 +28,6 @@ Reviewed-by: Puranjay Mohan <puranjay@kernel.org>
  1 file changed, 3 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm64/kernel/ftrace.c b/arch/arm64/kernel/ftrace.c
-index 5a1554a441628..e1a3c0b3a0514 100644
 --- a/arch/arm64/kernel/ftrace.c
 +++ b/arch/arm64/kernel/ftrace.c
 @@ -409,7 +409,8 @@ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
@@ -50,6 +49,7 @@ index 5a1554a441628..e1a3c0b3a0514 100644
  	if (ret)
  		return ret;
  
+
 -- 
 2.54.0
 
@@ -107,10 +107,9 @@ Reviewed-by: Puranjay Mohan <puranjay@kernel.org>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
-index edbaec4b6eead..532ce0d77069a 100644
 --- a/arch/arm64/Kconfig
 +++ b/arch/arm64/Kconfig
-@@ -214,7 +214,7 @@ config ARM64
+@@ -187,7 +187,7 @@ config ARM64
  		if (GCC_SUPPORTS_DYNAMIC_FTRACE_WITH_ARGS || \
  		    CLANG_SUPPORTS_DYNAMIC_FTRACE_WITH_ARGS)
  	select HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS \
@@ -119,6 +118,7 @@ index edbaec4b6eead..532ce0d77069a 100644
  	select HAVE_DYNAMIC_FTRACE_WITH_CALL_OPS \
  		if (DYNAMIC_FTRACE_WITH_ARGS && !CFI && \
  		    (CC_IS_CLANG || !CC_OPTIMIZE_FOR_SIZE))
+
 -- 
 2.54.0
 

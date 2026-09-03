@@ -1,31 +1,60 @@
 From: sdm845-mainline <https://gitlab.com/sdm845-mainline/linux>
-Subject: sdm845-mainline device support, rebased on v7.1.6
+Subject: sdm845-mainline device support, rebased on v7.2.3
 
 Squashed device delta of the sdm845-mainline tree (branch sdm845/7.1-dev,
 head 85f1df2a4ec7 "sdm845.config: further cleanup and some moved into
-misc.config", 2026-05-08) on top of the mainline stable tag v7.1.6.
+misc.config", 2026-05-08) on top of the mainline stable tag v7.2.3.
 
-Previously this package consumed the fork's own tarball (sdm845-7.1-rc1-r0),
-which pins 7.1.0-rc1; the fork has not been rebased since May 2026 and 7.1-rc1
-is an -rc. This patch keeps exactly the fork's device content (SDM845 DTS,
-panels/touchscreens, camera, qdsp6 audio, IPA/power bits) while the base moves
-to the current 7.1.y stable, so the kernel picks up ~6 stable releases of fixes
-(including USB-audio fixes and "arm64: dts: qcom: sdm845-xiaomi-beryllium:
-Correct IPA FW path").
+The fork has not been rebased since May 2026, so this package tracks the
+mainline stable series directly and carries the fork's device content (SDM845
+DTS, panels/touchscreens, camera, qdsp6 audio, IPA/power bits) as this patch.
+Moving the base from v7.1.6 to v7.2.3 drops four files from the delta —
+sdm845-xiaomi-beryllium-{ebbg,tianma}.dts, sdm845-lg-judyp.dts and
+sdm670-google-sargo.dts — because v7.2 carries that device support upstream
+now (the beryllium panel/touch nodes are byte-identical to the fork's).
 
 Generated with:
-  git merge v7.1.6            # into sdm845/7.1-dev
-  git diff v7.1.6..HEAD
+  git merge v7.2.3            # into sdm845/7.1-dev
+  git diff v7.2.3..HEAD
 
-Merge conflicts (8) resolved as:
-  - Makefile, drivers/char/tpm/tpm_crb.c, fs/nfs/write.c, io_uring/tctx.c,
-    net/sunrpc/xprtrdma/{rpc_rdma,transport}.c -> take v7.1.6.
-    The fork branched pre-rc1 (merge base ff9726d7a006) so its copies of these
-    files are stale snapshots of subsystem trees Linus merged differently;
-    none carry device changes.
-  - arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi (framebuffer node
-    name) and sound/soc/qcom/qdsp6/q6asm-dai.c (commented-out state
-    assignment) -> keep the fork's version.
+Merge conflicts (27 files, 46 hunks) resolved as:
+  - Makefile, drivers/char/tpm/tpm_crb.c, drivers/rtc/rtc-pcf2127.c,
+    fs/ceph/{debugfs.c,mds_client.h,super.h}, fs/nfs/write.c,
+    io_uring/{register,tctx}.c, kernel/trace/ring_buffer.c,
+    net/sunrpc/xprtrdma/{rpc_rdma,transport}.c -> take v7.2.3.
+    The fork branched pre-7.1-rc1 (merge base ff9726d7a006) so its copies of
+    these files are stale snapshots of subsystem trees Linus merged
+    differently; none carry device changes.
+  - drivers/video/fbdev/hgafb.c -> accept the upstream deletion.
+  - arch/arm64/boot/dts/qcom/sdm670-google-sargo.dts -> take v7.2.3; upstream
+    moved the RMI4 touchscreen nodes into sdm670-google-common.dtsi and the
+    .dts now only overrides &rmi4_f12.
+  - arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts (framebuffer node) ->
+    take v7.2.3, because the merged aliases node references &framebuffer.
+    Its camera/wcd9340/qdsp6 hunks keep the fork's version.
+  - the remaining DTS/binding hunks (beryllium stdout-path, google/oneplus/
+    starqltechn framebuffer + camera nodes, xiaomi,perseus, stmfts
+    mode-switch-gpios) and sound/soc/qcom/qdsp6/q6asm-dai.c -> keep the fork's
+    version; they are additive device content.
+  - drivers/media/platform/qcom/camss/camss-csid.c -> upstream's restructured
+    link setup (csiphy_id/tpg_linked, 2-argument csid_get_lane_assign()) plus
+    the fork's C-PHY detection line.
+  - drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c -> keep the
+    fork's per-configuration (D-PHY/C-PHY) lane_regs selection in
+    csiphy_lanes_enable() instead of upstream's fixed selection in
+    csiphy_init(), and carry over upstream's sm6350 lane_regs into it.
+  - drivers/input/rmi4/rmi_driver.h -> upstream's PRESENCE rename/limits plus
+    the fork's PDT scan state.
+  - drivers/input/rmi4/rmi_f12.c -> upstream's refactored F12 probe (it fixes
+    descriptor overflows) with the fork's aftermarket-touch-IC fallback
+    descriptor ported on top.
+  - drivers/input/touchscreen/stmfts.c -> keep the fork's FTS3/FTS5 ops split;
+    upstream took the same cleanup series from it, and the two upstream-only
+    commits are cosmetic. (Corrected: the first cut of this resolution left a
+    truncated stmfts_configure() plus duplicate stmfts_reset()/stmfts_power_on()
+    bodies -- upstream inlines read_system_info/enable_irq/msleep(50)/SLEEP_IN
+    into stmfts_power_on() while the fork moved them into the per-ops
+    ->configure(). The fork's versions of both functions are what is kept.)
 
 diff --git a/.forgejo/build.yml b/.forgejo/build.yml
 new file mode 100644
@@ -154,30 +183,13 @@ index 000000000000..473b819542f1
 +          echo "yamllint output:"
 +          cat out.txt
 diff --git a/Documentation/devicetree/bindings/arm/qcom.yaml b/Documentation/devicetree/bindings/arm/qcom.yaml
-index b4943123d2e4..5ad609f2e274 100644
+index 50cc18a6ec5e..785474667dfc 100644
 --- a/Documentation/devicetree/bindings/arm/qcom.yaml
 +++ b/Documentation/devicetree/bindings/arm/qcom.yaml
-@@ -822,6 +822,14 @@ properties:
-           - const: google,zombie-sku514
-           - const: qcom,sc7280
- 
-+      - description: Xiaomi Poco F1
-+        items:
-+          - enum:
-+              - xiaomi,beryllium-ebbg
-+              - xiaomi,beryllium-tianma
-+          - const: xiaomi,beryllium
-+          - const: qcom,sdm845
-+
-       - items:
-           - enum:
-               - lenovo,flex-5g
-@@ -972,8 +980,7 @@ properties:
+@@ -986,6 +986,7 @@ properties:
                - sony,akatsuki-row
                - sony,apollo-row
                - thundercomm,db845c
--              - xiaomi,beryllium
--              - xiaomi,beryllium-ebbg
 +              - xiaomi,perseus
                - xiaomi,polaris
            - const: qcom,sdm845
@@ -339,7 +351,7 @@ index 8685ef4481f4..fb4804ac3544 100644
    reg:
      maxItems: 1
 diff --git a/Documentation/devicetree/bindings/input/touchscreen/st,stmfts.yaml b/Documentation/devicetree/bindings/input/touchscreen/st,stmfts.yaml
-index 12256ae7df90..441fc92b9a4e 100644
+index 64c4f24ea3dd..441fc92b9a4e 100644
 --- a/Documentation/devicetree/bindings/input/touchscreen/st,stmfts.yaml
 +++ b/Documentation/devicetree/bindings/input/touchscreen/st,stmfts.yaml
 @@ -16,10 +16,19 @@ description:
@@ -363,7 +375,7 @@ index 12256ae7df90..441fc92b9a4e 100644
  
    reg:
      maxItems: 1
-@@ -40,6 +49,14 @@ properties:
+@@ -40,6 +49,10 @@ properties:
    vdd-supply:
      description: Power supply
  
@@ -371,13 +383,9 @@ index 12256ae7df90..441fc92b9a4e 100644
 +    description: Switch between touchscreen SLPI and AP mode.
 +    maxItems: 1
 +
-+  reset-gpios:
-+    description: Reset GPIO (active-low)
-+    maxItems: 1
-+
- required:
-   - compatible
-   - reg
+   reset-gpios:
+     description: Reset GPIO (active-low)
+     maxItems: 1
 diff --git a/Documentation/devicetree/bindings/media/i2c/onnn,lc898217xc.yaml b/Documentation/devicetree/bindings/media/i2c/onnn,lc898217xc.yaml
 new file mode 100644
 index 000000000000..3dd137d4c67c
@@ -736,7 +744,7 @@ index 2b27d6c8f58f..f45c3324393e 100644
            required:
              - qcom,sd-lines
 diff --git a/MAINTAINERS b/MAINTAINERS
-index f74da642290a..3dc0eaffe562 100644
+index 8014b9f8253e..2b8d9170b0b9 100644
 --- a/MAINTAINERS
 +++ b/MAINTAINERS
 @@ -1,4 +1,4 @@
@@ -745,7 +753,7 @@ index f74da642290a..3dc0eaffe562 100644
  ===================
  
  Descriptions of section entries and preferred order
-@@ -19957,6 +19957,13 @@ S:	Supported
+@@ -20196,6 +20196,13 @@ S:	Supported
  W:	http://www.onsemi.com
  F:	drivers/net/phy/ncn*
  
@@ -757,9 +765,9 @@ index f74da642290a..3dc0eaffe562 100644
 +F:	drivers/media/i2c/lc898217xc.c
 +
  OP-TEE DRIVER
- M:	Jens Wiklander <jens.wiklander@linaro.org>
+ M:	Jens Wiklander <jenswi@kernel.org>
  L:	op-tee@lists.trustedfirmware.org (moderated for non-subscribers)
-@@ -23254,6 +23261,14 @@ L:	linux-iio@vger.kernel.org
+@@ -23524,6 +23531,14 @@ L:	linux-iio@vger.kernel.org
  S:	Supported
  F:	drivers/iio/light/rohm-bu27034.c
  
@@ -774,7 +782,7 @@ index f74da642290a..3dc0eaffe562 100644
  ROHM MULTIFUNCTION BD9571MWV-M PMIC DEVICE DRIVERS
  M:	Marek Vasut <marek.vasut+renesas@gmail.com>
  L:	linux-kernel@vger.kernel.org
-@@ -24964,6 +24979,14 @@ T:	git git://linuxtv.org/media.git
+@@ -25262,6 +25277,14 @@ T:	git git://linuxtv.org/media.git
  F:	Documentation/devicetree/bindings/media/i2c/sony,imx415.yaml
  F:	drivers/media/i2c/imx415.c
  
@@ -789,7 +797,7 @@ index f74da642290a..3dc0eaffe562 100644
  SONY MEMORYSTICK SUBSYSTEM
  M:	Maxim Levitsky <maximlevitsky@gmail.com>
  M:	Alex Dubov <oakad@yahoo.com>
-@@ -29492,3 +29515,13 @@ S:	Buried alive in reporters
+@@ -29845,3 +29868,13 @@ S:	Buried alive in reporters
  T:	git git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
  F:	*
  F:	*/
@@ -804,10 +812,10 @@ index f74da642290a..3dc0eaffe562 100644
 +F:	sound/soc/qcom/qdsp6/q6voice-common.c
 +F:	sound/soc/qcom/qdsp6/q6voice-dai.c
 diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
-index 4ba8e7306419..557be6fd56d7 100644
+index 6f33c4e2f09c..d9d6ce98559d 100644
 --- a/arch/arm64/boot/dts/qcom/Makefile
 +++ b/arch/arm64/boot/dts/qcom/Makefile
-@@ -321,6 +321,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-sony-xperia-tama-akatsuki.dtb
+@@ -328,6 +328,7 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-sony-xperia-tama-akatsuki.dtb
  dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-sony-xperia-tama-apollo.dtb
  dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-xiaomi-beryllium-ebbg.dtb
  dtb-$(CONFIG_ARCH_QCOM)	+= sdm845-xiaomi-beryllium-tianma.dtb
@@ -929,24 +937,6 @@ index a9926ad6c6f9..cb89b88d887d 100644
  &pon_pwrkey {
  	status = "okay";
  };
-diff --git a/arch/arm64/boot/dts/qcom/sdm670-google-sargo.dts b/arch/arm64/boot/dts/qcom/sdm670-google-sargo.dts
-index ed55646ca419..a8e0e85c42cd 100644
---- a/arch/arm64/boot/dts/qcom/sdm670-google-sargo.dts
-+++ b/arch/arm64/boot/dts/qcom/sdm670-google-sargo.dts
-@@ -490,6 +490,13 @@ &pm660_charger {
- 	status = "okay";
- };
- 
-+&pm660_fg {
-+	monitored-battery = <&battery>;
-+	power-supplies = <&pm660_charger>;
-+
-+	status = "okay";
-+};
-+
- &pm660_rradc {
- 	status = "okay";
- };
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts b/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
 index fa89be500fb8..8fb988130b55 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-google-blueline.dts
@@ -978,7 +968,7 @@ index fa89be500fb8..8fb988130b55 100644
  
  &mdss_dsi0 {
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-google-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-google-common.dtsi
-index 693006685776..c7dae34aa826 100644
+index b2dc0327dff8..c7dae34aa826 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-google-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm845-google-common.dtsi
 @@ -6,7 +6,12 @@
@@ -1190,27 +1180,8 @@ index 693006685776..c7dae34aa826 100644
  
  	/* eeprom @50, at24 driver says 8K */
  };
-@@ -391,10 +548,77 @@ &gpu_zap_shader {
- 	firmware-name = "qcom/sdm845/Google/blueline/a630_zap.mbn";
- };
+@@ -410,8 +567,58 @@ nfc@28 {
  
-+&i2c3 {
-+	status = "okay";
-+
-+	nfc@28 {
-+		compatible = "nxp,pn557", "nxp,nxp-nci-i2c";
-+		reg = <0x28>;
-+
-+		interrupts-extended = <&tlmm 63 IRQ_TYPE_EDGE_RISING>;
-+
-+		enable-gpios = <&tlmm 25 GPIO_ACTIVE_HIGH>;
-+		firmware-gpios = <&tlmm 79 GPIO_ACTIVE_HIGH>;
-+
-+		pinctrl-0 = <&nfc_int_default &nfc_enable_default>;
-+		pinctrl-names = "default";
-+	};
-+};
-+
  &i2c12 {
  	/* Bottom spkr (right) CS35L36 @ 40 */
 +	status="okay";
@@ -1268,7 +1239,7 @@ index 693006685776..c7dae34aa826 100644
  };
  
  &ipa {
-@@ -437,6 +661,44 @@ &pmi8998_charger {
+@@ -454,6 +661,44 @@ &pmi8998_charger {
  	status = "okay";
  };
  
@@ -1313,7 +1284,7 @@ index 693006685776..c7dae34aa826 100644
  &qupv3_id_0 {
  	status = "okay";
  };
-@@ -455,10 +717,82 @@ &qup_uart9_tx {
+@@ -472,6 +717,36 @@ &qup_uart9_tx {
  	bias-disable;
  };
  
@@ -1350,21 +1321,10 @@ index 693006685776..c7dae34aa826 100644
  &tlmm {
  	gpio-reserved-ranges = < 0 4>, /* SPI (Intel MNH Pixel Visual Core) */
  			       <81 4>; /* SPI (most likely Fingerprint Cards FPC1075) */
+@@ -490,6 +765,34 @@ nfc_enable_default: nfc-enable-default-state {
+ 		bias-pull-down;
+ 	};
  
-+	nfc_int_default: nfc-int-default-state {
-+		pins = "gpio63";
-+		function = "gpio";
-+		drive-strength = <2>;
-+		bias-pull-down;
-+	};
-+
-+	nfc_enable_default: nfc-enable-default-state {
-+		pins = "gpio25", "gpio79";
-+		function = "gpio";
-+		drive-strength = <2>;
-+		bias-pull-down;
-+	};
-+
 +	cam_front_avdd_default_pin: cam-avdd-default-pins {
 +		pins = "gpio8";
 +		function = "gpio";
@@ -1396,7 +1356,7 @@ index 693006685776..c7dae34aa826 100644
  	touchscreen_reset: ts-reset-state {
  		pins = "gpio99";
  		function = "gpio";
-@@ -466,7 +800,7 @@ touchscreen_reset: ts-reset-state {
+@@ -497,7 +800,7 @@ touchscreen_reset: ts-reset-state {
  		bias-pull-up;
  	};
  
@@ -1405,7 +1365,7 @@ index 693006685776..c7dae34aa826 100644
  		pins = "gpio125";
  		function = "gpio";
  		drive-strength = <2>;
-@@ -479,6 +813,33 @@ touchscreen_i2c_pins: qup-i2c2-gpio-state {
+@@ -510,6 +813,33 @@ touchscreen_i2c_pins: qup-i2c2-gpio-state {
  		drive-strength = <2>;
  		bias-disable;
  	};
@@ -1440,20 +1400,10 @@ index 693006685776..c7dae34aa826 100644
  
  &uart6 {
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
-index 71d070619ad7..b6768b77117b 100644
+index e0c3566761bf..b6768b77117b 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm845-lg-common.dtsi
-@@ -98,8 +98,7 @@ spss_mem: memory@99000000 {
- 			no-map;
- 		};
- 
--		/* Framebuffer region */
--		memory@9d400000 {
-+		framebuffer_mem: memory@9d400000 {
- 			reg = <0x0 0x9d400000 0x0 0x2400000>;
- 			no-map;
- 		};
-@@ -472,8 +471,29 @@ &gpu {
+@@ -471,6 +471,25 @@ &gpu {
  	status = "okay";
  };
  
@@ -1477,34 +1427,9 @@ index 71d070619ad7..b6768b77117b 100644
 +};
 +
  &ipa {
--	qcom,gsi-loader = "modem";
-+	qcom,gsi-loader = "self";
-+	memory-region = <&ipa_fw_mem>;
-+
- 	status = "okay";
- };
- 
-@@ -496,6 +516,19 @@ &pm8998_resin {
- 	status = "okay";
- };
- 
-+&pmi8998_flash {
-+	status = "okay";
-+
-+	led-0 {
-+		function = LED_FUNCTION_FLASH;
-+		color = <LED_COLOR_ID_WHITE>;
-+		led-sources = <1>, <2>;
-+		led-max-microamp = <100000>;
-+		flash-max-microamp = <500000>;
-+		flash-max-timeout-us = <500000>;
-+	};
-+};
-+
- &pmi8998_lpg {
- 	status = "okay";
- 
-@@ -540,6 +573,12 @@ &qupv3_id_1 {
+ 	qcom,gsi-loader = "self";
+ 	memory-region = <&ipa_fw_mem>;
+@@ -554,6 +573,12 @@ &qupv3_id_1 {
  	status = "okay";
  };
  
@@ -1517,7 +1442,7 @@ index 71d070619ad7..b6768b77117b 100644
  &qup_uart9_rx {
  	drive-strength = <2>;
  	bias-pull-up;
-@@ -598,6 +637,13 @@ sd_card_det_n: sd-card-det-n-state {
+@@ -612,6 +637,13 @@ sd_card_det_n: sd-card-det-n-state {
  		function = "gpio";
  		bias-pull-up;
  	};
@@ -1531,30 +1456,10 @@ index 71d070619ad7..b6768b77117b 100644
  };
  
  &uart6 {
-@@ -680,5 +726,7 @@ &wifi {
- 	vdd-3.3-ch0-supply = <&vreg_l25a_3p3>;
- 	vdd-3.3-ch1-supply = <&vreg_l23a_3p3>;
- 
-+	qcom,snoc-host-cap-skip-quirk;
-+
- 	status = "okay";
- };
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-lg-judyln.dts b/arch/arm64/boot/dts/qcom/sdm845-lg-judyln.dts
-index adf41aa0146a..7f6ed0942f9d 100644
+index 349faa123ff1..7f6ed0942f9d 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-lg-judyln.dts
 +++ b/arch/arm64/boot/dts/qcom/sdm845-lg-judyln.dts
-@@ -14,9 +14,9 @@ / {
- 	compatible = "lg,judyln", "qcom,sdm845";
- 
- 	chosen {
--		framebuffer@9d400000 {
-+		framebuffer {
- 			compatible = "simple-framebuffer";
--			reg = <0x0 0x9d400000 0x0 (1440 * 3120 * 4)>;
-+			memory-region = <&framebuffer_mem>;
- 			width = <1440>;
- 			height = <3120>;
- 			stride = <(1440 * 4)>;
 @@ -141,6 +141,34 @@ &pmi8998_charger {
  	status = "okay";
  };
@@ -1590,24 +1495,8 @@ index adf41aa0146a..7f6ed0942f9d 100644
  &tlmm {
  	thinq_key_default: thinq-key-default-state {
  		pins = "gpio89";
-diff --git a/arch/arm64/boot/dts/qcom/sdm845-lg-judyp.dts b/arch/arm64/boot/dts/qcom/sdm845-lg-judyp.dts
-index d244ebdd17be..44e762f78e95 100644
---- a/arch/arm64/boot/dts/qcom/sdm845-lg-judyp.dts
-+++ b/arch/arm64/boot/dts/qcom/sdm845-lg-judyp.dts
-@@ -14,9 +14,9 @@ / {
- 	compatible = "lg,judyp", "qcom,sdm845";
- 
- 	chosen {
--		framebuffer@9d400000 {
-+		framebuffer {
- 			compatible = "simple-framebuffer";
--			reg = <0x0 0x9d400000 0x0 (1440 * 2880 * 4)>;
-+			memory-region = <&framebuffer_mem>;
- 			width = <1440>;
- 			height = <2880>;
- 			stride = <(1440 * 4)>;
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
-index b0b9baf01ec2..948a0dd18d13 100644
+index a6c2519a418d..948a0dd18d13 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm845-oneplus-common.dtsi
 @@ -8,11 +8,14 @@
@@ -1795,7 +1684,7 @@ index b0b9baf01ec2..948a0dd18d13 100644
  	};
  
  	regulators-1 {
-@@ -442,6 +578,172 @@ vreg_s3c_0p6: smps3 {
+@@ -442,24 +578,170 @@ vreg_s3c_0p6: smps3 {
  	};
  };
  
@@ -1841,11 +1730,12 @@ index b0b9baf01ec2..948a0dd18d13 100644
 +	};
 +};
 +
-+&cci {
-+	status = "okay";
-+};
-+
-+&cci_i2c0 {
+ &cci {
+ 	status = "okay";
+ };
+ 
+ &cci_i2c0 {
+-	/* front sony,imx371 @10 */
 +	front_cam: camera@10 {
 +		compatible = "sony,imx371";
 +		reg = <0x10>;
@@ -1876,11 +1766,13 @@ index b0b9baf01ec2..948a0dd18d13 100644
 +			};
 +		};
 +	};
-+
+ 
+-	/* rear sony,imx519 @1a */
 +	rear_cam: camera@1a {
 +		compatible = "sony,imx519";
 +		reg = <0x1a>;
-+
+ 
+-	/* rear onnn,lc898217xc @72 */
 +		reset-gpios = <&tlmm 28 GPIO_ACTIVE_LOW>;
 +		pinctrl-names = "default", "sleep";
 +		pinctrl-0 = <&main_cam_default &cam_mclk0_default>;
@@ -1919,9 +1811,10 @@ index b0b9baf01ec2..948a0dd18d13 100644
 +		vana-supply = <&main_cam_vaf>;
 +		vdd-supply = <&cam_vio_1p8>;
 +	};
-+};
-+
-+&cci_i2c1 {
+ };
+ 
+ &cci_i2c1 {
+-	/* sa,sa3103 @0d */
 +	/* sa,sa3103 @ 0d */
 +
 +	sub_cam: camera@10 {
@@ -1932,11 +1825,13 @@ index b0b9baf01ec2..948a0dd18d13 100644
 +		pinctrl-names = "default", "sleep";
 +		pinctrl-0 = <&sub_cam_default &cam_mclk2_default>;
 +		pinctrl-1 = <&sub_cam_sleep &cam_mclk2_sleep>;
-+
+ 
+-	/* rear sony,imx376k @10 */
 +		clocks = <&clock_camcc CAM_CC_MCLK2_CLK>;
 +		clock-names = "xclk";
 +		clock-frequency = <24000000>;
-+
+ 
+-	/* onnn,lc898217xc @74 */
 +		vana-supply = <&sub_cam_vana>;
 +		vcore-supply = <&sub_cam_vdig>;
 +		vio-supply = <&cam_vio_1p8>;
@@ -1963,39 +1858,10 @@ index b0b9baf01ec2..948a0dd18d13 100644
 +		vana-supply = <&sub_cam_vaf>;
 +		vdd-supply = <&cam_vio_1p8>;
 +	};
-+};
-+
- &cdsp_pas {
- 	firmware-name = "qcom/sdm845/OnePlus/enchilada/cdsp.mbn";
- 
-@@ -464,6 +766,26 @@ &gpu_zap_shader {
- 	firmware-name = "qcom/sdm845/OnePlus/enchilada/a630_zap.mbn";
  };
  
-+&i2c3 {
-+	clock-frequency = <400000>;
-+
-+	status = "okay";
-+
-+	nfc@28 {
-+		compatible = "nxp,pn553", "nxp,nxp-nci-i2c";
-+		reg = <0x28>;
-+
-+		interrupts-extended = <&tlmm 63 IRQ_TYPE_EDGE_RISING>;
-+
-+		enable-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
-+		firmware-gpios = <&tlmm 62 GPIO_ACTIVE_HIGH>;
-+
-+		pinctrl-0 = <&nfc_default>;
-+		pinctrl-1 = <&nfc_sleep>;
-+		pinctrl-names = "default", "sleep";
-+	};
-+};
-+
- &i2c10 {
- 	status = "okay";
- 	clock-frequency = <100000>;
-@@ -628,6 +950,12 @@ led-1 {
+ &cdsp_pas {
+@@ -668,6 +950,12 @@ led-1 {
  	};
  };
  
@@ -2008,7 +1874,7 @@ index b0b9baf01ec2..948a0dd18d13 100644
  &q6afedai {
  	dai@22 {
  		reg = <QUATERNARY_MI2S_RX>;
-@@ -666,6 +994,12 @@ dai@5 {
+@@ -706,6 +994,12 @@ dai@5 {
  	};
  };
  
@@ -2021,19 +1887,7 @@ index b0b9baf01ec2..948a0dd18d13 100644
  &qupv3_id_1 {
  	status = "okay";
  };
-@@ -674,6 +1008,11 @@ &qupv3_id_0 {
- 	status = "okay";
- };
- 
-+&qup_i2c3_default {
-+	drive-strength = <2>;
-+	bias-disable;
-+};
-+
- &qup_i2c10_default {
- 	drive-strength = <2>;
- 	bias-disable;
-@@ -748,6 +1087,14 @@ cpu {
+@@ -793,6 +1087,14 @@ cpu {
  		};
  	};
  
@@ -2048,7 +1902,7 @@ index b0b9baf01ec2..948a0dd18d13 100644
  	speaker_playback_dai: speaker-dai-link {
  		link-name = "Speaker Playback";
  		cpu {
-@@ -919,6 +1266,172 @@ &usb_1_hsphy {
+@@ -964,6 +1266,172 @@ &usb_1_hsphy {
  &tlmm {
  	gpio-reserved-ranges = <0 4>, <81 4>;
  
@@ -2221,46 +2075,7 @@ index b0b9baf01ec2..948a0dd18d13 100644
  	hall_sensor_default: hall-sensor-default-state {
  		pins = "gpio124";
  		function = "gpio";
-@@ -1007,6 +1520,38 @@ speaker_default: speaker-default-state {
- 		bias-pull-up;
- 		output-high;
- 	};
-+
-+	nfc_default: nfc-default-state {
-+		enable-pins {
-+			pins = "gpio12", "gpio62";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+
-+		int-pins {
-+			pins = "gpio63";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+	};
-+
-+	nfc_sleep: nfc-sleep-state {
-+		enable-pins {
-+			pins = "gpio12", "gpio62";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-disable;
-+		};
-+
-+		int-pins {
-+			pins = "gpio63";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+	};
- };
- 
- &venus {
-@@ -1038,3 +1583,16 @@ &wifi {
+@@ -1115,3 +1583,16 @@ &wifi {
  
  	status = "okay";
  };
@@ -2365,7 +2180,7 @@ index 0542333a8357..7ffcad24d505 100644
  &rmi4_f12 {
  	touchscreen-y-mm = <148>;
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts b/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
-index 77f5872de6f1..8729be6b461d 100644
+index 0d915ecb0444..8729be6b461d 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
 +++ b/arch/arm64/boot/dts/qcom/sdm845-samsung-starqltechn.dts
 @@ -14,6 +14,7 @@
@@ -2384,29 +2199,16 @@ index 77f5872de6f1..8729be6b461d 100644
  
  / {
  	chassis-type = "handset";
-@@ -43,9 +43,10 @@ chosen {
- 		#address-cells = <2>;
+@@ -44,7 +44,7 @@ chosen {
  		#size-cells = <2>;
  		ranges;
--		framebuffer: framebuffer@9d400000 {
-+
+ 
+-		framebuffer {
 +		framebuffer: framebuffer-0 {
  			compatible = "simple-framebuffer";
--			reg = <0 0x9d400000 0 (2960 * 1440 * 4)>;//2400000
-+			memory-region = <&framebuffer_mem>;
+ 			memory-region = <&framebuffer_mem>;
  			width = <1440>;
- 			height = <2960>;
- 			stride = <(1440 * 4)>;
-@@ -109,7 +110,7 @@ vreg_s4a_1p8: pm8998-smps4 {
- 	};
- 
- 	reserved-memory {
--		memory@9d400000 {
-+		framebuffer_mem: memory@9d400000 {
- 			reg = <0x0 0x9d400000 0x0 0x02400000>;
- 			no-map;
- 		};
-@@ -132,13 +133,13 @@ removed_region: removed-region@88f00000 {
+@@ -133,13 +133,13 @@ removed_region: removed-region@88f00000 {
  			no-map;
  		};
  
@@ -2424,7 +2226,7 @@ index 77f5872de6f1..8729be6b461d 100644
  			no-map;
  		};
  
-@@ -158,6 +159,34 @@ rmtfs_mem: rmtfs-mem@fde00000 {
+@@ -159,6 +159,34 @@ rmtfs_mem: rmtfs-mem@fde00000 {
  		};
  	};
  
@@ -2459,7 +2261,7 @@ index 77f5872de6f1..8729be6b461d 100644
  	i2c-21 {
  		compatible = "i2c-gpio";
  		sda-gpios = <&tlmm 127 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
-@@ -772,6 +801,28 @@ cpu {
+@@ -773,6 +801,28 @@ cpu {
  		};
  	};
  
@@ -2488,7 +2290,7 @@ index 77f5872de6f1..8729be6b461d 100644
  	slim-dai-link {
  		link-name = "SLIM Playback 1";
  
-@@ -891,6 +942,18 @@ dai@5 {
+@@ -892,6 +942,18 @@ dai@5 {
  	};
  };
  
@@ -2507,7 +2309,7 @@ index 77f5872de6f1..8729be6b461d 100644
  &wcd9340 {
  	reset-gpios = <&tlmm 64 GPIO_ACTIVE_HIGH>;
  	vdd-buck-supply = <&vreg_s4a_1p8>;
-@@ -923,6 +986,10 @@ &slpi_pas {
+@@ -924,6 +986,10 @@ &slpi_pas {
  	firmware-name = "qcom/sdm845/Samsung/starqltechn/slpi.mbn";
  	cx-supply = <&slpi_regulator>;
  
@@ -2518,7 +2320,7 @@ index 77f5872de6f1..8729be6b461d 100644
  	status = "okay";
  };
  
-@@ -1057,6 +1124,29 @@ slpi_ldo_active_state: slpi-ldo-active-state {
+@@ -1058,6 +1124,29 @@ slpi_ldo_active_state: slpi-ldo-active-state {
  		function = "gpio";
  		drive-strength = <2>;
  		bias-disable;
@@ -2549,7 +2351,7 @@ index 77f5872de6f1..8729be6b461d 100644
  
  	touch_irq_state: touch-irq-state {
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
-index b5fc93f0315f..21f6825d881f 100644
+index f21b914f22b5..cc7ecb9f83e2 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
 +++ b/arch/arm64/boot/dts/qcom/sdm845-shift-axolotl.dts
 @@ -10,8 +10,13 @@
@@ -2566,27 +2368,6 @@ index b5fc93f0315f..21f6825d881f 100644
  #include "pm8998.dtsi"
  #include "pmi8998.dtsi"
  
-@@ -36,9 +41,9 @@ chosen {
- 		stdout-path = "serial0";
- 
- 		/* Use framebuffer setup by the bootloader. */
--		framebuffer0: framebuffer@9d400000 {
-+		framebuffer0: framebuffer-0 {
- 			compatible = "simple-framebuffer";
--			reg = <0x0 0x9d400000 0x0 (1080 * 2160 * 4)>;
-+			memory-region = <&framebuffer_mem>;
- 			width = <1080>;
- 			height = <2160>;
- 			stride = <(1080 * 4)>;
-@@ -62,7 +67,7 @@ key-vol-up {
- 	};
- 
- 	reserved-memory {
--		framebuffer@9d400000 {
-+		framebuffer_mem: framebuffer@9d400000 {
- 			reg = <0x0 0x9d400000 0x0 (1080 * 2160 * 4)>;
- 			no-map;
- 		};
 @@ -86,6 +91,45 @@ battery: battery {
  		voltage-max-design-microvolt = <4400000>;
  	};
@@ -2633,51 +2414,7 @@ index b5fc93f0315f..21f6825d881f 100644
  	vph_pwr: vph-pwr-regulator {
  		compatible = "regulator-fixed";
  		regulator-name = "vph_pwr";
-@@ -105,6 +149,43 @@ vreg_s4a_1p8: pm8998-smps4 {
- 
- 		vin-supply = <&vph_pwr>;
- 	};
-+
-+	wcn3990-pmu {
-+		compatible = "qcom,wcn3990-pmu";
-+
-+		pinctrl-0 = <&sw_ctrl_default>;
-+		pinctrl-names = "default";
-+
-+		vddio-supply = <&vreg_s4a_1p8>;
-+		vddxo-supply = <&vreg_l7a_1p8>;
-+		vddrf-supply = <&vreg_l17a_1p3>;
-+		vddch0-supply = <&vreg_l25a_3p3>;
-+		vddch1-supply = <&vreg_l23a_3p3>;
-+
-+		swctrl-gpios = <&pm8998_gpios 3 GPIO_ACTIVE_HIGH>;
-+
-+		regulators {
-+			vreg_pmu_io: ldo0 {
-+				regulator-name = "vreg_pmu_io";
-+			};
-+
-+			vreg_pmu_xo: ldo1 {
-+				regulator-name = "vreg_pmu_xo";
-+			};
-+
-+			vreg_pmu_rf: ldo2 {
-+				regulator-name = "vreg_pmu_rf";
-+			};
-+
-+			vreg_pmu_ch0: ldo3 {
-+				regulator-name = "vreg_pmu_ch0";
-+			};
-+
-+			vreg_pmu_ch1: ldo4 {
-+				regulator-name = "vreg_pmu_ch1";
-+			};
-+		};
-+	};
- };
- 
- &adsp_pas {
-@@ -415,6 +496,76 @@ &cdsp_pas {
+@@ -452,6 +496,76 @@ &cdsp_pas {
  	status = "okay";
  };
  
@@ -2754,34 +2491,7 @@ index b5fc93f0315f..21f6825d881f 100644
  &gcc {
  	protected-clocks = <GCC_QSPI_CORE_CLK>,
  			   <GCC_QSPI_CORE_CLK_SRC>,
-@@ -431,6 +582,26 @@ &gpu_zap_shader {
- 	firmware-name = "qcom/sdm845/SHIFT/axolotl/a630_zap.mbn";
- };
- 
-+&i2c3 {
-+	clock-frequency = <400000>;
-+
-+	status = "okay";
-+
-+	nfc@28 {
-+		compatible = "nxp,pn553", "nxp,nxp-nci-i2c";
-+		reg = <0x28>;
-+
-+		interrupts-extended = <&tlmm 63 IRQ_TYPE_EDGE_RISING>;
-+
-+		enable-gpios = <&tlmm 12 GPIO_ACTIVE_HIGH>;
-+		firmware-gpios = <&tlmm 62 GPIO_ACTIVE_HIGH>;
-+
-+		pinctrl-0 = <&nfc_default>;
-+		pinctrl-1 = <&nfc_sleep>;
-+		pinctrl-names = "default", "sleep";
-+	};
-+};
-+
- &i2c5 {
- 	clock-frequency = <400000>;
- 
-@@ -464,10 +635,11 @@ &i2c11 {
+@@ -521,10 +635,11 @@ &i2c11 {
  
  	status = "okay";
  
@@ -2794,17 +2504,10 @@ index b5fc93f0315f..21f6825d881f 100644
  		#sound-dai-cells = <0>;
  	};
  };
-@@ -526,6 +698,20 @@ &mss_pil {
- };
+@@ -590,6 +705,13 @@ sw_ctrl_default: sw-ctrl-default-state {
+ 		bias-pull-down;
+ 	};
  
- &pm8998_gpios {
-+	sw_ctrl_default: sw-ctrl-default-state {
-+		pins = "gpio3";
-+		function = "normal";
-+		input-enable;
-+		bias-pull-down;
-+	};
-+
 +	camera_rear_dvdd_n_default: camera-rear-dvdd-n-default-pins {
 +		pins = "gpio12";
 +		function = "normal";
@@ -2815,7 +2518,7 @@ index b5fc93f0315f..21f6825d881f 100644
  	volume_up_gpio: pm8998-gpio6-state {
  		pinconf {
  			pins = "gpio6";
-@@ -543,6 +729,19 @@ &pmi8998_charger {
+@@ -607,6 +729,19 @@ &pmi8998_charger {
  	status = "okay";
  };
  
@@ -2835,7 +2538,7 @@ index b5fc93f0315f..21f6825d881f 100644
  &pm8998_resin {
  	linux,code = <KEY_VOLUMEDOWN>;
  	status = "okay";
-@@ -597,6 +796,45 @@ led-1 {
+@@ -661,6 +796,45 @@ led-1 {
  	};
  };
  
@@ -2881,7 +2584,7 @@ index b5fc93f0315f..21f6825d881f 100644
  &qup_uart9_rx {
  	drive-strength = <2>;
  	bias-pull-up;
-@@ -639,6 +877,163 @@ &slpi_pas {
+@@ -703,6 +877,163 @@ &slpi_pas {
  	status = "okay";
  };
  
@@ -3045,67 +2748,10 @@ index b5fc93f0315f..21f6825d881f 100644
  &tlmm {
  	gpio-reserved-ranges = <0 4>, <81 4>;
  
-@@ -668,6 +1063,38 @@ sdc2_card_det_n: sd-card-det-n-state {
- 		bias-disable;
- 	};
- 
-+	nfc_default: nfc-default-state {
-+		enable-pins {
-+			pins = "gpio12", "gpio62";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+
-+		int-pins {
-+			pins = "gpio63";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+	};
-+
-+	nfc_sleep: nfc-sleep-state {
-+		enable-pins {
-+			pins = "gpio12", "gpio62";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-disable;
-+		};
-+
-+		int-pins {
-+			pins = "gpio63";
-+			function = "gpio";
-+			drive-strength = <2>;
-+			bias-pull-up;
-+		};
-+	};
-+
- 	sde_dsi_active: sde-dsi-active-state {
- 		pins = "gpio6", "gpio11";
- 		function = "gpio";
-@@ -732,10 +1159,11 @@ bluetooth {
- 		 */
- 		firmware-name = "SHIFT/axolotl/crnv21.bin";
- 
--		vddio-supply = <&vreg_s4a_1p8>;
--		vddxo-supply = <&vreg_l7a_1p8>;
--		vddrf-supply = <&vreg_l17a_1p3>;
--		vddch0-supply = <&vreg_l25a_3p3>;
-+		vddio-supply = <&vreg_pmu_io>;
-+		vddxo-supply = <&vreg_pmu_xo>;
-+		vddrf-supply = <&vreg_pmu_rf>;
-+		vddch0-supply = <&vreg_pmu_ch0>;
-+
- 		max-speed = <3200000>;
- 	};
- };
-@@ -789,15 +1217,44 @@ &venus {
+@@ -886,6 +1217,22 @@ &venus {
  	status = "okay";
  };
  
--&wifi {
--	status = "okay";
 +&wcd9340 {
 +	pinctrl-0 = <&wcd_intr_default>;
 +	pinctrl-names = "default";
@@ -3121,23 +2767,14 @@ index b5fc93f0315f..21f6825d881f 100644
 +	qcom,micbias3-microvolt = <2700000>;
 +	qcom,micbias4-microvolt = <2700000>;
 +};
- 
-+&wifi {
- 	vdd-0.8-cx-mx-supply = <&vreg_l5a_0p8>;
--	vdd-1.3-rfa-supply = <&vreg_l17a_1p3>;
--	vdd-1.8-xo-supply = <&vreg_l7a_1p8>;
--	vdd-3.3-ch0-supply = <&vreg_l25a_3p3>;
--	vdd-3.3-ch1-supply = <&vreg_l23a_3p3>;
-+	vdd-1.8-xo-supply = <&vreg_pmu_xo>;
-+	vdd-1.3-rfa-supply = <&vreg_pmu_rf>;
-+	vdd-3.3-ch0-supply = <&vreg_pmu_ch0>;
-+	vdd-3.3-ch1-supply = <&vreg_pmu_ch1>;
- 
- 	qcom,calibration-variant = "shift_axolotl";
- 	qcom,snoc-host-cap-8bit-quirk;
 +
-+	status = "okay";
-+};
+ &wifi {
+ 	vdd-0.8-cx-mx-supply = <&vreg_l5a_0p8>;
+ 	vdd-1.8-xo-supply = <&vreg_pmu_xo>;
+@@ -898,3 +1245,16 @@ &wifi {
+ 
+ 	status = "okay";
+ };
 +
 +/* qdsp6 hacks */
 +&q6cvp {
@@ -3150,9 +2787,9 @@ index b5fc93f0315f..21f6825d881f 100644
 +
 +&q6mvm {
 +	status = "okay";
- };
++};
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
-index 22354968aeaa..4c813a1dc2a5 100644
+index 54e58ca04693..4c813a1dc2a5 100644
 --- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-common.dtsi
 @@ -8,6 +8,9 @@
@@ -3165,7 +2802,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  #include "sdm845.dtsi"
  #include "sdm845-wcd9340.dtsi"
  #include "pm8998.dtsi"
-@@ -36,9 +39,28 @@ / {
+@@ -36,6 +39,7 @@ / {
  	qcom,msm-id = <QCOM_ID_SDM845 0x20001>;
  
  	aliases {
@@ -3173,28 +2810,16 @@ index 22354968aeaa..4c813a1dc2a5 100644
  		serial1 = &uart6;
  	};
  
-+	chosen {
-+		#address-cells = <2>;
-+		#size-cells = <2>;
-+		ranges;
-+
+@@ -44,6 +48,8 @@ chosen {
+ 		#size-cells = <2>;
+ 		ranges;
+ 
 +		stdout-path = "serial0:115200n8";
 +
-+		framebuffer {
-+			compatible = "simple-framebuffer";
-+			memory-region = <&cont_splash_mem>;
-+
-+			format = "a8r8g8b8";
-+			stride = <(1080 * 4)>;
-+			height = <2246>;
-+			width = <1080>;
-+		};
-+	};
-+
- 	gpio-keys {
- 		compatible = "gpio-keys";
- 		autorepeat;
-@@ -132,6 +154,52 @@ vreg_s4a_1p8: vreg-s4a-1p8 {
+ 		framebuffer {
+ 			compatible = "simple-framebuffer";
+ 			memory-region = <&cont_splash_mem>;
+@@ -148,6 +154,52 @@ vreg_s4a_1p8: vreg-s4a-1p8 {
  		regulator-max-microvolt = <1800000>;
  		regulator-always-on;
  	};
@@ -3247,7 +2872,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  };
  
  &adsp_pas {
-@@ -144,6 +212,9 @@ regulators-0 {
+@@ -160,6 +212,9 @@ regulators-0 {
  		compatible = "qcom,pm8998-rpmh-regulators";
  		qcom,pmic-id = "a";
  
@@ -3257,7 +2882,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  		vreg_l1a_0p875: ldo1 {
  			regulator-min-microvolt = <880000>;
  			regulator-max-microvolt = <880000>;
-@@ -228,10 +299,75 @@ vreg_l26a_1p2: ldo26 {
+@@ -244,10 +299,75 @@ vreg_l26a_1p2: ldo26 {
  	};
  };
  
@@ -3334,7 +2959,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  };
  
  &cdsp_pas {
-@@ -247,6 +383,10 @@ &gcc {
+@@ -263,6 +383,10 @@ &gcc {
  			   <GCC_LPASS_SWAY_CLK>;
  };
  
@@ -3345,7 +2970,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  &gpi_dma1 {
  	status = "okay";
  };
-@@ -335,6 +475,26 @@ &mss_pil {
+@@ -351,6 +475,26 @@ &mss_pil {
  	"qcom/sdm845/Xiaomi/beryllium/modem.mbn";
  };
  
@@ -3372,7 +2997,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  &pm8998_gpios {
  	vol_up_pin_a: vol-up-active-state {
  		pins = "gpio6";
-@@ -394,6 +554,19 @@ led-1 {
+@@ -410,6 +554,19 @@ led-1 {
  	};
  };
  
@@ -3392,7 +3017,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  &pm8998_resin {
  	linux,code = <KEY_VOLUMEDOWN>;
  	status = "okay";
-@@ -419,6 +592,10 @@ dai@1 {
+@@ -435,6 +592,10 @@ dai@1 {
  	dai@2 {
  		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
  	};
@@ -3403,7 +3028,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  };
  
  &qupv3_id_0 {
-@@ -429,6 +606,16 @@ &qupv3_id_1 {
+@@ -445,6 +606,16 @@ &qupv3_id_1 {
  	status = "okay";
  };
  
@@ -3420,7 +3045,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  &sdhc_2 {
  	status = "okay";
  
-@@ -463,21 +650,50 @@ &sound {
+@@ -479,21 +650,50 @@ &sound {
  	mm1-dai-link {
  		link-name = "MultiMedia1";
  		cpu {
@@ -3474,7 +3099,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  		};
  	};
  
-@@ -497,7 +713,7 @@ codec {
+@@ -513,7 +713,7 @@ codec {
  	};
  
  	slimcap-dai-link {
@@ -3483,7 +3108,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  		cpu {
  			sound-dai = <&q6afedai SLIMBUS_0_TX>;
  		};
-@@ -507,7 +723,22 @@ platform {
+@@ -523,7 +723,22 @@ platform {
  		};
  
  		codec {
@@ -3507,7 +3132,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  		};
  	};
  };
-@@ -515,6 +746,24 @@ codec {
+@@ -531,6 +746,24 @@ codec {
  &tlmm {
  	gpio-reserved-ranges = <0 4>, <81 4>;
  
@@ -3532,7 +3157,7 @@ index 22354968aeaa..4c813a1dc2a5 100644
  	sdc2_default_state: sdc2-default-state {
  		clk-pins {
  			pins = "sdc2_clk";
-@@ -589,6 +838,11 @@ bluetooth {
+@@ -605,6 +838,11 @@ bluetooth {
  	};
  };
  
@@ -3544,13 +3169,10 @@ index 22354968aeaa..4c813a1dc2a5 100644
  &ufs_mem_hc {
  	status = "okay";
  
-@@ -661,5 +915,24 @@ &wifi {
- 	vdd-3.3-ch1-supply = <&vreg_l23a_3p3>;
+@@ -680,3 +918,21 @@ &wifi {
+ 	qcom,snoc-host-cap-skip-quirk;
+ };
  
- 	qcom,calibration-variant = "xiaomi_beryllium";
-+	qcom,snoc-host-cap-skip-quirk;
-+};
-+
 +/* qdsp6 hacks */
 +&q6cvp {
 +	status = "okay";
@@ -3562,39 +3184,13 @@ index 22354968aeaa..4c813a1dc2a5 100644
 +
 +&q6mvm {
 +	status = "okay";
- };
- 
++};
++
 +&q6voicedai {
 +	dai@1 {
 +		reg = <VOICEMMODE1>;
 +	};
 +};
-diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-ebbg.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-ebbg.dts
-index 2d6f0e382a6c..d157622f84d1 100644
---- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-ebbg.dts
-+++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-ebbg.dts
-@@ -6,7 +6,7 @@
- 
- / {
- 	model = "Xiaomi Pocophone F1 (EBBG)";
--	compatible = "xiaomi,beryllium-ebbg", "qcom,sdm845";
-+	compatible = "xiaomi,beryllium-ebbg", "xiaomi,beryllium", "qcom,sdm845";
- };
- 
- &display_panel {
-diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
-index b58964cde834..71816a9f33b4 100644
---- a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
-+++ b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-beryllium-tianma.dts
-@@ -6,7 +6,7 @@
- 
- / {
- 	model = "Xiaomi Pocophone F1 (Tianma)";
--	compatible = "xiaomi,beryllium", "qcom,sdm845";
-+	compatible = "xiaomi,beryllium-tianma", "xiaomi,beryllium", "qcom,sdm845";
- };
- 
- &display_panel {
 diff --git a/arch/arm64/boot/dts/qcom/sdm845-xiaomi-perseus.dts b/arch/arm64/boot/dts/qcom/sdm845-xiaomi-perseus.dts
 new file mode 100644
 index 000000000000..8257dd7b8249
@@ -6241,10 +5837,10 @@ index 6064a0e17d51..3f75ba5fbd32 100644
  	}
  	return -EINVAL;
 diff --git a/drivers/clk/qcom/dispcc-sdm845.c b/drivers/clk/qcom/dispcc-sdm845.c
-index 78e43f6d7502..468b30497746 100644
+index 6ad6c4f5d337..5df2893f56c2 100644
 --- a/drivers/clk/qcom/dispcc-sdm845.c
 +++ b/drivers/clk/qcom/dispcc-sdm845.c
-@@ -763,6 +763,7 @@ static struct gdsc mdss_gdsc = {
+@@ -762,6 +762,7 @@ static struct gdsc mdss_gdsc = {
  	.en_rest_wait_val = 0x5,
  	.pd = {
  		.name = "mdss_gdsc",
@@ -6253,10 +5849,10 @@ index 78e43f6d7502..468b30497746 100644
  	.pwrsts = PWRSTS_OFF_ON,
  	.flags = HW_CTRL | POLL_CFG_GDSCR,
 diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
-index 7a3e3c2f5cf3..7f1e26c65400 100644
+index 8b3bb2fd433b..57ad020b3e80 100644
 --- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
 +++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
-@@ -1686,12 +1686,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
+@@ -1608,12 +1608,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
  	dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
  	dev_pm_genpd_synced_poweroff(gmu->cxpd);
  
@@ -6270,7 +5866,7 @@ index 7a3e3c2f5cf3..7f1e26c65400 100644
  
  	if (!wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
  		DRM_DEV_ERROR(&gpu->pdev->dev, "cx gdsc didn't collapse\n");
-@@ -1700,10 +1695,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
+@@ -1622,10 +1617,7 @@ static void a6xx_recover(struct msm_gpu *gpu)
  
  	pm_runtime_use_autosuspend(&gpu->pdev->dev);
  
@@ -6321,10 +5917,10 @@ index 982abaaac00d..4c17cf2e3b69 100644
  
  	pinctrl_pm_select_sleep_state(&msm_host->pdev->dev);
 diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
-index adab94b3ebdf..980bc2138542 100644
+index 3eac4d0f88bc..a01850f0401c 100644
 --- a/drivers/gpu/drm/panel/Kconfig
 +++ b/drivers/gpu/drm/panel/Kconfig
-@@ -473,6 +473,21 @@ config DRM_PANEL_LG_SW43408
+@@ -500,6 +500,21 @@ config DRM_PANEL_LG_SW43408
  	  pixel. It provides a MIPI DSI interface to the host and has a
  	  built-in LED backlight.
  
@@ -6346,7 +5942,7 @@ index adab94b3ebdf..980bc2138542 100644
  config DRM_PANEL_LXD_M9189A
  	tristate "LXD M9189A MIPI-DSI LCD panel"
  	depends on OF
-@@ -564,6 +579,18 @@ config DRM_PANEL_NOVATEK_NT35560
+@@ -601,6 +616,18 @@ config DRM_PANEL_NOVATEK_NT35560
  	  mode. This supports several panels such as Sony ACX424AKM and
  	  ACX424AKP.
  
@@ -6365,7 +5961,7 @@ index adab94b3ebdf..980bc2138542 100644
  config DRM_PANEL_NOVATEK_NT35950
  	tristate "Novatek NT35950 DSI panel"
  	depends on OF
-@@ -838,6 +865,15 @@ config DRM_PANEL_SAMSUNG_DB7430
+@@ -878,6 +905,15 @@ config DRM_PANEL_SAMSUNG_DB7430
  	  DB7430 DPI display controller used in such devices as the
  	  LMS397KF04 480x800 DPI panel.
  
@@ -6382,10 +5978,10 @@ index adab94b3ebdf..980bc2138542 100644
  	tristate "Samsung LD9040 RGB/SPI panel"
  	depends on OF && SPI
 diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
-index a4291dc3905b..4532f79021ea 100644
+index c2c5cf817116..ecf76dc38771 100644
 --- a/drivers/gpu/drm/panel/Makefile
 +++ b/drivers/gpu/drm/panel/Makefile
-@@ -47,6 +47,7 @@ obj-$(CONFIG_DRM_PANEL_LG_LB035Q02) += panel-lg-lb035q02.o
+@@ -49,6 +49,7 @@ obj-$(CONFIG_DRM_PANEL_LG_LB035Q02) += panel-lg-lb035q02.o
  obj-$(CONFIG_DRM_PANEL_LG_LD070WX3) += panel-lg-ld070wx3.o
  obj-$(CONFIG_DRM_PANEL_LG_LG4573) += panel-lg-lg4573.o
  obj-$(CONFIG_DRM_PANEL_LG_SW43408) += panel-lg-sw43408.o
@@ -6393,15 +5989,15 @@ index a4291dc3905b..4532f79021ea 100644
  obj-$(CONFIG_DRM_PANEL_LXD_M9189A) += panel-lxd-m9189a.o
  obj-$(CONFIG_DRM_PANEL_MAGNACHIP_D53E6EA8966) += panel-magnachip-d53e6ea8966.o
  obj-$(CONFIG_DRM_PANEL_MOTOROLA_MOT) += panel-motorola-mot.o
-@@ -55,6 +56,7 @@ obj-$(CONFIG_DRM_PANEL_NEWVISION_NV3051D) += panel-newvision-nv3051d.o
- obj-$(CONFIG_DRM_PANEL_NEWVISION_NV3052C) += panel-newvision-nv3052c.o
+@@ -58,6 +59,7 @@ obj-$(CONFIG_DRM_PANEL_NEWVISION_NV3052C) += panel-newvision-nv3052c.o
  obj-$(CONFIG_DRM_PANEL_NOVATEK_NT35510) += panel-novatek-nt35510.o
+ obj-$(CONFIG_DRM_PANEL_NOVATEK_NT35532) += panel-novatek-nt35532.o
  obj-$(CONFIG_DRM_PANEL_NOVATEK_NT35560) += panel-novatek-nt35560.o
 +obj-$(CONFIG_DRM_PANEL_NOVATEK_NT35596S) += panel-novatek-nt35596s.o
  obj-$(CONFIG_DRM_PANEL_NOVATEK_NT35950) += panel-novatek-nt35950.o
  obj-$(CONFIG_DRM_PANEL_NOVATEK_NT36523) += panel-novatek-nt36523.o
  obj-$(CONFIG_DRM_PANEL_NOVATEK_NT36672A) += panel-novatek-nt36672a.o
-@@ -81,6 +83,7 @@ obj-$(CONFIG_DRM_PANEL_SAMSUNG_AMS581VF01) += panel-samsung-ams581vf01.o
+@@ -84,6 +86,7 @@ obj-$(CONFIG_DRM_PANEL_SAMSUNG_AMS581VF01) += panel-samsung-ams581vf01.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_AMS639RQ08) += panel-samsung-ams639rq08.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_ATNA33XC20) += panel-samsung-atna33xc20.o
  obj-$(CONFIG_DRM_PANEL_SAMSUNG_DB7430) += panel-samsung-db7430.o
@@ -8051,10 +7647,10 @@ index 000000000000..479b9d7016ee
 +MODULE_DESCRIPTION("DRM driver for samsung ea8076 fhd cmd dsi panel");
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/gpu/drm/panel/panel-visionox-rm69299.c b/drivers/gpu/drm/panel/panel-visionox-rm69299.c
-index f1430370ff94..b149bca05421 100644
+index 50f8a84537ca..470a2e08dfa8 100644
 --- a/drivers/gpu/drm/panel/panel-visionox-rm69299.c
 +++ b/drivers/gpu/drm/panel/panel-visionox-rm69299.c
-@@ -389,6 +389,7 @@ static int visionox_rm69299_probe(struct mipi_dsi_device *dsi)
+@@ -388,6 +388,7 @@ static int visionox_rm69299_probe(struct mipi_dsi_device *dsi)
  	dsi->format = MIPI_DSI_FMT_RGB888;
  	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_LPM |
  			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
@@ -8063,7 +7659,7 @@ index f1430370ff94..b149bca05421 100644
  	if (ret < 0) {
  		dev_err(dev, "dsi attach failed ret = %d\n", ret);
 diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
-index 94a753fcb64f..30fae603f5d1 100644
+index 1f6c57dba030..551cad6de0b5 100644
 --- a/drivers/input/misc/Kconfig
 +++ b/drivers/input/misc/Kconfig
 @@ -236,6 +236,18 @@ config INPUT_PMIC8XXX_PWRKEY
@@ -8086,10 +7682,10 @@ index 94a753fcb64f..30fae603f5d1 100644
  	tristate "SPARC Speaker support"
  	depends on PCI && SPARC64
 diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
-index 415fc4e2918b..a6bdf73d1349 100644
+index 2281d6803fce..7c20cf27eb70 100644
 --- a/drivers/input/misc/Makefile
 +++ b/drivers/input/misc/Makefile
-@@ -71,6 +71,7 @@ obj-$(CONFIG_INPUT_POWERMATE)		+= powermate.o
+@@ -70,6 +70,7 @@ obj-$(CONFIG_INPUT_POWERMATE)		+= powermate.o
  obj-$(CONFIG_INPUT_PWM_BEEPER)		+= pwm-beeper.o
  obj-$(CONFIG_INPUT_PWM_VIBRA)		+= pwm-vibra.o
  obj-$(CONFIG_INPUT_QNAP_MCU)		+= qnap-mcu-input.o
@@ -9083,10 +8679,10 @@ index 000000000000..1d453a4a6174
 +MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Casey Connolly <casey@connolly.tech>");
 diff --git a/drivers/input/rmi4/rmi_driver.c b/drivers/input/rmi4/rmi_driver.c
-index ccd9338a44db..bb1db5bbb3ab 100644
+index 5d49a9021c7d..e680a7facadc 100644
 --- a/drivers/input/rmi4/rmi_driver.c
 +++ b/drivers/input/rmi4/rmi_driver.c
-@@ -137,9 +137,14 @@ static int rmi_process_interrupt_requests(struct rmi_device *rmi_dev)
+@@ -138,9 +138,14 @@ static int rmi_process_interrupt_requests(struct rmi_device *rmi_dev)
  		return 0;
  
  	if (!data->attn_data.data) {
@@ -9103,7 +8699,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  		if (error < 0) {
  			dev_err(dev, "Failed to read irqs, code=%d\n", error);
  			return error;
-@@ -457,9 +462,10 @@ static int rmi_driver_reset_handler(struct rmi_device *rmi_dev)
+@@ -461,9 +466,10 @@ static int rmi_driver_reset_handler(struct rmi_device *rmi_dev)
  	return 0;
  }
  
@@ -9116,7 +8712,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  	u8 buf[RMI_PDT_ENTRY_SIZE];
  	int error;
  
-@@ -470,6 +476,21 @@ static int rmi_read_pdt_entry(struct rmi_device *rmi_dev,
+@@ -474,6 +480,21 @@ static int rmi_read_pdt_entry(struct rmi_device *rmi_dev,
  		return error;
  	}
  
@@ -9138,7 +8734,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  	entry->page_start = pdt_address & RMI4_PAGE_MASK;
  	entry->query_base_addr = buf[0];
  	entry->command_base_addr = buf[1];
-@@ -494,12 +515,39 @@ static void rmi_driver_copy_pdt_to_fd(const struct pdt_entry *pdt,
+@@ -498,12 +519,39 @@ static void rmi_driver_copy_pdt_to_fd(const struct pdt_entry *pdt,
  	fd->function_version = pdt->function_version;
  }
  
@@ -9179,7 +8775,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  			     void *ctx,
  			     int (*callback)(struct rmi_device *rmi_dev,
  					     void *ctx,
-@@ -515,13 +563,16 @@ static int rmi_scan_pdt_page(struct rmi_device *rmi_dev,
+@@ -519,13 +567,16 @@ static int rmi_scan_pdt_page(struct rmi_device *rmi_dev,
  	int retval;
  
  	for (addr = pdt_start; addr >= pdt_end; addr -= RMI_PDT_ENTRY_SIZE) {
@@ -9197,7 +8793,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  		retval = callback(rmi_dev, ctx, &pdt_entry);
  		if (retval != RMI_SCAN_CONTINUE)
  			return retval;
-@@ -532,11 +583,11 @@ static int rmi_scan_pdt_page(struct rmi_device *rmi_dev,
+@@ -536,11 +587,11 @@ static int rmi_scan_pdt_page(struct rmi_device *rmi_dev,
  	 * or more is found, stop scanning.
  	 */
  	if (addr == pdt_start)
@@ -9212,7 +8808,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  					RMI_SCAN_DONE : RMI_SCAN_CONTINUE;
  }
  
-@@ -545,11 +596,11 @@ int rmi_scan_pdt(struct rmi_device *rmi_dev, void *ctx,
+@@ -549,11 +600,11 @@ int rmi_scan_pdt(struct rmi_device *rmi_dev, void *ctx,
  		 void *ctx, const struct pdt_entry *entry))
  {
  	int page;
@@ -9226,7 +8822,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  					   ctx, callback);
  		if (retval != RMI_SCAN_CONTINUE)
  			break;
-@@ -989,9 +1040,13 @@ static int rmi_driver_remove(struct device *dev)
+@@ -1033,9 +1084,13 @@ static int rmi_driver_remove(struct device *dev)
  }
  
  #ifdef CONFIG_OF
@@ -9242,7 +8838,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  	int retval;
  
  	retval = rmi_of_property_read_u32(dev, &pdata->reset_delay_ms,
-@@ -999,11 +1054,37 @@ static int rmi_driver_of_probe(struct device *dev,
+@@ -1043,11 +1098,37 @@ static int rmi_driver_of_probe(struct device *dev,
  	if (retval)
  		return retval;
  
@@ -9282,7 +8878,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  {
  	return -ENODEV;
  }
-@@ -1049,16 +1130,17 @@ int rmi_probe_interrupts(struct rmi_driver_data *data)
+@@ -1093,16 +1174,17 @@ int rmi_probe_interrupts(struct rmi_driver_data *data)
  	data->num_of_irq_regs = (data->irq_count + 7) / 8;
  
  	size = BITS_TO_LONGS(data->irq_count) * sizeof(unsigned long);
@@ -9305,7 +8901,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  
  	return retval;
  }
-@@ -1123,7 +1205,7 @@ static int rmi_driver_probe(struct device *dev)
+@@ -1167,7 +1249,7 @@ static int rmi_driver_probe(struct device *dev)
  	pdata = rmi_get_platform_data(rmi_dev);
  
  	if (rmi_dev->xport->dev->of_node) {
@@ -9315,7 +8911,7 @@ index ccd9338a44db..bb1db5bbb3ab 100644
  			return retval;
  	}
 diff --git a/drivers/input/rmi4/rmi_driver.h b/drivers/input/rmi4/rmi_driver.h
-index e84495caab15..a6a29fde49f3 100644
+index abeafb77a483..e1e39e98559b 100644
 --- a/drivers/input/rmi4/rmi_driver.h
 +++ b/drivers/input/rmi4/rmi_driver.h
 @@ -31,6 +31,8 @@
@@ -9339,9 +8935,9 @@ index e84495caab15..a6a29fde49f3 100644
 +	bool pdts[RMI_PDT_MAX + 1];
 +};
 +
- #define RMI_REG_DESC_PRESENSE_BITS	(32 * BITS_PER_BYTE)
+ #define RMI_REG_DESC_PRESENCE_BITS	(32 * BITS_PER_BYTE)
+ #define RMI_REG_DESC_PRESENCE_REGS_MAX	(3 + RMI_REG_DESC_PRESENCE_BITS / 8)
  #define RMI_REG_DESC_SUBPACKET_BITS	(37 * BITS_PER_BYTE)
- 
 diff --git a/drivers/input/rmi4/rmi_f01.c b/drivers/input/rmi4/rmi_f01.c
 index 47be64284b25..2278e9b6a920 100644
 --- a/drivers/input/rmi4/rmi_f01.c
@@ -9368,19 +8964,26 @@ index 47be64284b25..2278e9b6a920 100644
  }
  
 diff --git a/drivers/input/rmi4/rmi_f12.c b/drivers/input/rmi4/rmi_f12.c
-index 8246fe77114b..1a103cc5f223 100644
+index 88c28089de99..81b1b9ebbd28 100644
 --- a/drivers/input/rmi4/rmi_f12.c
 +++ b/drivers/input/rmi4/rmi_f12.c
-@@ -218,6 +218,41 @@ static void rmi_f12_process_objects(struct f12_data *f12, u8 *data1, int size)
+@@ -245,6 +245,52 @@ static void rmi_f12_process_objects(struct f12_data *f12, u8 *data1, u32 size)
  		rmi_2d_sensor_abs_report(sensor, &sensor->objs[i], i);
  }
  
-+static void rmi_f12_set_hardcoded_desc(struct rmi_function *fn, struct f12_data *f12)
++/*
++ * Some replacement displays ship third-party touch ICs that have no register
++ * descriptors at all. Fake a Data1 descriptor with sane defaults so that touch
++ * events still work, instead of failing the probe.
++ */
++static int rmi_f12_set_hardcoded_desc(struct rmi_function *fn,
++				      struct f12_data *f12)
 +{
 +	struct rmi_2d_sensor *sensor = &f12->sensor;
 +	struct rmi_register_desc_item *reg_desc;
 +
-+	/* We have no f12->data_reg_desc, so the pkt_size is 0, override it with
++	/*
++	 * We have no f12->data_reg_desc, so the pkt_size is 0, override it with
 +	 * a somewhat sensible default (this corresponds to 10 fingers).
 +	 */
 +	sensor->pkt_size = 88;
@@ -9397,8 +9000,10 @@ index 8246fe77114b..1a103cc5f223 100644
 +	 * Create the Data1 register descriptor so that touch events
 +	 * can work properly.
 +	 */
-+	reg_desc = devm_kcalloc(&fn->dev, 1,
-+			sizeof(struct rmi_register_desc_item), GFP_KERNEL);
++	reg_desc = devm_kzalloc(&fn->dev, sizeof(*reg_desc), GFP_KERNEL);
++	if (!reg_desc)
++		return -ENOMEM;
++
 +	reg_desc->reg = 1;
 +	reg_desc->reg_size = 80;
 +	reg_desc->num_subpackets = 10;
@@ -9408,61 +9013,22 @@ index 8246fe77114b..1a103cc5f223 100644
 +	sensor->nbr_fingers = reg_desc->num_subpackets;
 +	sensor->report_abs = 1;
 +	sensor->attn_size += reg_desc->reg_size;
-+}
-+
- static irqreturn_t rmi_f12_attention(int irq, void *ctx)
- {
- 	int retval;
-@@ -338,6 +373,40 @@ static int rmi_f12_config(struct rmi_function *fn)
- 	return 0;
- }
- 
-+static int rmi_f12_sensor_init(struct rmi_function *fn, struct f12_data *f12)
-+{
-+	struct rmi_2d_sensor *sensor = &f12->sensor;
-+
-+	sensor->fn = fn;
-+	f12->data_addr = fn->fd.data_base_addr;
-+
-+	/* On quirky devices that don't have a data_reg_desc we hardcode the packet
-+	 * in rmi_f12_set_hardcoded_desc(). Make sure not to set it to 0 here.
-+	 */
-+	if (!sensor->pkt_size)
-+		sensor->pkt_size = rmi_register_desc_calc_size(&f12->data_reg_desc);
-+
-+	sensor->axis_align =
-+		f12->sensor_pdata.axis_align;
-+
-+	sensor->x_mm = f12->sensor_pdata.x_mm;
-+	sensor->y_mm = f12->sensor_pdata.y_mm;
-+	sensor->dribble = f12->sensor_pdata.dribble;
-+
-+	if (sensor->sensor_type == rmi_sensor_default)
-+		sensor->sensor_type =
-+			f12->sensor_pdata.sensor_type;
-+
-+	rmi_dbg(RMI_DEBUG_FN, &fn->dev, "%s: data packet size: %d\n", __func__,
-+		sensor->pkt_size);
-+
-+	sensor->data_pkt = devm_kzalloc(&fn->dev, sensor->pkt_size, GFP_KERNEL);
-+	if (!sensor->data_pkt)
-+		return -ENOMEM;
 +
 +	return 0;
 +}
 +
- static int rmi_f12_probe(struct rmi_function *fn)
+ static irqreturn_t rmi_f12_attention(int irq, void *ctx)
  {
- 	struct f12_data *f12;
-@@ -351,6 +420,7 @@ static int rmi_f12_probe(struct rmi_function *fn)
- 	struct rmi_driver_data *drvdata = dev_get_drvdata(&rmi_dev->dev);
- 	u16 data_offset = 0;
- 	int mask_size;
+ 	struct rmi_function *fn = ctx;
+@@ -383,6 +429,7 @@ static int rmi_f12_probe(struct rmi_function *fn)
+ 	size_t data_offset = 0;
+ 	size_t pkt_size;
+ 	int irq_mask_size;
 +	bool hardcoded_desc_quirk = false;
+ 	int i;
  
  	rmi_dbg(RMI_DEBUG_FN, &fn->dev, "%s\n", __func__);
- 
-@@ -365,9 +435,9 @@ static int rmi_f12_probe(struct rmi_function *fn)
+@@ -398,9 +445,9 @@ static int rmi_f12_probe(struct rmi_function *fn)
  	++query_addr;
  
  	if (!(buf & BIT(0))) {
@@ -9474,78 +9040,66 @@ index 8246fe77114b..1a103cc5f223 100644
 +		hardcoded_desc_quirk = true;
  	}
  
- 	f12 = devm_kzalloc(&fn->dev, sizeof(struct f12_data) + mask_size * 2,
-@@ -375,6 +445,8 @@ static int rmi_f12_probe(struct rmi_function *fn)
- 	if (!f12)
- 		return -ENOMEM;
- 
-+	dev_set_drvdata(&fn->dev, f12);
-+
- 	f12->abs_mask = (unsigned long *)((char *)f12
- 			+ sizeof(struct f12_data));
- 	f12->rel_mask = (unsigned long *)((char *)f12
-@@ -393,6 +465,18 @@ static int rmi_f12_probe(struct rmi_function *fn)
+ 	f12 = devm_kzalloc(&fn->dev, struct_size(f12, irq_mask, irq_mask_size * 2),
+@@ -421,19 +468,28 @@ static int rmi_f12_probe(struct rmi_function *fn)
  		f12->sensor_pdata = pdata->sensor_pdata;
  	}
  
-+	sensor = &f12->sensor;
+-	ret = rmi_f12_read_register_descs(fn, f12, query_addr);
+-	if (ret)
+-		return ret;
+-
+ 	sensor = &f12->sensor;
 +
 +	if (hardcoded_desc_quirk) {
-+		rmi_f12_set_hardcoded_desc(fn, f12);
-+
-+		ret = rmi_f12_sensor_init(fn, f12);
++		ret = rmi_f12_set_hardcoded_desc(fn, f12);
++		if (ret)
++			return ret;
++	} else {
++		ret = rmi_f12_read_register_descs(fn, f12, query_addr);
 +		if (ret)
 +			return ret;
 +
-+		goto skip_register_desc;
++		pkt_size = rmi_register_desc_calc_size(&f12->data_reg_desc);
++		if (pkt_size > SZ_1M) {
++			dev_err(&fn->dev, "Invalid data packet size: %zu\n",
++				pkt_size);
++			return -EINVAL;
++		}
++		sensor->pkt_size = pkt_size;
 +	}
 +
- 	ret = rmi_read_register_desc(rmi_dev, query_addr,
- 					&f12->query_reg_desc);
- 	if (ret) {
-@@ -423,29 +507,9 @@ static int rmi_f12_probe(struct rmi_function *fn)
- 	}
- 	query_addr += 3;
+ 	sensor->fn = fn;
+ 	f12->data_addr = fn->fd.data_base_addr;
+-	pkt_size = rmi_register_desc_calc_size(&f12->data_reg_desc);
+-	if (pkt_size > SZ_1M) {
+-		dev_err(&fn->dev, "Invalid data packet size: %zu\n", pkt_size);
+-		return -EINVAL;
+-	}
+-	sensor->pkt_size = pkt_size;
  
--	sensor = &f12->sensor;
--	sensor->fn = fn;
--	f12->data_addr = fn->fd.data_base_addr;
--	sensor->pkt_size = rmi_register_desc_calc_size(&f12->data_reg_desc);
--
--	sensor->axis_align =
--		f12->sensor_pdata.axis_align;
--
--	sensor->x_mm = f12->sensor_pdata.x_mm;
--	sensor->y_mm = f12->sensor_pdata.y_mm;
--	sensor->dribble = f12->sensor_pdata.dribble;
--
--	if (sensor->sensor_type == rmi_sensor_default)
--		sensor->sensor_type =
--			f12->sensor_pdata.sensor_type;
--
--	rmi_dbg(RMI_DEBUG_FN, &fn->dev, "%s: data packet size: %d\n", __func__,
--		sensor->pkt_size);
--	sensor->data_pkt = devm_kzalloc(&fn->dev, sensor->pkt_size, GFP_KERNEL);
--	if (!sensor->data_pkt)
--		return -ENOMEM;
--
--	dev_set_drvdata(&fn->dev, f12);
-+	ret = rmi_f12_sensor_init(fn, f12);
-+	if (ret)
-+		return ret;
+ 	sensor->axis_align = f12->sensor_pdata.axis_align;
  
+@@ -452,6 +508,9 @@ static int rmi_f12_probe(struct rmi_function *fn)
+ 
+ 	dev_set_drvdata(&fn->dev, f12);
+ 
++	if (hardcoded_desc_quirk)
++		goto skip_register_desc;
++
  	ret = rmi_f12_read_sensor_tuning(f12);
  	if (ret)
-@@ -543,6 +607,7 @@ static int rmi_f12_probe(struct rmi_function *fn)
+ 		return ret;
+@@ -521,6 +580,7 @@ static int rmi_f12_probe(struct rmi_function *fn)
  		data_offset += item->reg_size;
  	}
  
 +skip_register_desc:
  	/* allocate the in-kernel tracking buffers */
- 	sensor->tracking_pos = devm_kcalloc(&fn->dev,
- 			sensor->nbr_fingers, sizeof(struct input_mt_pos),
+ 	sensor->tracking_pos = devm_kcalloc(&fn->dev, sensor->nbr_fingers,
+ 					    sizeof(*sensor->tracking_pos),
 diff --git a/drivers/input/rmi4/rmi_f55.c b/drivers/input/rmi4/rmi_f55.c
-index 488adaca4dd0..776c915b82e7 100644
+index a0877d32a914..87e7922a16d5 100644
 --- a/drivers/input/rmi4/rmi_f55.c
 +++ b/drivers/input/rmi4/rmi_f55.c
 @@ -52,6 +52,11 @@ static int rmi_f55_detect(struct rmi_function *fn)
@@ -9559,12 +9113,12 @@ index 488adaca4dd0..776c915b82e7 100644
 +	}
  
  	f55->cfg_num_rx_electrodes = f55->num_rx_electrodes;
- 	f55->cfg_num_tx_electrodes = f55->num_rx_electrodes;
+ 	f55->cfg_num_tx_electrodes = f55->num_tx_electrodes;
 diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
-index aeaf9a9cbb41..84d18b0ffb94 100644
+index 9b9ae8ac3f7f..dbc9549e1c1b 100644
 --- a/drivers/input/touchscreen/Kconfig
 +++ b/drivers/input/touchscreen/Kconfig
-@@ -1297,6 +1297,18 @@ config TOUCHSCREEN_SURFACE3_SPI
+@@ -1299,6 +1299,18 @@ config TOUCHSCREEN_SURFACE3_SPI
  	  To compile this driver as a module, choose M here: the
  	  module will be called surface3_spi.
  
@@ -9584,7 +9138,7 @@ index aeaf9a9cbb41..84d18b0ffb94 100644
  	tristate "Semtech SX8654 touchscreen"
  	depends on I2C
 diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
-index f2b002abebe8..79e3babf0307 100644
+index bfd9de83389d..da3ecf9824ab 100644
 --- a/drivers/input/touchscreen/Makefile
 +++ b/drivers/input/touchscreen/Makefile
 @@ -119,3 +119,4 @@ obj-$(CONFIG_TOUCHSCREEN_IQS5XX)	+= iqs5xx.o
@@ -9593,7 +9147,6 @@ index f2b002abebe8..79e3babf0307 100644
  obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83112B)	+= himax_hx83112b.o
 +obj-$(CONFIG_TOUCHSCREEN_SW49410) += sw49410-ts-spi.o
 diff --git a/drivers/input/touchscreen/stmfts.c b/drivers/input/touchscreen/stmfts.c
-index 8af87d0b6eb6..e613299e3755 100644
 --- a/drivers/input/touchscreen/stmfts.c
 +++ b/drivers/input/touchscreen/stmfts.c
 @@ -1,8 +1,11 @@
@@ -9611,8 +9164,8 @@ index 8af87d0b6eb6..e613299e3755 100644
 + */
  
  #include <linux/delay.h>
- #include <linux/i2c.h>
-@@ -12,6 +15,7 @@
+ #include <linux/gpio/consumer.h>
+@@ -13,6 +16,7 @@
  #include <linux/irq.h>
  #include <linux/leds.h>
  #include <linux/module.h>
@@ -9620,7 +9173,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  #include <linux/pm_runtime.h>
  #include <linux/regulator/consumer.h>
  
-@@ -34,6 +38,7 @@
+@@ -35,6 +39,7 @@
  #define STMFTS_FULL_FORCE_CALIBRATION		0xa2
  #define STMFTS_MS_CX_TUNING			0xa3
  #define STMFTS_SS_CX_TUNING			0xa4
@@ -9628,7 +9181,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  
  /* events */
  #define STMFTS_EV_NO_EVENT			0x00
-@@ -51,12 +56,32 @@
+@@ -52,12 +57,32 @@
  #define STMFTS_EV_STATUS			0x16
  #define STMFTS_EV_DEBUG				0xdb
  
@@ -9661,16 +9214,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  
  /* key related event masks */
  #define STMFTS_MASK_KEY_NO_TOUCH		0x00
-@@ -69,20 +94,24 @@
- #define STMFTS_MAX_FINGERS	10
- #define STMFTS_DEV_NAME		"stmfts"
- 
--enum stmfts_regulators {
--	STMFTS_REGULATOR_VDD,
--	STMFTS_REGULATOR_AVDD,
-+static const struct regulator_bulk_data stmfts_supplies[] = {
-+	{ .supply = "vdd" },
-+	{ .supply = "avdd" },
+@@ -76,9 +101,12 @@
  };
  
  struct stmfts_data {
@@ -9678,19 +9222,12 @@ index 8af87d0b6eb6..e613299e3755 100644
 +
  	struct i2c_client *client;
  	struct input_dev *input;
-+	struct gpio_desc *reset_gpio;
+ 	struct gpio_desc *reset_gpio;
 +	struct gpio_desc *mode_switch_gpio;
  	struct led_classdev led_cdev;
  	struct mutex mutex;
  
- 	struct touchscreen_properties prop;
- 
--	struct regulator_bulk_data regulators[2];
-+	struct regulator_bulk_data *supplies;
- 
- 	/*
- 	 * Presence of ledvdd will be used also to check
-@@ -100,12 +129,27 @@ struct stmfts_data {
+@@ -102,12 +130,27 @@
  
  	struct completion cmd_done;
  
@@ -9716,9 +9253,9 @@ index 8af87d0b6eb6..e613299e3755 100644
 +};
 +
  static int stmfts_brightness_set(struct led_classdev *led_cdev,
- 					enum led_brightness value)
+ 				 enum led_brightness value)
  {
-@@ -168,6 +212,7 @@ static int stmfts_read_events(struct stmfts_data *sdata)
+@@ -170,6 +213,7 @@
  	return ret == ARRAY_SIZE(msgs) ? 0 : -EIO;
  }
  
@@ -9726,7 +9263,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  static void stmfts_report_contact_event(struct stmfts_data *sdata,
  					const u8 event[])
  {
-@@ -203,6 +248,157 @@ static void stmfts_report_contact_release(struct stmfts_data *sdata,
+@@ -205,6 +249,157 @@
  	input_sync(sdata->input);
  }
  
@@ -9884,23 +9421,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  static void stmfts_report_hover_event(struct stmfts_data *sdata,
  				      const u8 event[])
  {
-@@ -250,7 +446,6 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
- 		u8 *event = &sdata->data[i * STMFTS_EVENT_SIZE];
- 
- 		switch (event[0]) {
--
- 		case STMFTS_EV_CONTROLLER_READY:
- 		case STMFTS_EV_SLEEP_OUT_CONTROLLER_READY:
- 		case STMFTS_EV_STATUS:
-@@ -263,7 +458,6 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
- 		}
- 
- 		switch (event[0] & STMFTS_MASK_EVENT_ID) {
--
- 		case STMFTS_EV_MULTI_TOUCH_ENTER:
- 		case STMFTS_EV_MULTI_TOUCH_MOTION:
- 			stmfts_report_contact_event(sdata, event);
-@@ -297,6 +491,45 @@ static void stmfts_parse_events(struct stmfts_data *sdata)
+@@ -297,6 +492,45 @@
  	}
  }
  
@@ -9946,7 +9467,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  static irqreturn_t stmfts_irq_handler(int irq, void *dev)
  {
  	struct stmfts_data *sdata = dev;
-@@ -309,7 +542,7 @@ static irqreturn_t stmfts_irq_handler(int irq, void *dev)
+@@ -309,7 +543,7 @@
  		dev_err(&sdata->client->dev,
  			"failed to read events: %d\n", err);
  	else
@@ -9955,7 +9476,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  
  	return IRQ_HANDLED;
  }
-@@ -331,6 +564,25 @@ static int stmfts_command(struct stmfts_data *sdata, const u8 cmd)
+@@ -331,6 +565,25 @@
  	return 0;
  }
  
@@ -9981,7 +9502,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  static int stmfts_input_open(struct input_dev *dev)
  {
  	struct stmfts_data *sdata = input_get_drvdata(dev);
-@@ -370,6 +622,28 @@ static int stmfts_input_open(struct input_dev *dev)
+@@ -370,6 +623,28 @@
  	return 0;
  }
  
@@ -10010,7 +9531,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  static void stmfts_input_close(struct input_dev *dev)
  {
  	struct stmfts_data *sdata = input_get_drvdata(dev);
-@@ -403,6 +677,23 @@ static void stmfts_input_close(struct input_dev *dev)
+@@ -403,6 +678,23 @@
  	pm_runtime_put_sync(&sdata->client->dev);
  }
  
@@ -10032,136 +9553,107 @@ index 8af87d0b6eb6..e613299e3755 100644
 +}
 +
  static ssize_t stmfts_sysfs_chip_id(struct device *dev,
- 				struct device_attribute *attr, char *buf)
+ 				    struct device_attribute *attr, char *buf)
  {
-@@ -483,10 +774,8 @@ static ssize_t stmfts_sysfs_hover_enable_write(struct device *dev,
+@@ -487,10 +779,8 @@
  	guard(mutex)(&sdata->mutex);
  
  	if (hover != sdata->hover_enabled) {
 -		if (sdata->running) {
 -			err = i2c_smbus_write_byte(sdata->client,
--					   value ? STMFTS_SS_HOVER_SENSE_ON :
--						   STMFTS_SS_HOVER_SENSE_OFF);
+-						   value ? STMFTS_SS_HOVER_SENSE_ON :
+-							   STMFTS_SS_HOVER_SENSE_OFF);
 +		if (sdata->running && sdata->ops->set_hover) {
 +			err = sdata->ops->set_hover(sdata, hover);
  			if (err)
  				return err;
  		}
-@@ -518,22 +807,11 @@ static struct attribute *stmfts_sysfs_attrs[] = {
- };
- ATTRIBUTE_GROUPS(stmfts_sysfs);
- 
--static int stmfts_power_on(struct stmfts_data *sdata)
-+static int stmfts_read_system_info(struct stmfts_data *sdata)
+@@ -556,6 +846,14 @@
  {
  	int err;
- 	u8 reg[8];
  
--	err = regulator_bulk_enable(ARRAY_SIZE(sdata->regulators),
--				    sdata->regulators);
--	if (err)
--		return err;
--
--	/*
--	 * The datasheet does not specify the power on time, but considering
--	 * that the reset time is < 10ms, I sleep 20ms to be sure
--	 */
--	msleep(20);
--
- 	err = i2c_smbus_read_i2c_block_data(sdata->client, STMFTS_READ_INFO,
- 					    sizeof(reg), reg);
- 	if (err < 0)
-@@ -547,6 +825,26 @@ static int stmfts_power_on(struct stmfts_data *sdata)
- 	sdata->config_id = reg[4];
- 	sdata->config_ver = reg[5];
- 
-+	return 0;
-+}
-+
-+static void stmfts_reset(struct stmfts_data *sdata)
-+{
-+	gpiod_set_value_cansleep(sdata->reset_gpio, 1);
-+	msleep(20);
-+
-+	gpiod_set_value_cansleep(sdata->reset_gpio, 0);
-+	msleep(50);
-+}
-+
-+static int stmfts_configure(struct stmfts_data *sdata)
-+{
-+	int err;
-+
 +	err = stmfts_read_system_info(sdata);
 +	if (err)
 +		return err;
 +
- 	enable_irq(sdata->client->irq);
++	enable_irq(sdata->client->irq);
++
++	msleep(50);
++
+ 	err = stmfts_command(sdata, STMFTS_SYSTEM_RESET);
+ 	if (err)
+ 		return err;
+@@ -580,6 +878,12 @@
+ 	if (err)
+ 		return err;
  
- 	msleep(50);
-@@ -584,13 +882,129 @@ static int stmfts_power_on(struct stmfts_data *sdata)
++	/*
++	 * At this point no one is using the touchscreen
++	 * and I don't really care about the return value
++	 */
++	(void)i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
++
  	return 0;
  }
  
-+static int stmfts_power_on(struct stmfts_data *sdata)
-+{
-+	int err;
-+
-+	err = regulator_bulk_enable(ARRAY_SIZE(stmfts_supplies),
-+				    sdata->supplies);
-+	if (err)
-+		return err;
-+
-+	/*
-+	 * The datasheet does not specify the power on time, but considering
-+	 * that the reset time is < 10ms, I sleep 20ms to be sure
-+	 */
-+	msleep(20);
-+
-+	if (sdata->reset_gpio)
-+		stmfts_reset(sdata);
-+
+@@ -601,31 +905,35 @@
+ 	if (sdata->reset_gpio)
+ 		stmfts_reset(sdata);
+ 
+-	err = stmfts_read_system_info(sdata);
 +	err = sdata->ops->configure(sdata);
-+	if (err)
+ 	if (err)
+-		goto err_disable_regulators;
 +		regulator_bulk_disable(ARRAY_SIZE(stmfts_supplies),
 +				       sdata->supplies);
-+
+ 
+-	enable_irq(sdata->client->irq);
 +	return err;
 +}
-+
+ 
+-	msleep(50);
 +static int stmfts5_configure(struct stmfts_data *sdata)
 +{
 +	u8 event[STMFTS_EVENT_SIZE];
 +	int ret;
-+
+ 
+-	err = stmfts_configure(sdata);
+-	if (err)
+-		goto err_disable_irq;
 +	/* Verify I2C communication */
 +	ret = i2c_smbus_read_i2c_block_data(sdata->client,
 +					    STMFTS_READ_ALL_EVENT,
 +					    sizeof(event), event);
 +	if (ret < 0)
 +		return ret;
-+
+ 
+-	/*
+-	 * At this point no one is using the touchscreen
+-	 * and I don't really care about the return value
+-	 */
+-	(void)i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
 +	enable_irq(sdata->client->irq);
-+
-+	return 0;
+ 
+ 	return 0;
 +}
-+
+ 
+-err_disable_irq:
+-	disable_irq(sdata->client->irq);
+-err_disable_regulators:
+-	regulator_bulk_disable(ARRAY_SIZE(stmfts_supplies), sdata->supplies);
+-	return err;
 +static void stmfts5_chip_power_off(struct stmfts_data *sdata)
 +{
 +	i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_IN);
 +	msleep(20);
-+}
-+
- static void stmfts_power_off(void *data)
- {
- 	struct stmfts_data *sdata = data;
+ }
  
- 	disable_irq(sdata->client->irq);
--	regulator_bulk_disable(ARRAY_SIZE(sdata->regulators),
--						sdata->regulators);
-+
-+	if (sdata->reset_gpio)
-+		gpiod_set_value_cansleep(sdata->reset_gpio, 1);
-+
+ static void stmfts_power_off(void *data)
+@@ -637,7 +945,71 @@
+ 	if (sdata->reset_gpio)
+ 		gpiod_set_value_cansleep(sdata->reset_gpio, 1);
+ 
+-	regulator_bulk_disable(ARRAY_SIZE(stmfts_supplies), sdata->supplies);
 +	if (sdata->ops->power_off)
 +		sdata->ops->power_off(sdata);
 +
@@ -10230,51 +9722,26 @@ index 8af87d0b6eb6..e613299e3755 100644
  }
  
  static int stmfts_enable_led(struct stmfts_data *sdata)
-@@ -619,6 +1033,7 @@ static int stmfts_enable_led(struct stmfts_data *sdata)
- 
- static int stmfts_probe(struct i2c_client *client)
- {
-+	struct device *dev = &client->dev;
- 	int err;
- 	struct stmfts_data *sdata;
- 
-@@ -627,7 +1042,7 @@ static int stmfts_probe(struct i2c_client *client)
- 						I2C_FUNC_SMBUS_I2C_BLOCK))
- 		return -ENODEV;
- 
--	sdata = devm_kzalloc(&client->dev, sizeof(*sdata), GFP_KERNEL);
-+	sdata = devm_kzalloc(dev, sizeof(*sdata), GFP_KERNEL);
- 	if (!sdata)
- 		return -ENOMEM;
- 
-@@ -637,22 +1052,29 @@ static int stmfts_probe(struct i2c_client *client)
+@@ -685,6 +1057,8 @@
  	mutex_init(&sdata->mutex);
  	init_completion(&sdata->cmd_done);
  
--	sdata->regulators[STMFTS_REGULATOR_VDD].supply = "vdd";
--	sdata->regulators[STMFTS_REGULATOR_AVDD].supply = "avdd";
--	err = devm_regulator_bulk_get(&client->dev,
--				      ARRAY_SIZE(sdata->regulators),
--				      sdata->regulators);
 +	sdata->ops = of_device_get_match_data(dev);
 +
-+	err = devm_regulator_bulk_get_const(dev,
-+					    ARRAY_SIZE(stmfts_supplies),
-+					    stmfts_supplies,
-+					    &sdata->supplies);
+ 	err = devm_regulator_bulk_get_const(dev,
+ 					    ARRAY_SIZE(stmfts_supplies),
+ 					    stmfts_supplies,
+@@ -692,7 +1066,8 @@
  	if (err)
  		return err;
  
--	sdata->input = devm_input_allocate_device(&client->dev);
+-	sdata->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
 +	sdata->reset_gpio = devm_gpiod_get_optional(dev, "reset",
 +						    GPIOD_OUT_HIGH);
-+	if (IS_ERR(sdata->reset_gpio))
-+		return dev_err_probe(dev, PTR_ERR(sdata->reset_gpio),
-+				     "Failed to get GPIO 'reset'\n");
-+
-+	sdata->input = devm_input_allocate_device(dev);
- 	if (!sdata->input)
- 		return -ENOMEM;
+ 	if (IS_ERR(sdata->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(sdata->reset_gpio),
+ 				     "Failed to get GPIO 'reset'\n");
+@@ -703,8 +1078,8 @@
  
  	sdata->input->name = STMFTS_DEV_NAME;
  	sdata->input->id.bustype = BUS_I2C;
@@ -10285,7 +9752,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  
  	input_set_capability(sdata->input, EV_ABS, ABS_MT_POSITION_X);
  	input_set_capability(sdata->input, EV_ABS, ABS_MT_POSITION_Y);
-@@ -660,19 +1082,9 @@ static int stmfts_probe(struct i2c_client *client)
+@@ -712,18 +1087,9 @@
  
  	input_set_abs_params(sdata->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
  	input_set_abs_params(sdata->input, ABS_MT_TOUCH_MINOR, 0, 255, 0, 0);
@@ -10293,8 +9760,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  	input_set_abs_params(sdata->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
 -	input_set_abs_params(sdata->input, ABS_DISTANCE, 0, 255, 0, 0);
  
--	sdata->use_key = device_property_read_bool(&client->dev,
--						   "touch-key-connected");
+-	sdata->use_key = device_property_read_bool(dev, "touch-key-connected");
 -	if (sdata->use_key) {
 -		input_set_capability(sdata->input, EV_KEY, KEY_MENU);
 -		input_set_capability(sdata->input, EV_KEY, KEY_BACK);
@@ -10306,48 +9772,7 @@ index 8af87d0b6eb6..e613299e3755 100644
  	if (err)
  		return err;
  
-@@ -685,20 +1097,20 @@ static int stmfts_probe(struct i2c_client *client)
- 	 * interrupts. To be on the safe side it's better to not enable
- 	 * the interrupts during their request.
- 	 */
--	err = devm_request_threaded_irq(&client->dev, client->irq,
-+	err = devm_request_threaded_irq(dev, client->irq,
- 					NULL, stmfts_irq_handler,
- 					IRQF_ONESHOT | IRQF_NO_AUTOEN,
- 					"stmfts_irq", sdata);
- 	if (err)
- 		return err;
- 
--	dev_dbg(&client->dev, "initializing ST-Microelectronics FTS...\n");
-+	dev_dbg(dev, "initializing ST-Microelectronics FTS...\n");
- 
- 	err = stmfts_power_on(sdata);
- 	if (err)
- 		return err;
- 
--	err = devm_add_action_or_reset(&client->dev, stmfts_power_off, sdata);
-+	err = devm_add_action_or_reset(dev, stmfts_power_off, sdata);
- 	if (err)
- 		return err;
- 
-@@ -715,13 +1127,13 @@ static int stmfts_probe(struct i2c_client *client)
- 			 * without LEDs. The ledvdd regulator pointer will be
- 			 * used as a flag.
- 			 */
--			dev_warn(&client->dev, "unable to use touchkey leds\n");
-+			dev_warn(dev, "unable to use touchkey leds\n");
- 			sdata->ledvdd = NULL;
- 		}
- 	}
- 
--	pm_runtime_enable(&client->dev);
--	device_enable_async_suspend(&client->dev);
-+	pm_runtime_enable(dev);
-+	device_enable_async_suspend(dev);
- 
- 	return 0;
- }
-@@ -743,12 +1155,62 @@ static int stmfts_runtime_suspend(struct device *dev)
+@@ -794,13 +1160,63 @@
  	return ret;
  }
  
@@ -10404,14 +9829,15 @@ index 8af87d0b6eb6..e613299e3755 100644
  static int stmfts_runtime_resume(struct device *dev)
  {
  	struct stmfts_data *sdata = dev_get_drvdata(dev);
+ 	struct i2c_client *client = sdata->client;
  	int ret;
  
--	ret = i2c_smbus_write_byte(sdata->client, STMFTS_SLEEP_OUT);
+-	ret = i2c_smbus_write_byte(client, STMFTS_SLEEP_OUT);
 +	ret = sdata->ops->runtime_resume(sdata);
  	if (ret)
  		dev_err(dev, "failed to resume device: %d\n", ret);
  
-@@ -777,8 +1239,29 @@ static const struct dev_pm_ops stmfts_pm_ops = {
+@@ -829,8 +1245,29 @@
  };
  
  #ifdef CONFIG_OF
@@ -10442,15 +9868,14 @@ index 8af87d0b6eb6..e613299e3755 100644
  	{ },
  };
  MODULE_DEVICE_TABLE(of, stmfts_of_match);
-@@ -806,5 +1289,7 @@ static struct i2c_driver stmfts_driver = {
+@@ -858,5 +1295,7 @@
  module_i2c_driver(stmfts_driver);
  
  MODULE_AUTHOR("Andi Shyti <andi.shyti@samsung.com>");
 +MODULE_AUTHOR("David Heidelberg <david@ixit.cz>");
 +MODULE_AUTHOR("Petr Hodina <petr.hodina@protonmail.com>");
  MODULE_DESCRIPTION("STMicroelectronics FTS Touch Screen");
--MODULE_LICENSE("GPL v2");
-+MODULE_LICENSE("GPL");
+ MODULE_LICENSE("GPL");
 diff --git a/drivers/input/touchscreen/sw49410-ts-spi.c b/drivers/input/touchscreen/sw49410-ts-spi.c
 new file mode 100644
 index 000000000000..5bf6293cda00
@@ -10962,7 +10387,7 @@ index 000000000000..5bf6293cda00
 +MODULE_DESCRIPTION("LGE / SiliconWorks SW49410 touchscreen driver for SPI");
 +MODULE_LICENSE("Dual MIT/GPL");
 diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
-index 8f2ba4121586..06c46123b133 100644
+index 5d173e0ecf42..904763f8c7b6 100644
 --- a/drivers/media/i2c/Kconfig
 +++ b/drivers/media/i2c/Kconfig
 @@ -266,6 +266,36 @@ config VIDEO_IMX355
@@ -11001,7 +10426,7 @@ index 8f2ba4121586..06c46123b133 100644
 +
  config VIDEO_IMX412
  	tristate "Sony IMX412 sensor support"
- 	depends on OF_GPIO
+ 	depends on OF
 @@ -287,6 +317,20 @@ config VIDEO_IMX415
  	  To compile this driver as a module, choose M here: the
  	  module will be called imx415.
@@ -11058,7 +10483,7 @@ index 8f2ba4121586..06c46123b133 100644
  
  menu "Flash devices"
 diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
-index 90b276a7417a..fa6a606dbecf 100644
+index e45359efe0e4..317a4ecf61a7 100644
 --- a/drivers/media/i2c/Makefile
 +++ b/drivers/media/i2c/Makefile
 @@ -23,6 +23,7 @@ obj-$(CONFIG_VIDEO_AR0521) += ar0521.o
@@ -18252,10 +17677,10 @@ index eadcb2f7e3aa..52ef730b1055 100644
  
  	val = 1 << CSI2_RX_CFG1_PACKET_ECC_CORRECTION_EN;
 diff --git a/drivers/media/platform/qcom/camss/camss-csid.c b/drivers/media/platform/qcom/camss/camss-csid.c
-index ed1820488c98..24f244d2959c 100644
+index 48459b46a981..087276a63353 100644
 --- a/drivers/media/platform/qcom/camss/camss-csid.c
 +++ b/drivers/media/platform/qcom/camss/camss-csid.c
-@@ -545,7 +545,7 @@ static int csid_set_clock_rates(struct csid_device *csid)
+@@ -547,7 +547,7 @@ static int csid_set_clock_rates(struct csid_device *csid)
  	fmt = csid_get_fmt_entry(csid->res->formats->formats, csid->res->formats->nformats,
  				 csid->fmt[MSM_CSIPHY_PAD_SINK].code);
  	link_freq = camss_get_link_freq(&csid->subdev.entity, fmt->bpp,
@@ -18264,16 +17689,16 @@ index ed1820488c98..24f244d2959c 100644
  	if (link_freq < 0)
  		link_freq = 0;
  
-@@ -1275,6 +1275,7 @@ static int csid_link_setup(struct media_entity *entity,
- 		csid->phy.csiphy_id = csiphy->id;
+@@ -1290,6 +1290,7 @@ static int csid_link_setup(struct media_entity *entity,
+ 			csid->phy.csiphy_id = csiphy->id;
  
- 		lane_cfg = &csiphy->cfg.csi2->lane_cfg;
-+		csid->phy.cphy = (lane_cfg->phy_cfg == V4L2_MBUS_CSI2_CPHY);
- 		csid->phy.lane_cnt = lane_cfg->num_data;
- 		csid->phy.lane_assign = csid_get_lane_assign(lane_cfg);
- 	}
+ 			lane_cfg = &csiphy->cfg.csi2->lane_cfg;
++			csid->phy.cphy = (lane_cfg->phy_cfg == V4L2_MBUS_CSI2_CPHY);
+ 			csid->phy.lane_cnt = lane_cfg->num_data;
+ 			csid->phy.lane_assign = csid_get_lane_assign(lane_cfg, lane_cfg->num_data);
+ 			csid->tpg_linked = false;
 diff --git a/drivers/media/platform/qcom/camss/camss-csid.h b/drivers/media/platform/qcom/camss/camss-csid.h
-index aedc96ed84b2..a82db31bd233 100644
+index 5296b10f6bac..00e2669db64c 100644
 --- a/drivers/media/platform/qcom/camss/camss-csid.h
 +++ b/drivers/media/platform/qcom/camss/camss-csid.h
 @@ -70,6 +70,7 @@ struct csid_phy_config {
@@ -18311,7 +17736,7 @@ index 9d67e7fa6366..bb4b91f69616 100644
  
  static void csiphy_lanes_disable(struct csiphy_device *csiphy,
 diff --git a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
-index 415483274552..89bfe3710fc3 100644
+index dac8d2ecf799..80137f4e3d62 100644
 --- a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
 +++ b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
 @@ -14,6 +14,7 @@
@@ -18400,7 +17825,7 @@ index 415483274552..89bfe3710fc3 100644
  /* GEN2 1.1 2PH */
  static const struct
  csiphy_lane_regs lane_regs_sc8280xp[] = {
-@@ -483,6 +548,111 @@ csiphy_lane_regs lane_regs_qcm2290[] = {
+@@ -603,6 +668,111 @@ csiphy_lane_regs lane_regs_qcm2290[] = {
  	{0x0664, 0x3f, 0x00, CSIPHY_DEFAULT_PARAMS},
  };
  
@@ -18512,7 +17937,7 @@ index 415483274552..89bfe3710fc3 100644
  /* GEN2 2.1.2 2PH DPHY mode */
  static const struct
  csiphy_lane_regs lane_regs_sm8550[] = {
-@@ -993,13 +1163,22 @@ static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
+@@ -1113,13 +1283,22 @@ static void csiphy_gen2_config_lanes(struct csiphy_device *csiphy,
  
  static u8 csiphy_get_lane_mask(struct csiphy_lanes_cfg *lane_cfg)
  {
@@ -18540,7 +17965,7 @@ index 415483274552..89bfe3710fc3 100644
  
  	return lane_mask;
  }
-@@ -1027,21 +1206,115 @@ static bool csiphy_is_gen2(u32 version)
+@@ -1148,21 +1327,122 @@ static bool csiphy_is_gen2(u32 version)
  	return ret;
  }
  
@@ -18561,6 +17986,7 @@ index 415483274552..89bfe3710fc3 100644
 +	if (c->phy_cfg == V4L2_MBUS_CSI2_CPHY) {
 +		switch (csiphy->camss->res->version) {
 +		case CAMSS_2290:
++		case CAMSS_6350:
 +		case CAMSS_8280XP:
 +		case CAMSS_X1E80100:
 +		case CAMSS_8550:
@@ -18590,6 +18016,12 @@ index 415483274552..89bfe3710fc3 100644
 +		{ /* V4L2_MBUS_CSI2_DPHY */
 +			regs->lane_regs = &lane_regs_qcm2290[0];
 +			regs->lane_array_size = ARRAY_SIZE(lane_regs_qcm2290);
++		}
++		break;
++	case CAMSS_6350:
++		{ /* V4L2_MBUS_CSI2_DPHY */
++			regs->lane_regs = &lane_regs_sm6350[0];
++			regs->lane_array_size = ARRAY_SIZE(lane_regs_sm6350);
 +		}
 +		break;
 +	case CAMSS_7280:
@@ -18662,7 +18094,7 @@ index 415483274552..89bfe3710fc3 100644
  
  	writel_relaxed(val, csiphy->base +
  		       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 5));
-@@ -1068,6 +1341,8 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
+@@ -1189,6 +1469,8 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
  		writel_relaxed(0, csiphy->base +
  			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, i));
  	}
@@ -18671,7 +18103,7 @@ index 415483274552..89bfe3710fc3 100644
  }
  
  static void csiphy_lanes_disable(struct csiphy_device *csiphy,
-@@ -1092,49 +1367,16 @@ static int csiphy_init(struct csiphy_device *csiphy)
+@@ -1213,53 +1495,16 @@ static int csiphy_init(struct csiphy_device *csiphy)
  		return -ENOMEM;
  
  	csiphy->regs = regs;
@@ -18687,6 +18119,10 @@ index 415483274552..89bfe3710fc3 100644
 -	case CAMSS_6150:
 -		regs->lane_regs = &lane_regs_qcm2290[0];
 -		regs->lane_array_size = ARRAY_SIZE(lane_regs_qcm2290);
+-		break;
+-	case CAMSS_6350:
+-		regs->lane_regs = &lane_regs_sm6350[0];
+-		regs->lane_array_size = ARRAY_SIZE(lane_regs_sm6350);
 -		break;
 -	case CAMSS_7280:
 -	case CAMSS_8250:
@@ -18723,7 +18159,7 @@ index 415483274552..89bfe3710fc3 100644
  	}
  
 diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.c b/drivers/media/platform/qcom/camss/camss-csiphy.c
-index 78a1b568dbae..fbd793c186c7 100644
+index 539ac4888b60..1d70f5c202ad 100644
 --- a/drivers/media/platform/qcom/camss/camss-csiphy.c
 +++ b/drivers/media/platform/qcom/camss/camss-csiphy.c
 @@ -144,8 +144,9 @@ static int csiphy_set_clock_rates(struct csiphy_device *csiphy)
@@ -18761,10 +18197,10 @@ index 78a1b568dbae..fbd793c186c7 100644
  
  /*
 diff --git a/drivers/media/platform/qcom/camss/camss-csiphy.h b/drivers/media/platform/qcom/camss/camss-csiphy.h
-index 2d5054819df7..21cf2ce931c1 100644
+index 9d9657b82f74..42f013463531 100644
 --- a/drivers/media/platform/qcom/camss/camss-csiphy.h
 +++ b/drivers/media/platform/qcom/camss/camss-csiphy.h
-@@ -28,11 +28,13 @@ struct csiphy_lane {
+@@ -30,11 +30,13 @@ struct csiphy_lane {
  
  /**
   * struct csiphy_lanes_cfg - CSIPHY lanes configuration
@@ -18778,7 +18214,7 @@ index 2d5054819df7..21cf2ce931c1 100644
  	int num_data;
  	struct csiphy_lane *data;
  	struct csiphy_lane clk;
-@@ -71,9 +73,9 @@ struct csiphy_hw_ops {
+@@ -73,9 +75,9 @@ struct csiphy_hw_ops {
  	void (*hw_version_read)(struct csiphy_device *csiphy,
  				struct device *dev);
  	void (*reset)(struct csiphy_device *csiphy);
@@ -18792,7 +18228,7 @@ index 2d5054819df7..21cf2ce931c1 100644
  			      struct csiphy_config *cfg);
  	irqreturn_t (*isr)(int irq, void *dev);
 diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
-index 9335636d7c4d..58316e8a4bbc 100644
+index 2123f6388e3d..d6476aec402c 100644
 --- a/drivers/media/platform/qcom/camss/camss.c
 +++ b/drivers/media/platform/qcom/camss/camss.c
 @@ -32,6 +32,14 @@
@@ -18810,7 +18246,7 @@ index 9335636d7c4d..58316e8a4bbc 100644
  static const struct parent_dev_ops vfe_parent_dev_ops;
  
  static const struct camss_subdev_resources csiphy_res_8x16[] = {
-@@ -4280,20 +4288,22 @@ struct media_pad *camss_find_sensor_pad(struct media_entity *entity)
+@@ -4623,20 +4631,22 @@ struct media_pad *camss_find_sensor_pad(struct media_entity *entity)
   * camss_get_link_freq - Get link frequency from sensor
   * @entity: Media entity in the current pipeline
   * @bpp: Number of bits per pixel for the current format
@@ -18836,7 +18272,7 @@ index 9335636d7c4d..58316e8a4bbc 100644
  }
  
  /*
-@@ -4411,11 +4421,11 @@ static int camss_parse_endpoint_node(struct device *dev,
+@@ -4754,11 +4764,11 @@ static int camss_parse_endpoint_node(struct device *dev,
  	if (ret)
  		return ret;
  
@@ -18853,7 +18289,7 @@ index 9335636d7c4d..58316e8a4bbc 100644
  		dev_err(dev, "Unsupported bus type %d\n", vep.bus_type);
  		return -EINVAL;
  	}
-@@ -4423,9 +4433,13 @@ static int camss_parse_endpoint_node(struct device *dev,
+@@ -4766,9 +4776,13 @@ static int camss_parse_endpoint_node(struct device *dev,
  	csd->interface.csiphy_id = vep.base.port;
  
  	mipi_csi2 = &vep.bus.mipi_csi2;
@@ -18870,10 +18306,10 @@ index 9335636d7c4d..58316e8a4bbc 100644
  	lncfg->data = devm_kcalloc(dev,
  				   lncfg->num_data, sizeof(*lncfg->data),
 diff --git a/drivers/media/platform/qcom/camss/camss.h b/drivers/media/platform/qcom/camss/camss.h
-index 6d048414c919..6bf7738837b8 100644
+index 93d691c8ac63..15b6cdc5db8a 100644
 --- a/drivers/media/platform/qcom/camss/camss.h
 +++ b/drivers/media/platform/qcom/camss/camss.h
-@@ -163,7 +163,7 @@ int camss_enable_clocks(int nclocks, struct camss_clock *clock,
+@@ -169,7 +169,7 @@ int camss_enable_clocks(int nclocks, struct camss_clock *clock,
  void camss_disable_clocks(int nclocks, struct camss_clock *clock);
  struct media_pad *camss_find_sensor_pad(struct media_entity *entity);
  s64 camss_get_link_freq(struct media_entity *entity, unsigned int bpp,
@@ -18883,7 +18319,7 @@ index 6d048414c919..6bf7738837b8 100644
  int camss_pm_domain_on(struct camss *camss, int id);
  void camss_pm_domain_off(struct camss *camss, int id);
 diff --git a/drivers/net/wireless/ath/ath10k/htt.h b/drivers/net/wireless/ath/ath10k/htt.h
-index 603f6de62b0a..ec897175c933 100644
+index 25c6b2e2f81c..07c3dc088f07 100644
 --- a/drivers/net/wireless/ath/ath10k/htt.h
 +++ b/drivers/net/wireless/ath/ath10k/htt.h
 @@ -1929,6 +1929,10 @@ struct ath10k_htt {
@@ -18898,10 +18334,10 @@ index 603f6de62b0a..ec897175c933 100644
  
  struct ath10k_htt_tx_ops {
 diff --git a/drivers/net/wireless/ath/ath10k/htt_rx.c b/drivers/net/wireless/ath/ath10k/htt_rx.c
-index 8f88ea116a32..41452c83c523 100644
+index b3f1b7186721..f4552afc93e2 100644
 --- a/drivers/net/wireless/ath/ath10k/htt_rx.c
 +++ b/drivers/net/wireless/ath/ath10k/htt_rx.c
-@@ -297,6 +297,8 @@ void ath10k_htt_rx_free(struct ath10k_htt *htt)
+@@ -296,6 +296,8 @@ void ath10k_htt_rx_free(struct ath10k_htt *htt)
  	skb_queue_purge(&htt->rx_in_ord_compl_q);
  	skb_queue_purge(&htt->tx_fetch_ind_q);
  
@@ -18910,7 +18346,7 @@ index 8f88ea116a32..41452c83c523 100644
  	spin_lock_bh(&htt->rx_ring.lock);
  	ath10k_htt_rx_ring_free(htt);
  	spin_unlock_bh(&htt->rx_ring.lock);
-@@ -847,6 +849,8 @@ int ath10k_htt_rx_alloc(struct ath10k_htt *htt)
+@@ -846,6 +848,8 @@ int ath10k_htt_rx_alloc(struct ath10k_htt *htt)
  	skb_queue_head_init(&htt->tx_fetch_ind_q);
  	atomic_set(&htt->num_mpdus_ready, 0);
  
@@ -18919,7 +18355,7 @@ index 8f88ea116a32..41452c83c523 100644
  	ath10k_dbg(ar, ATH10K_DBG_BOOT, "htt rx ring size %d fill_level %d\n",
  		   htt->rx_ring.size, htt->rx_ring.fill_level);
  	return 0;
-@@ -3164,6 +3168,10 @@ static int ath10k_htt_rx_extract_amsdu(struct ath10k_hw_params *hw,
+@@ -3163,6 +3167,10 @@ static int ath10k_htt_rx_extract_amsdu(struct ath10k_hw_params *hw,
  	if (WARN_ON(!skb_queue_empty(amsdu)))
  		return -EINVAL;
  
@@ -18930,7 +18366,7 @@ index 8f88ea116a32..41452c83c523 100644
  	while ((msdu = __skb_dequeue(list))) {
  		__skb_queue_tail(amsdu, msdu);
  
-@@ -3265,7 +3273,6 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
+@@ -3264,7 +3272,6 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
  	struct ath10k_htt *htt = &ar->htt;
  	struct htt_resp *resp = (void *)skb->data;
  	struct ieee80211_rx_status *status = &htt->rx_status;
@@ -18938,7 +18374,7 @@ index 8f88ea116a32..41452c83c523 100644
  	struct sk_buff_head amsdu;
  	u16 peer_id;
  	u16 msdu_count;
-@@ -3300,16 +3307,32 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
+@@ -3299,16 +3306,32 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
  		return -EINVAL;
  	}
  
@@ -18974,7 +18410,7 @@ index 8f88ea116a32..41452c83c523 100644
  
  	if (ret < 0) {
  		ath10k_warn(ar, "failed to pop paddr list: %d\n", ret);
-@@ -3321,11 +3344,12 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
+@@ -3320,11 +3343,12 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
  	 * separately.
  	 */
  	if (offload)
@@ -18990,7 +18426,7 @@ index 8f88ea116a32..41452c83c523 100644
  		switch (ret) {
  		case 0:
  			/* Note: The in-order indication may report interleaved
-@@ -3341,12 +3365,15 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
+@@ -3340,12 +3364,15 @@ static int ath10k_htt_rx_in_ord_ind(struct ath10k *ar, struct sk_buff *skb)
  			ath10k_htt_rx_h_enqueue(ar, &amsdu, status);
  			break;
  		case -EAGAIN:
@@ -19009,7 +18445,7 @@ index 8f88ea116a32..41452c83c523 100644
  		}
  	}
 diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
-index 83392ed6a8da..6c5a1e524c02 100644
+index f0ede1cecb6a..c51fb21a9482 100644
 --- a/drivers/power/supply/Kconfig
 +++ b/drivers/power/supply/Kconfig
 @@ -768,6 +768,14 @@ config CHARGER_PM8916_LBC
@@ -19028,7 +18464,7 @@ index 83392ed6a8da..6c5a1e524c02 100644
  	tristate "TI BQ2415x battery charger driver"
  	depends on I2C
 diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
-index 7ee839dca7f3..bf949fb29ee1 100644
+index 31fe4a145929..cfd7cb72de9d 100644
 --- a/drivers/power/supply/Makefile
 +++ b/drivers/power/supply/Makefile
 @@ -97,6 +97,7 @@ obj-$(CONFIG_CHARGER_MT6370)	+= mt6370-charger.o
@@ -20901,10 +20337,10 @@ index b67636b28c35..acec25f8d113 100644
  KBUILD_CPPFLAGS	+= $(CLANG_FLAGS)
  export CLANG_FLAGS
 diff --git a/sound/soc/codecs/Kconfig b/sound/soc/codecs/Kconfig
-index 269c31ce0814..56113d275399 100644
+index e4d139108d72..e9cff1fa4d58 100644
 --- a/sound/soc/codecs/Kconfig
 +++ b/sound/soc/codecs/Kconfig
-@@ -157,6 +157,7 @@ config SND_SOC_ALL_CODECS
+@@ -159,6 +159,7 @@ config SND_SOC_ALL_CODECS
  	imply SND_SOC_MAX98388
  	imply SND_SOC_MAX98390
  	imply SND_SOC_MAX98396
@@ -20912,15 +20348,15 @@ index 269c31ce0814..56113d275399 100644
  	imply SND_SOC_MAX9850
  	imply SND_SOC_MAX9860
  	imply SND_SOC_MAX9759
-@@ -276,6 +277,7 @@ config SND_SOC_ALL_CODECS
- 	imply SND_SOC_TAS5720
+@@ -280,6 +281,7 @@ config SND_SOC_ALL_CODECS
  	imply SND_SOC_TAS6424
+ 	imply SND_SOC_TAS675X
  	imply SND_SOC_TDA7419
 +	imply SND_SOC_TFA98xx
  	imply SND_SOC_TFA9879
  	imply SND_SOC_TFA989X
  	imply SND_SOC_TLV320ADC3XXX
-@@ -364,6 +366,8 @@ config SND_SOC_ALL_CODECS
+@@ -368,6 +370,8 @@ config SND_SOC_ALL_CODECS
  	imply SND_SOC_WSA883X
  	imply SND_SOC_WSA884X
  	imply SND_SOC_ZL38060
@@ -20929,7 +20365,7 @@ index 269c31ce0814..56113d275399 100644
  	help
  	  Normally ASoC codec drivers are only built if a machine driver which
  	  uses them is also built since they are only usable with a machine
-@@ -1499,6 +1503,15 @@ config SND_SOC_MAX98396
+@@ -1516,6 +1520,15 @@ config SND_SOC_MAX98396
  	  audio data and a standard I2C interface for control
  	  data communication.
  
@@ -20945,7 +20381,7 @@ index 269c31ce0814..56113d275399 100644
  config SND_SOC_MAX9850
  	tristate
  	depends on I2C
-@@ -2239,6 +2252,14 @@ config SND_SOC_TDA7419
+@@ -2278,6 +2291,14 @@ config SND_SOC_TDA7419
  	depends on I2C
  	select REGMAP_I2C
  
@@ -20960,7 +20396,7 @@ index 269c31ce0814..56113d275399 100644
  config SND_SOC_TFA9879
  	tristate "NXP Semiconductors TFA9879 amplifier"
  	depends on I2C
-@@ -2869,6 +2890,14 @@ config SND_SOC_LPASS_VA_MACRO
+@@ -2908,6 +2929,14 @@ config SND_SOC_LPASS_VA_MACRO
  	select SND_SOC_LPASS_MACRO_COMMON
  	tristate "Qualcomm VA Macro in LPASS(Low Power Audio SubSystem)"
  
@@ -20976,10 +20412,10 @@ index 269c31ce0814..56113d275399 100644
  	depends on COMMON_CLK
  	select REGMAP_MMIO
 diff --git a/sound/soc/codecs/Makefile b/sound/soc/codecs/Makefile
-index 172861d17cfd..f1ba1ec784d9 100644
+index aa0396e5b575..615182c2e78c 100644
 --- a/sound/soc/codecs/Makefile
 +++ b/sound/soc/codecs/Makefile
-@@ -327,6 +327,10 @@ snd-soc-tas2781-i2c-y := tas2781-i2c.o
+@@ -331,6 +331,10 @@ snd-soc-tas2781-i2c-y := tas2781-i2c.o
  snd-soc-tas2783-sdw-y := tas2783-sdw.o
  snd-soc-tfa9879-y := tfa9879.o
  snd-soc-tfa989x-y := tfa989x.o
@@ -20990,7 +20426,7 @@ index 172861d17cfd..f1ba1ec784d9 100644
  snd-soc-tlv320adc3xxx-y := tlv320adc3xxx.o
  snd-soc-tlv320aic23-y := tlv320aic23.o
  snd-soc-tlv320aic23-i2c-y := tlv320aic23-i2c.o
-@@ -426,6 +430,8 @@ snd-soc-zl38060-y := zl38060.o
+@@ -430,6 +434,8 @@ snd-soc-zl38060-y := zl38060.o
  # Amp
  snd-soc-max9877-y := max9877.o
  snd-soc-max98504-y := max98504.o
@@ -20999,7 +20435,7 @@ index 172861d17cfd..f1ba1ec784d9 100644
  snd-soc-simple-amplifier-y := simple-amplifier.o
  snd-soc-tpa6130a2-y := tpa6130a2.o
  snd-soc-tas2552-y := tas2552.o
-@@ -435,6 +441,14 @@ snd-soc-tas2780-y := tas2780.o
+@@ -439,6 +445,14 @@ snd-soc-tas2780-y := tas2780.o
  # Mux
  snd-soc-simple-mux-y := simple-mux.o
  
@@ -21014,7 +20450,7 @@ index 172861d17cfd..f1ba1ec784d9 100644
  obj-$(CONFIG_SND_SOC_88PM860X)	+= snd-soc-88pm860x.o
  obj-$(CONFIG_SND_SOC_AB8500_CODEC)	+= snd-soc-ab8500-codec.o
  obj-$(CONFIG_SND_SOC_AC97_CODEC)	+= snd-soc-ac97.o
-@@ -613,6 +627,7 @@ obj-$(CONFIG_SND_SOC_MAX98373_SDW)   += snd-soc-max98373-sdw.o
+@@ -619,6 +633,7 @@ obj-$(CONFIG_SND_SOC_MAX98373_SDW)   += snd-soc-max98373-sdw.o
  obj-$(CONFIG_SND_SOC_MAX98388)	+= snd-soc-max98388.o
  obj-$(CONFIG_SND_SOC_MAX98390)	+= snd-soc-max98390.o
  obj-$(CONFIG_SND_SOC_MAX98396)	+= snd-soc-max98396.o
@@ -21022,8 +20458,8 @@ index 172861d17cfd..f1ba1ec784d9 100644
  obj-$(CONFIG_SND_SOC_MAX9850)	+= snd-soc-max9850.o
  obj-$(CONFIG_SND_SOC_MAX9860)	+= snd-soc-max9860.o
  obj-$(CONFIG_SND_SOC_MC13783)	+= snd-soc-mc13783.o
-@@ -762,6 +777,7 @@ obj-$(CONFIG_SND_SOC_TAS5805M)	+= snd-soc-tas5805m.o
- obj-$(CONFIG_SND_SOC_TAS6424)	+= snd-soc-tas6424.o
+@@ -770,6 +785,7 @@ obj-$(CONFIG_SND_SOC_TAS6424)	+= snd-soc-tas6424.o
+ obj-$(CONFIG_SND_SOC_TAS675X)	+= snd-soc-tas675x.o
  obj-$(CONFIG_SND_SOC_TDA7419)	+= snd-soc-tda7419.o
  obj-$(CONFIG_SND_SOC_TAS2770) += snd-soc-tas2770.o
 +obj-$(CONFIG_SND_SOC_TFA98XX) += snd-soc-tfa98xx.o
@@ -21031,7 +20467,7 @@ index 172861d17cfd..f1ba1ec784d9 100644
  obj-$(CONFIG_SND_SOC_TFA989X)	+= snd-soc-tfa989x.o
  obj-$(CONFIG_SND_SOC_TLV320ADC3XXX)	+= snd-soc-tlv320adc3xxx.o
 diff --git a/sound/soc/codecs/cs35l36.c b/sound/soc/codecs/cs35l36.c
-index 93818d7ec1a7..f0c2750cb7c8 100644
+index 89645327945f..0ec1ba9b24ef 100644
 --- a/sound/soc/codecs/cs35l36.c
 +++ b/sound/soc/codecs/cs35l36.c
 @@ -793,6 +793,7 @@ static int cs35l36_set_dai_fmt(struct snd_soc_dai *component_dai,
@@ -67394,149 +66830,14 @@ index 0b8c3ec1315c..b7bfdcaee894 100644
  	u16	slot_mask;
  	u32	data_align_type;
 diff --git a/sound/soc/qcom/qdsp6/q6asm-dai.c b/sound/soc/qcom/qdsp6/q6asm-dai.c
-index 4f09fdd40905..28e4a842fe90 100644
+index 4f09fdd40905..51d059b93d7e 100644
 --- a/sound/soc/qcom/qdsp6/q6asm-dai.c
 +++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
-@@ -186,10 +186,12 @@ static void event_handler(uint32_t opcode, uint32_t token,
- 	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
- 		break;
- 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
-+		prtd->state = Q6ASM_STREAM_STOPPED;
- 		break;
--	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
-+	case ASM_CLIENT_EVENT_DATA_WRITE_DONE: {
- 		snd_pcm_period_elapsed(substream);
- 		break;
-+		}
- 	case ASM_CLIENT_EVENT_DATA_READ_DONE:
- 		snd_pcm_period_elapsed(substream);
- 		if (prtd->state == Q6ASM_STREAM_RUNNING)
-@@ -225,19 +227,9 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
- 	/* rate and channels are sent to audio driver */
- 	if (prtd->state == Q6ASM_STREAM_RUNNING) {
- 		/* clear the previous setup if any  */
--		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
--		if (ret < 0) {
--			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
--			return ret;
--		}
--
--		ret = q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
--		if (ret < 0) {
--			dev_err(dev, "Failed to unmap memory regions for q6asm stream %d\n",
--				prtd->stream_id);
--			return ret;
--		}
--
-+		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-+		q6asm_unmap_memory_regions(substream->stream,
-+					   prtd->audio_client);
- 		q6routing_stream_close(soc_prtd->dai_link->id,
- 					 substream->stream);
- 		prtd->state = Q6ASM_STREAM_STOPPED;
-@@ -305,6 +297,8 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
- 	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
- open_err:
- 	q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
-+	q6asm_audio_client_free(prtd->audio_client);
-+	prtd->audio_client = NULL;
- 
- 	return ret;
- }
-@@ -347,6 +341,7 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
+@@ -347,6 +347,7 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
  				       0, 0, 0);
  		break;
  	case SNDRV_PCM_TRIGGER_STOP:
 +		// prtd->state = Q6ASM_STREAM_STOPPED;
- 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
- 				       CMD_EOS);
- 		break;
-@@ -383,7 +378,7 @@ static int q6asm_dai_open(struct snd_soc_component *component,
- 		return -EINVAL;
- 	}
- 
--	prtd = kzalloc_obj(*prtd);
-+	prtd = kzalloc_obj(struct q6asm_dai_rtd);
- 	if (prtd == NULL)
- 		return -ENOMEM;
- 
-@@ -462,12 +457,12 @@ static int q6asm_dai_close(struct snd_soc_component *component,
- 	struct q6asm_dai_rtd *prtd = runtime->private_data;
- 
- 	if (prtd->audio_client) {
--		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-+		if (prtd->state)
- 			q6asm_cmd(prtd->audio_client, prtd->stream_id,
- 				  CMD_CLOSE);
--			q6asm_unmap_memory_regions(substream->stream,
-+
-+		q6asm_unmap_memory_regions(substream->stream,
- 					   prtd->audio_client);
--		}
- 		q6asm_audio_client_free(prtd->audio_client);
- 		prtd->audio_client = NULL;
- 	}
-@@ -560,6 +555,8 @@ static void compress_event_handler(uint32_t opcode, uint32_t token,
- 			snd_compr_drain_notify(prtd->cstream);
- 			prtd->notify_on_drain = false;
- 
-+		} else {
-+			prtd->state = Q6ASM_STREAM_STOPPED;
- 		}
- 		break;
- 
-@@ -677,7 +674,7 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
- 	struct snd_soc_pcm_runtime *rtd = stream->private_data;
- 
- 	if (prtd->audio_client) {
--		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-+		if (prtd->state) {
- 			q6asm_cmd(prtd->audio_client, prtd->stream_id,
- 				  CMD_CLOSE);
- 			if (prtd->next_track_stream_id) {
-@@ -685,11 +682,11 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
- 					  prtd->next_track_stream_id,
- 					  CMD_CLOSE);
- 			}
--
--			q6asm_unmap_memory_regions(stream->direction,
--					   prtd->audio_client);
- 		}
-+
- 		snd_dma_free_pages(&prtd->dma_buffer);
-+		q6asm_unmap_memory_regions(stream->direction,
-+					   prtd->audio_client);
- 		q6asm_audio_client_free(prtd->audio_client);
- 		prtd->audio_client = NULL;
- 	}
-@@ -919,7 +916,7 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
- 			      prtd->session_id, dir);
- 	if (ret) {
- 		dev_err(dev, "Stream reg failed ret:%d\n", ret);
--		goto routing_err;
-+		goto q6_err;
- 	}
- 
- 	ret = __q6asm_dai_compr_set_codec_params(component, stream,
-@@ -945,11 +942,11 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
- 	return 0;
- 
- q6_err:
--	q6routing_stream_close(rtd->dai_link->id, dir);
--routing_err:
- 	q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
- 
- open_err:
-+	q6asm_audio_client_free(prtd->audio_client);
-+	prtd->audio_client = NULL;
- 	return ret;
- }
- 
-@@ -1017,6 +1014,7 @@ static int q6asm_dai_compr_trigger(struct snd_soc_component *component,
- 				       0, 0, 0);
- 		break;
- 	case SNDRV_PCM_TRIGGER_STOP:
-+		prtd->state = Q6ASM_STREAM_STOPPED;
  		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
  				       CMD_EOS);
  		break;

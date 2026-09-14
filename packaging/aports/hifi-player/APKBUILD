@@ -1,7 +1,7 @@
 # Maintainer: Anton <fourth@devpins.org>
 pkgname=hifi-player
 pkgver=0.1.0
-pkgrel=17
+pkgrel=18
 pkgdesc="Bit-perfect lossless music player (player-gtk + player-cli) for Poco F1 + Chord Mojo 2"
 url="https://github.com/AntonIXO/player"
 # beryllium / SDM845 only: the bundled audio-tuning files are device-specific.
@@ -20,10 +20,12 @@ license="MIT"
 # it as _sftp-ssh._tcp so it auto-appears in Nautilus' network view. NetworkManager
 # (the Wi-Fi half) is already part of the Phosh image.
 depends="alsa-utils adwaita-icon-theme openssh-server avahi iw"
-# llvm:   provides /usr/bin/llvm-profdata to merge PGO profiles. The UNVERSIONED
-#         `llvm` package tracks Alpine's default LLVM — the same one `rust` is built
-#         against — so it always matches rustc's raw-profile format (LLVM 22 here).
-#         If it's ever still missing, build() falls back to a plain release build.
+# llvm:   provides llvm-profdata to merge PGO profiles. compiler-rt provides the
+#         matching libclang_rt.profile archive used instead of Alpine rust's bundled
+#         profiler_builtins. rust 1.98.1-r0 is built against LLVM 23 but bundles an
+#         older raw-profile runtime (format 10 vs LLVM 23's format 11), so binaries
+#         linked with the bundled runtime run but silently produce no .profraw.
+#         If either matching component is missing, build() falls back to release.
 # ffmpeg: build()'s bit-perfect gate decodes each testfile and byte-compares the
 #         output against ffmpeg's, refusing to package a binary whose samples differ
 #         (the PGO/BOLT safety net).
@@ -53,6 +55,7 @@ makedepends="
 	cargo
 	rust
 	llvm
+	compiler-rt
 	gtk4.0-dev
 	libadwaita-dev
 	alsa-lib-dev
@@ -306,7 +309,7 @@ _workload() {
 # Runs in a () subshell so its env never leaks. $1 = instrumented player-gtk.
 _workload_gtk() (
 	[ "$_pgo_ui" = 1 ] || exit 0
-	_gtk="$1"; [ -x "$_gtk" ] || exit 0
+	_gtk="$1"; _cli="${2:-$_outdir/player-cli}"; [ -x "$_gtk" ] || exit 0
 	command -v Xvfb >/dev/null 2>&1 || { warning "UI PGO skipped: Xvfb not found"; exit 0; }
 	# Isolated throwaway library so the UI has real rows + art to render without
 	# touching anything real. build_ui reads the XDG default paths.
@@ -315,7 +318,7 @@ _workload_gtk() (
 	mkdir -p "$XDG_DATA_HOME/player" "$XDG_CACHE_HOME/player" "$XDG_RUNTIME_DIR"
 	chmod 700 "$XDG_RUNTIME_DIR"
 	# Populate the default-path DB from the real corpus (best-effort, bounded).
-	[ -n "$_PGO_MUSIC" ] && "$_outdir/player-cli" scan "$_PGO_MUSIC" --force >/dev/null 2>&1 || true
+	[ -n "$_PGO_MUSIC" ] && "$_cli" scan "$_PGO_MUSIC" --force >/dev/null 2>&1 || true
 	msg "PGO: UI bench (player-gtk --bench under Xvfb)"
 	Xvfb :99 -screen 0 720x1440x24 >/dev/null 2>&1 &
 	_xp=$!
@@ -379,6 +382,16 @@ _bolt_one() {
 	[ -x "$_bin" ] || return 1
 	_bd="$builddir/target/.bolt-$_tag"; rm -rf "$_bd"; mkdir -p "$_bd" || return 1
 	_fdata="$_bd/$_tag.fdata"
+	_bhelp="$($_LLVM_BOLT --help-list 2>&1 || true)"
+	_btarget_opts=""
+	# The aarch64 linker can leave Cortex-A53 erratum 843419 workaround veneers in
+	# the input binary, which BOLT refuses to rewrite by default. This package is
+	# beryllium/SDM845-only (Cortex-A75 + A55), so it is safe to inline/drop those
+	# veneers. Apply the option to both rewrites: instrumentation and optimization.
+	case "$_bhelp" in
+		*drop-cortex-a53-843419-veneers*)
+			_btarget_opts="--drop-cortex-a53-843419-veneers" ;;
+	esac
 	# --instrumentation-file-append-pid (per-pid dump AT EXIT) is what musl breaks and
 	# is mutually exclusive with --instrumentation-sleep-time anyway, so use sleep-time
 	# alone. But sleep-time writes ONE shared file, and our training is many SEQUENTIAL
@@ -388,7 +401,7 @@ _bolt_one() {
 	# scan phases are the hot code BOLT cares about.
 	$_LLVM_BOLT "$_bin" -instrument --instrumentation-file="$_fdata" \
 		--instrumentation-sleep-time="$_sleep" --instrumentation-no-counters-clear \
-		-o "$_bin.inst" || return 1
+		$_btarget_opts -o "$_bin.inst" || return 1
 	_wrap="$_bd/run.sh"
 	cat > "$_wrap" <<EOF
 #!/bin/sh
@@ -422,15 +435,20 @@ EOF
 	#   icf=safe — fold identical code only where BOLT can prove no function
 	#             pointer identity is observed (Rust vtables/fn pointers can).
 	# Layout only: the bit-perfect gate below re-proves byte-equality regardless.
-	_bhelp="$($_LLVM_BOLT --help-list 2>&1 || true)"
-	_bopts="-reorder-blocks=ext-tsp -dyno-stats"
+	_bopts="$_btarget_opts -reorder-blocks=ext-tsp -dyno-stats"
 	case "$_bhelp" in
 		*=cdsort*)  _bopts="$_bopts -reorder-functions=cdsort" ;;
 		*"=hfsort+"*) _bopts="$_bopts -reorder-functions=hfsort+" ;;
 		*)          _bopts="$_bopts -reorder-functions=hfsort" ;;
 	esac
 	case "$_bhelp" in
-		*=cdsplit*) _bopts="$_bopts -split-functions --split-strategy=cdsplit" ;;
+		*=cdsplit*)
+			_bopts="$_bopts -split-functions --split-strategy=cdsplit"
+			# AArch64 CDSplit uses long jumps unless BOLT's compact (<128 MiB)
+			# code model is selected. Both player binaries are far below that limit.
+			case "$_bhelp" in
+				*compact-code-model*) _bopts="$_bopts --compact-code-model" ;;
+			esac ;;
 		*)          _bopts="$_bopts -split-functions -split-all-cold" ;;
 	esac
 	case "$_bhelp" in
@@ -458,20 +476,57 @@ _pgo_build() {
 	done
 	[ -z "$_profdata" ] && _profdata="$(ls /usr/lib/llvm*/bin/llvm-profdata 2>/dev/null | head -n1)"
 	[ -n "$_profdata" ] || { warning "PGO skipped: llvm-profdata not found — add 'llvm$_major' (or 'llvm') to makedepends"; return 1; }
-	_prof="$builddir/target/.pgo"; rm -rf "$_prof"; mkdir -p "$_prof" || return 1
+	# Alpine rust 1.98.1-r0 currently combines LLVM 23 instrumentation (raw format
+	# 11) with a bundled profiler_builtins built for raw format 10. The executable
+	# exits 0 after printing a runtime-version error, so no .profraw is produced.
+	# Use compiler-rt from the same LLVM major as rustc/llvm-profdata instead.
+	_prof_rt=""
+	for _c in \
+		/usr/lib/llvm"$_major"/lib/clang/"$_major"/lib/*/libclang_rt.profile-*.a \
+		/usr/lib/llvm"$_major"/lib/clang/*/lib/*/libclang_rt.profile-*.a; do
+		[ -f "$_c" ] && { _prof_rt="$_c"; break; }
+	done
+	[ -n "$_prof_rt" ] \
+		|| { warning "PGO skipped: LLVM $_major compiler-rt profile runtime not found — add 'compiler-rt' to makedepends"; return 1; }
+
+	# Keep instrumented artifacts out of target/release-pgo. Besides avoiding a
+	# stale instrumented binary after fallback, this makes it impossible to package
+	# a profile-generate executable when collection or profile-use fails.
+	_prof="$builddir/target/.pgo"
+	_instr_target="$builddir/target/.pgo-instrumented"
+	_instr_out="$_instr_target/$_cargo_profile"
+	rm -rf "$_prof" "$_instr_target"
+	mkdir -p "$_prof" || return 1
 	# Instrument player-cli always; player-gtk too when _pgo_ui=1 (so the UI bench
 	# can collect coverage for the UI's own code). Unquoted on purpose to expand
 	# into separate -p args.
 	_instr="-p player-cli"
 	[ "$_pgo_ui" = 1 ] && _instr="$_instr -p player-gtk"
-	msg "PGO: instrumenting$_instr (profdata=$_profdata; material=$_TESTDIR)"
-	RUSTFLAGS="$_base_rustflags -C profile-generate=$_prof" \
+	msg "PGO: instrumenting$_instr (profdata=$_profdata; runtime=$_prof_rt; material=$_TESTDIR)"
+	RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$_instr_target" \
+	RUSTFLAGS="$_base_rustflags -C profile-generate=$_prof -Z no-profiler-runtime -C link-arg=$_prof_rt" \
 		cargo build --profile "$_cargo_profile" --frozen $_instr \
 		|| { warning "PGO skipped: instrumented build failed (rustc without profiler runtime?)"; return 1; }
 	msg "PGO: collecting profiles"
+	# Discard any profiles emitted by Cargo build scripts; the training profile must
+	# prove that the target player binary itself ran successfully.
+	find "$_prof" -name '*.profraw' -delete
+	export LLVM_PROFILE_FILE="$_prof/smoke-%p-%m.profraw"
+	# Do not hide the one diagnostic that proves the binary starts and the runtime
+	# can write its format. The full workloads remain best-effort per individual
+	# media file, but they only begin after this profile smoke test succeeds.
+	_smoke_err="$_prof/smoke.stderr"; _smoke_rc=0
+	"$_instr_out/player-cli" --help >/dev/null 2>"$_smoke_err" || _smoke_rc=$?
+	if [ "$_smoke_rc" -ne 0 ] || ! find "$_prof" -name 'smoke-*.profraw' -print -quit | grep -q .; then
+		_smoke_detail="$(tr '\n' ' ' < "$_smoke_err" | sed 's/[[:space:]][[:space:]]*/ /g; s/[[:space:]]*$//' | cut -c1-300)"
+		rm -f "$_smoke_err"; unset LLVM_PROFILE_FILE
+		warning "PGO skipped: instrumented player-cli smoke test failed (exit $_smoke_rc)${_smoke_detail:+: $_smoke_detail}"
+		return 1
+	fi
+	rm -f "$_smoke_err"
 	export LLVM_PROFILE_FILE="$_prof/pgo-%p-%m.profraw"
-	_workload "$_outdir/player-cli" || true
-	_workload_gtk "$_outdir/player-gtk" || true
+	_workload "$_instr_out/player-cli" || true
+	_workload_gtk "$_instr_out/player-gtk" "$_instr_out/player-cli" || true
 	unset LLVM_PROFILE_FILE
 	[ -n "$(find "$_prof" -name '*.profraw' 2>/dev/null)" ] \
 		|| { warning "PGO skipped: no .profraw produced (could not run instrumented binary?)"; return 1; }

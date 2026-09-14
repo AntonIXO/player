@@ -1,0 +1,13 @@
+{
+    "mcpServers": {
+        "perplexity": {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "perplexity-web-api-mcp"],
+            "env": {
+                "PERPLEXITY_SESSION_TOKEN": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..hn8D-cyDfQ1fnEJN.NVT7zt6vS1p0NbJeotysjnUKLg1G930becM1IVVo_ep_QikCSJMUfU_Vq2i4FvRD9fMzUaFzvnWykmoMgaIPgec9uXQivwEybNOUWAYCfUq1tLBoFCbtoe9hNixU4C7aWqu3IC-JQS0DBcXbRIApANTUDi9f-EM37F483POXxBIWkQMn-QRke_aZJDMJmPpkAHkJyoPWdRrcx4niNVLvmE-TwwyTKiyB5GDvKZ7k-xONVC9JG-51FGFRNoA7vK2gYfgWQXAxGrvLeOh2uC5QpVR1RYFL7R2iKYDJ44DGqQTyQn5bpANXFal3HANUS4MltAzIij9zkzaeZC8Ev0K4OfjihnUkaOobiy790Ne1gLx-TU-yR2249nwLbzP0elDvlgNFCx1tnx4uFglg6cg0TP9QdeIUkTHdBWLQYsLUjawv0yBhAVA3chk0K7QvSb7Edg.L27VLPzkWHKMudTpaMV5iQ",
+                "PERPLEXITY_CSRF_TOKEN": "c7f1ac437ca46a55d274fcca409d3c1fe9973b5b1e0b5e314fb51b439d2e0a4d"
+            }
+        }
+    }
+}

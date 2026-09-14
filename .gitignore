@@ -39,3 +39,6 @@
 # Scratch screenshots (not source).
 queue.png
 search.png
+
+# Local diagnostics, evidence captures, and generated repro build artifacts.
+/repro/

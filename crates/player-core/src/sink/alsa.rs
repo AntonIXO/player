@@ -109,18 +109,15 @@ impl AlsaSink {
         }
         self.pcm.try_recover(e, true)?;
         if reinit && self.guard_reinit.get() {
-            self.prime_reinit_silence();
+            self.prime_reinit_silence()?;
         }
         Ok(())
     }
 
-    /// Clock out [`REINIT_GUARD_MS`] of digital silence into a freshly
-    /// (re)prepared stream so no full-scale sample is emitted during the DAC's
-    /// unmuted-but-unattenuated reinit window (the Mojo 2 burst hazard). PCM →
-    /// zeros; DoP → valid-marker DSD silence (also re-locks DoP). Best-effort: a
-    /// write error is swallowed (the caller's next write recovers again if
-    /// needed). Leading silence only — never part of the bit-perfect music.
-    fn prime_reinit_silence(&self) {
+    /// Clock out [`REINIT_GUARD_MS`] of leading silence after recovery: PCM
+    /// zeros or valid-marker DoP silence. Propagate failed/zero writes instead
+    /// of resuming music on an unusable device or spinning without progress.
+    fn prime_reinit_silence(&self) -> Result<()> {
         let frames = (self.spec.rate as usize / 1000) * REINIT_GUARD_MS;
         let fb = self.spec.bytes_per_frame();
         let silence = if self.spec.is_dop {
@@ -132,10 +129,12 @@ impl AlsaSink {
         let mut off = 0;
         while off < silence.len() {
             match io.writei(&silence[off..]) {
+                Ok(0) => return Err(alsa::Error::new("snd_pcm_writei", libc::EIO).into()),
                 Ok(n) => off += n * fb,
-                Err(_) => break,
+                Err(e) => return Err(e.into()),
             }
         }
+        Ok(())
     }
 
     /// Write one packed block via the typed interface (the engine hot path).
@@ -183,37 +182,51 @@ impl AlsaSink {
     }
 
     fn write_i16(&self, buf: &[i16]) -> Result<()> {
-        let io = self.pcm.io_i16()?;
+        let mut io = self.pcm.io_i16()?;
         let mut off = 0;
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * self.channels,
-                Err(e) => self.recover(e)?,
+                Err(e) => {
+                    // Recovery writes its own silence through io_bytes(). ALSA
+                    // permits only one IO object per PCM, including on errors.
+                    drop(io);
+                    self.recover(e)?;
+                    io = self.pcm.io_i16()?;
+                }
             }
         }
         Ok(())
     }
 
     fn write_i32(&self, buf: &[i32]) -> Result<()> {
-        let io = self.pcm.io_i32()?;
+        let mut io = self.pcm.io_i32()?;
         let mut off = 0;
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * self.channels,
-                Err(e) => self.recover(e)?,
+                Err(e) => {
+                    drop(io);
+                    self.recover(e)?;
+                    io = self.pcm.io_i32()?;
+                }
             }
         }
         Ok(())
     }
 
     fn write_bytes(&self, buf: &[u8]) -> Result<()> {
-        let io = self.pcm.io_bytes();
+        let mut io = self.pcm.io_bytes();
         let frame_bytes = self.spec.bytes_per_frame();
         let mut off = 0;
         while off < buf.len() {
             match io.writei(&buf[off..]) {
                 Ok(frames) => off += frames * frame_bytes,
-                Err(e) => self.recover(e)?,
+                Err(e) => {
+                    drop(io);
+                    self.recover(e)?;
+                    io = self.pcm.io_bytes();
+                }
             }
         }
         Ok(())
@@ -221,12 +234,7 @@ impl AlsaSink {
 }
 
 /// Shared hw-param negotiation used by both playback and capture.
-pub(crate) fn configure_hw(
-    pcm: &PCM,
-    spec: StreamSpec,
-    period: i64,
-    periods: i64,
-) -> Result<()> {
+pub(crate) fn configure_hw(pcm: &PCM, spec: StreamSpec, period: i64, periods: i64) -> Result<()> {
     let hwp = HwParams::any(pcm)?;
     hwp.set_access(Access::RWInterleaved)?;
     hwp.set_format(spec.fmt.to_alsa())?;
@@ -259,4 +267,42 @@ pub fn probe_formats(device: &str) -> Result<DeviceFormats> {
         s24_3: hwp.test_format(Format::S243LE).is_ok(),
         s32: hwp.test_format(Format::S32LE).is_ok(),
     })
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::format::AlsaFmt;
+
+    // Run with: modprobe snd-aloop; cargo test -p player-core --release \
+    //   recovery_after_real_xrun -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "requires the ALSA Loopback device"]
+    fn recovery_after_real_xrun() {
+        for fmt in [AlsaFmt::S16, AlsaFmt::S24_3, AlsaFmt::S32] {
+            let spec = StreamSpec {
+                rate: 48000,
+                channels: 2,
+                fmt,
+                source_bits: fmt.output_bits(),
+                is_dop: false,
+            };
+            let sink = AlsaSink::open("hw:Loopback,0,0", spec, 128, 4).unwrap();
+            sink.enable_reinit_guard();
+            let s16 = vec![0i16; 1024];
+            let s32 = vec![0i32; 1024];
+            let bytes = vec![0u8; 512 * spec.bytes_per_frame()];
+            let write = || match fmt {
+                AlsaFmt::S16 => sink.write_i16(&s16),
+                AlsaFmt::S32 => sink.write_i32(&s32),
+                _ => sink.write_bytes(&bytes),
+            };
+            write().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            // Previously panicked: recover() created io_bytes while write's
+            // typed/byte IO was still alive. Exercise all three callers.
+            write().unwrap();
+            assert!(sink.xruns() > 0, "test must cause a real underrun");
+        }
+    }
 }

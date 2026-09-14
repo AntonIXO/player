@@ -187,8 +187,22 @@ save_mode() { echo "$1" > "$STATE" 2>/dev/null || true; }
 # --- composite entry points (host-first leaves, then the three modes) ---------
 
 # Leaf used by both `audio` here and hifi-player-audio-setup (no recursion).
-usb_host()   { role_set host; vbus_on; }
-usb_device() { vbus_off; role_set device; }
+usb_host() {
+	role_set host
+	# Compatibility fix for the 7.2.3 PMI8998 driver. New kernels carry
+	# the same halt-1-in-8 setting in the regulator driver's enable path.
+	if modinfo pmi8998_otg_fix >/dev/null 2>&1; then
+		modprobe pmi8998_otg_fix || return 1
+	fi
+	vbus_on
+}
+usb_device() {
+	vbus_off
+	if [ -d /sys/module/pmi8998_otg_fix ]; then
+		modprobe -r pmi8998_otg_fix || return 1
+	fi
+	role_set device
+}
 
 audio() {
 	gadget_down

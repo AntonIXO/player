@@ -21,7 +21,7 @@ maintainer="Casey Connolly <kcxt@postmarketos.org>"
 _flavor="postmarketos-qcom-sdm845"
 pkgname=linux-$_flavor-audio
 pkgver=7.2.3
-pkgrel=1
+pkgrel=2
 pkgdesc="Mainline SDM845 kernel for beryllium audio player (switchable USB DRD host-first + PMI8998 VBUS + RT/USB-audio tuning)"
 provides="linux-$_flavor=$pkgver-r$pkgrel"
 replaces="linux-$_flavor"
@@ -61,6 +61,7 @@ source="
 	0007-power-supply-pmi8998-charge-control-thresholds.patch
 	0008-power-supply-qcom-smbx-correctness-fixes.patch
 	0009-drm-panel-port-fork-panels-to-the-v7.2-drm_panel-alloc-api.patch
+	0010-regulator-qcom-usb-vbus-pmi8998-halt-mode.patch
 	enable-dynamic-ftrace.patch
 "
 builddir="$srcdir/linux-$pkgver"
@@ -123,4 +124,5 @@ c83af906eed5cedb19f47122926b9f4988e0605f0e4062ea6d6a8433c095565fe45cf3dde86b8b75
 9275cefcc1c432c636abb7d17a37d773c58692169a7a290a07f11a8c2c80c5cd064cf23d072f634a6151574a90d5e95b931b512e0aa239a01cbce4bb29a09ba3  0008-power-supply-qcom-smbx-correctness-fixes.patch
 9368d9fd5f76f7585440e2f2a0bf926d652724487164e64e3ea35d8317d3eaf12e5227df4e5e012dc518b0c8b5dca2b420606f79202c27fff4b0fa1e2c34eaec  0009-drm-panel-port-fork-panels-to-the-v7.2-drm_panel-alloc-api.patch
 944970943938c3d9e6a7f8c2d6f66e6ad559971d9fe5cace5931689f1ee7a7192c5b9955d4e2e7ebd9a3ec1144def575c0c546c139d6c4db0b55aa0e78ca08f1  enable-dynamic-ftrace.patch
+d226f23b2cef43d85b660a5da05b3ee085e2f2b139c7d6803a26110411d89dabee3ef7940d6352cb7f6ab73a7077daded78a029dc22bc8eeecd9752eced3c789  0010-regulator-qcom-usb-vbus-pmi8998-halt-mode.patch
 "

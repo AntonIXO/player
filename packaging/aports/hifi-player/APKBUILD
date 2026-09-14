@@ -614,8 +614,10 @@ package() {
 		"$pkgdir"/etc/default/hifi-player
 	install -Dm755 "$srcdir"/hifi-player-greetd-config \
 		"$pkgdir"/usr/libexec/hifi-player-greetd-config
+	# postmarketos-ui-phosh-systemd ships an unnumbered override.conf that also
+	# resets ExecStart. Sort after it so our appliance policy remains effective.
 	install -Dm644 "$srcdir"/hifi-player-greetd-autologin.conf \
-		"$pkgdir"/usr/lib/systemd/system/greetd.service.d/90-hifi-player-autologin.conf
+		"$pkgdir"/usr/lib/systemd/system/greetd.service.d/zz-hifi-player-autologin.conf
 
 	# systemd service: USB host mode (OTG workaround) + governors + IRQ RT.
 	# Shared imperative setup script (also runnable by hand), unit, and the

@@ -18,7 +18,7 @@ whole GTK4 workspace links against Alpine's musl libraries.
 | `/usr/bin/player-gtk`, `/usr/bin/player-cli` | the player + CLI |
 | `/usr/share/applications/hifi-player.desktop` + icon | Phosh app-grid entry |
 | `/etc/xdg/autostart/hifi-player-autostart.desktop` | launch `player-gtk` inside the authenticated Phosh user session |
-| `greetd.service.d/90-hifi-player-autologin.conf` + `/usr/libexec/hifi-player-greetd-config` | greetd `initial_session` for the non-root `/etc/default_user`, with phrog retained as the fallback greeter |
+| `greetd.service.d/zz-hifi-player-autologin.conf` + `/usr/libexec/hifi-player-greetd-config` | greetd `initial_session` for the non-root `/etc/default_user`, with phrog retained as the fallback greeter |
 | `/etc/default/hifi-player` | reversible boot policy plus battery thresholds (`HIFI_PLAYER_AUTOLOGIN` / `HIFI_PLAYER_AUTOSTART` / `HIFI_PLAYER_CHARGE_LIMIT`) |
 | `/usr/bin/hifi-player-audio-setup` + `…/systemd/system/hifi-player-audio-setup.service` (+ preset) | systemd oneshot: USB host mode (OTG workaround), perf governor on CPUs 4-7, SCHED_FIFO on USB IRQ threads |
 | `/usr/libexec/hifi-player-charge-limit` + `hifi-player-charge-limit.service` + udev rule | restore the standard PMI8998 battery threshold at boot, battery registration, and resume; no-op on unsupported kernels |
@@ -39,7 +39,9 @@ The package does not auto-login root or bypass PAM: greetd starts a non-root
 Phosh's user-session autostart once Wayland and the user D-Bus are ready. The normal
 phrog greeter remains in the generated config as the recovery path. Set
 `HIFI_PLAYER_AUTOLOGIN=0` or `HIFI_PLAYER_AUTOSTART=0` in `/etc/default/hifi-player`
-to opt out and reboot.
+to opt out and reboot. The `zz-` prefix is intentional: postmarketOS' Phosh systemd
+package ships an unnumbered `override.conf` that resets `ExecStart`, so the autologin
+drop-in must sort after it.
 
 The audio setup unit no longer waits for `sound.target`; it only waits for udev and
 is ordered before greetd. This lets it assert USB host mode before the graphical

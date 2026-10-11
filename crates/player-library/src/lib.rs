@@ -88,7 +88,7 @@ fn track_stub(path: &Path, folder: String) -> Track {
         bits: None,
         channels: None,
         art_hash: None,
-        source_path: path.to_path_buf(),
+        source_path: None,
         start_ms: None,
         loved: false,
     }

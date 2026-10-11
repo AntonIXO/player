@@ -46,10 +46,10 @@ pub(crate) fn start_current(state: &SharedState, ui: &SharedUi) {
         // SACD .iso track → the DoP path; a .cue track decodes a sub-range of its
         // source file; everything else is a whole-file play.
         if let Some(t) = track.sacd_track() {
-            s.player.play_sacd(track.source_path.clone(), t);
+            s.player.play_sacd(track.source_path.clone().unwrap_or_else(|| track.path.clone()), t);
         } else {
             match track.cue_range() {
-                Some((start, end)) => s.player.play_range(track.source_path.clone(), start, end),
+                Some((start, end)) => s.player.play_range(track.source_path.clone().unwrap_or_else(|| track.path.clone()), start, end),
                 None => s.player.play(track.path.clone()),
             }
         }

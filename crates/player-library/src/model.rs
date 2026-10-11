@@ -32,7 +32,7 @@ pub struct Track {
     /// The audio file the engine should decode. Equals `path` for a whole-file
     /// track; for a `.cue` track it is the referenced audio file (while `path`
     /// is a synthetic per-track id like `album.cue#02`).
-    pub source_path: PathBuf,
+    pub source_path: Option<PathBuf>,
     /// Start offset into `source_path` for a `.cue` track; `None` (whole file)
     /// otherwise. With `duration_ms` this gives the track's decode range.
     pub start_ms: Option<u64>,
@@ -78,10 +78,10 @@ impl Track {
     /// tracks play through the engine's SACD/DoP path, not the decoder.
     pub fn is_sacd(&self) -> bool {
         self.start_ms.is_none()
-            && self.source_path != self.path
+            && self.source_path.as_ref().is_some_and(|sp| sp != &self.path)
             && self
                 .source_path
-                .extension()
+                .as_ref().and_then(|p| p.extension())
                 .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
     }
 

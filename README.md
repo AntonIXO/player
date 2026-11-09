@@ -1,5 +1,11 @@
 # Bit-Perfect Player
 
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="Music library" width="220">
+  <img src="docs/screenshots/now-playing.png" alt="Now playing with bit-perfect format indicator" width="220">
+  <img src="docs/screenshots/queue.png" alt="Playback queue" width="220">
+</p>
+
 A hi-end, bit-perfect music player in Rust. It decodes lossless audio and writes
 it **directly to an ALSA `hw:` device** with no resampling, no software mixing,
 no dither, and no software volume. Target hardware: Poco F1 DAP on
